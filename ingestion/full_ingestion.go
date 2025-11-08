@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -110,7 +109,7 @@ func main() {
 	// Configure the BufferedStorageBackend
 	backendConfig := ledgerbackend.BufferedStorageBackendConfig{
 		BufferSize: 1000,
-		NumWorkers: 20,
+		NumWorkers: 100,
 		RetryLimit: 3,
 		RetryWait:  5 * time.Second,
 	}
@@ -161,7 +160,7 @@ func main() {
 	defer encoder.Close()
 
 	// Iterate through the ledger sequence
-	for ledgerSeq := ledgerRange.From(); ledgerSeq <= ledgerRange.To(); ledgerSeq++ {
+	for ledgerSeq := ledgerRange.From(); ledgerSeq < ledgerRange.To(); ledgerSeq++ {
 		processStart := time.Now()
 
 		ledger, err := backend.GetLedger(ctx, ledgerSeq)
@@ -347,10 +346,6 @@ func processLedger(
 			return stats, fmt.Errorf("error marshalling transaction meta: %w", err)
 		}
 
-		txEnvelopeHexstring := base64.StdEncoding.EncodeToString(txEnvelopeBytes)
-		txResultHexstring := base64.StdEncoding.EncodeToString(txResultBytes)
-		txMetaHexstring := base64.StdEncoding.EncodeToString(txMetaBytes)
-
 		// Create TxData protobuf
 		txDataProto := tx_data.TxData{
 			LedgerSequence: ledgerSeq,
@@ -372,14 +367,10 @@ func processLedger(
 		compressedTxData := compressData(encoder, txDataBytes)
 		stats.CompressedTx += int64(len(compressedTxData))
 
-		txHashBytes, err := tx.Hash.MarshalBinary()
-		if err != nil {
-			return stats, fmt.Errorf("error marshalling transaction hash: %w", err)
-		}
-
-		txHash := tx.Hash.HexString()
-		txHashToTxData[txHash] = compressedTxData
-		txHashToLedgerSeq[txHash] = ledgerSeq
+		// Use hex string as map key (for convenience), but we'll convert to binary when writing to DB
+		txHashHex := tx.Hash.HexString()
+		txHashToTxData[txHashHex] = compressedTxData
+		txHashToLedgerSeq[txHashHex] = ledgerSeq
 
 		stats.TxCount++
 	}
@@ -412,16 +403,26 @@ func writeBatchToDB(
 	}
 
 	// Write to DB2 (txHash -> compressed TxData)
-	for txHash, compressedTxData := range txHashToTxData {
-		if err := db2.Put(wo, []byte(txHash), compressedTxData); err != nil {
+	// Convert hex string keys to binary
+	for txHashHex, compressedTxData := range txHashToTxData {
+		txHashBytes, err := hexStringToBytes(txHashHex)
+		if err != nil {
+			return errors.Wrapf(err, "failed to convert tx hash to bytes: %s", txHashHex)
+		}
+		if err := db2.Put(wo, txHashBytes, compressedTxData); err != nil {
 			return errors.Wrap(err, "failed to write to DB2")
 		}
 	}
 
 	// Write to DB3 (txHash -> ledgerSeq)
-	for txHash, ledgerSeq := range txHashToLedgerSeq {
+	// Convert hex string keys to binary
+	for txHashHex, ledgerSeq := range txHashToLedgerSeq {
+		txHashBytes, err := hexStringToBytes(txHashHex)
+		if err != nil {
+			return errors.Wrapf(err, "failed to convert tx hash to bytes: %s", txHashHex)
+		}
 		value := uint32ToBytes(ledgerSeq)
-		if err := db3.Put(wo, []byte(txHash), value); err != nil {
+		if err := db3.Put(wo, txHashBytes, value); err != nil {
 			return errors.Wrap(err, "failed to write to DB3")
 		}
 	}
@@ -461,15 +462,11 @@ func showDBSizes(db1Path, db2Path, db3Path string) {
 
 // openRocksDB opens or creates a RocksDB database with optimized settings
 func openRocksDB(path string, createNew bool) (*grocksdb.DB, *grocksdb.Options, error) {
-	if createNew {
-		// Remove existing directory if it exists
-		if _, err := os.Stat(path); err == nil {
-			log.Printf("Removing existing database at %s", path)
-			if err := os.RemoveAll(path); err != nil {
-				return nil, nil, errors.Wrap(err, "failed to remove existing database directory")
-			}
-		}
-
+	// Check if database exists
+	if _, err := os.Stat(path); err == nil {
+		log.Printf("Opening existing database at %s", path)
+	} else {
+		log.Printf("Creating new database at %s", path)
 		// Create parent directory if it doesn't exist
 		parentDir := filepath.Dir(path)
 		if err := os.MkdirAll(parentDir, 0755); err != nil {
@@ -478,9 +475,9 @@ func openRocksDB(path string, createNew bool) (*grocksdb.DB, *grocksdb.Options, 
 	}
 
 	opts := grocksdb.NewDefaultOptions()
-	opts.SetCreateIfMissing(createNew)
-	opts.SetCreateIfMissingColumnFamilies(createNew)
-	opts.SetErrorIfExists(createNew)
+	opts.SetCreateIfMissing(true) // Create if missing
+	opts.SetCreateIfMissingColumnFamilies(true)
+	opts.SetErrorIfExists(false) // Don't error if exists - we want to append
 
 	// Optimize for bulk writes and large datasets
 	opts.SetCompression(grocksdb.SnappyCompression)
@@ -515,6 +512,26 @@ func uint32ToBytes(n uint32) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, n)
 	return b
+}
+
+// hexStringToBytes converts a hex string to bytes
+func hexStringToBytes(hexStr string) ([]byte, error) {
+	// Remove "0x" prefix if present
+	if len(hexStr) >= 2 && hexStr[0:2] == "0x" {
+		hexStr = hexStr[2:]
+	}
+
+	// Decode hex string to bytes
+	bytes := make([]byte, len(hexStr)/2)
+	for i := 0; i < len(bytes); i++ {
+		var b byte
+		_, err := fmt.Sscanf(hexStr[i*2:i*2+2], "%02x", &b)
+		if err != nil {
+			return nil, err
+		}
+		bytes[i] = b
+	}
+	return bytes, nil
 }
 
 // getDirSize calculates the total size of a directory
