@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package proto;
+
+import "google/protobuf/timestamp.proto";
+
+message TxData {
+    uint32 ledger_sequence = 1;
+    google.protobuf.Timestamp closed_at = 2;
+    uint32 index = 3;
+    bytes tx_envelope = 4;
+    bytes tx_result = 5;
+    bytes tx_meta = 6;
+}
