@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
@@ -36,9 +38,12 @@ type CompressionStats struct {
 func main() {
 	// Command-line flags
 	var startLedger, endLedger uint
+	var batchSize int
 	var db1Path, db2Path, db3Path string
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
+	flag.IntVar(&batchSize, "batch-size", 1000, "Batch size for commit")
+
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
 	flag.StringVar(&db1Path, "db1", "", "Path for DataStore 1 (ledgerSeq -> compressed LCM)")
 	flag.StringVar(&db2Path, "db2", "", "Path for DataStore 2 (txHash -> compressed TxData)")
@@ -48,6 +53,9 @@ func main() {
 	// Validate required arguments
 	if startLedger == 0 || endLedger == 0 {
 		log.Fatal("start-ledger and end-ledger are required")
+	}
+	if batchSize <= 0 {
+		log.Fatal("batch-size cannot be less than or equal to 0")
 	}
 	if db1Path == "" || db2Path == "" || db3Path == "" {
 		log.Fatal("All three database paths (db1, db2, db3) are required")
@@ -146,8 +154,6 @@ func main() {
 
 	var totalStats CompressionStats
 
-	// Batch maps
-	const batchSize = 1000
 	ledgerSeqToLcm := make(map[uint32][]byte)
 	txHashToTxData := make(map[string][]byte)
 	txHashToLedgerSeq := make(map[string]uint32)
@@ -202,8 +208,8 @@ func main() {
 			flushAllDBs(db1, db2, db3)
 
 			// Compact to remove duplicates and optimize storage
-			log.Printf("[Ledger %d] Compacting databases...", ledgerSeq)
-			compactAllDBs(db1, db2, db3)
+			//log.Printf("[Ledger %d] Compacting databases...", ledgerSeq)
+			//compactAllDBs(db1, db2, db3)
 
 			totalFlushTime += time.Since(flushStart)
 
@@ -536,22 +542,9 @@ func uint32ToBytes(n uint32) []byte {
 
 // hexStringToBytes converts a hex string to bytes
 func hexStringToBytes(hexStr string) ([]byte, error) {
-	// Remove "0x" prefix if present
-	if len(hexStr) >= 2 && hexStr[0:2] == "0x" {
-		hexStr = hexStr[2:]
-	}
-
-	// Decode hex string to bytes
-	bytes := make([]byte, len(hexStr)/2)
-	for i := 0; i < len(bytes); i++ {
-		var b byte
-		_, err := fmt.Sscanf(hexStr[i*2:i*2+2], "%02x", &b)
-		if err != nil {
-			return nil, err
-		}
-		bytes[i] = b
-	}
-	return bytes, nil
+	// Remove optional "0x" prefix
+	hexStr = strings.TrimPrefix(hexStr, "0x")
+	return hex.DecodeString(hexStr)
 }
 
 // getDirSize calculates the total size of a directory
