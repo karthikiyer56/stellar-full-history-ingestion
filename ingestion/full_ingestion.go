@@ -195,8 +195,8 @@ func main() {
 		if processedCount%batchSize == 0 {
 			flushStart := time.Now()
 
-			log.Printf("\n[Ledger %d] Writing batch to disk (%d ledgers, %d transactions)...",
-				ledgerSeq, len(ledgerSeqToLcm), len(txHashToTxData))
+			log.Printf("\n(startLedger - %d, endLedger - %d)[Ledger %d] Writing batch to disk (%d ledgers, %d transactions)...",
+				startLedger, endLedger, ledgerSeq, len(ledgerSeqToLcm), len(txHashToTxData))
 
 			// Write to all three databases
 			if err := writeBatchToDB(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq); err != nil {
@@ -204,7 +204,7 @@ func main() {
 			}
 
 			// Flush to disk
-			log.Printf("[Ledger %d] Flushing databases to disk...", ledgerSeq)
+			log.Printf("(startLedger - %d, endLedger - %d)[Ledger %d] Flushing databases to disk...", startLedger, endLedger, ledgerSeq)
 			flushAllDBs(db1, db2, db3)
 
 			// Compact to remove duplicates and optimize storage
@@ -233,8 +233,8 @@ func main() {
 				eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
 			}
 
-			log.Printf("Progress: %d/%d ledgers (%d%%) | %.2f ledgers/sec | %s transactions | ETA: %s",
-				processedCount, totalLedgers, currentPercent,
+			log.Printf("\n(startLedger - %d, endLedger - %d) Progress: %d/%d ledgers (%d%%) | %.2f ledgers/sec | %s transactions | ETA: %s",
+				startLedger, endLedger, processedCount, totalLedgers, currentPercent,
 				ledgersPerSec, formatNumber(totalStats.TxCount), formatDuration(eta))
 
 			lastReportedPercent = currentPercent
