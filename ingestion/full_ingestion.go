@@ -159,7 +159,7 @@ func main() {
 	}
 	defer encoder.Close()
 
-	// Iterate through the ledger sequence
+	// Iterate through the ledger sequence. DO NOT INCLUDE LAST LEDGER. THIS IS DELIBERATE
 	for ledgerSeq := ledgerRange.From(); ledgerSeq < ledgerRange.To(); ledgerSeq++ {
 		processStart := time.Now()
 
@@ -200,6 +200,10 @@ func main() {
 			// Flush to disk
 			log.Printf("[Ledger %d] Flushing databases to disk...", ledgerSeq)
 			flushAllDBs(db1, db2, db3)
+
+			// Compact to remove duplicates and optimize storage
+			log.Printf("[Ledger %d] Compacting databases...", ledgerSeq)
+			compactAllDBs(db1, db2, db3)
 
 			totalFlushTime += time.Since(flushStart)
 
@@ -249,6 +253,13 @@ func main() {
 
 	elapsed := time.Since(startTime)
 
+	// Trigger final compaction to ensure everything is optimized
+	log.Printf("\nPerforming final compaction...")
+	finalCompactionStart := time.Now()
+	compactAllDBs(db1, db2, db3)
+	totalFlushTime += time.Since(finalCompactionStart)
+	log.Printf("Final compaction complete in %s", formatDuration(time.Since(finalCompactionStart)))
+
 	// Print final statistics
 	log.Printf("\n========================================")
 	log.Printf("INGESTION COMPLETE")
@@ -261,7 +272,7 @@ func main() {
 	log.Printf("Time breakdown:")
 	log.Printf("  Processing:             %s (%.1f%%)", formatDuration(totalProcessingTime),
 		100*totalProcessingTime.Seconds()/elapsed.Seconds())
-	log.Printf("  Disk I/O (flush):       %s (%.1f%%)", formatDuration(totalFlushTime),
+	log.Printf("  Disk I/O (flush+compact): %s (%.1f%%)", formatDuration(totalFlushTime),
 		100*totalFlushTime.Seconds()/elapsed.Seconds())
 	log.Printf("")
 
@@ -447,6 +458,14 @@ func flushAllDBs(db1, db2, db3 *grocksdb.DB) {
 	}
 }
 
+// compactAllDBs performs full compaction on all three databases
+// This removes duplicate keys and optimizes storage
+func compactAllDBs(db1, db2, db3 *grocksdb.DB) {
+	db1.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+	db2.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+	db3.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+}
+
 // showDBSizes displays the current sizes of all three databases
 func showDBSizes(db1Path, db2Path, db3Path string) {
 	size1, _ := getDirSize(db1Path)
@@ -480,7 +499,8 @@ func openRocksDB(path string, createNew bool) (*grocksdb.DB, *grocksdb.Options, 
 	opts.SetErrorIfExists(false) // Don't error if exists - we want to append
 
 	// Optimize for bulk writes and large datasets
-	opts.SetCompression(grocksdb.SnappyCompression)
+	// Use NoCompression since we already compress data with Zstd at application level
+	opts.SetCompression(grocksdb.NoCompression)
 	opts.SetWriteBufferSize(128 << 20) // 128 MB
 	opts.SetMaxWriteBufferNumber(3)
 	opts.SetTargetFileSizeBase(128 << 20) // 128 MB
