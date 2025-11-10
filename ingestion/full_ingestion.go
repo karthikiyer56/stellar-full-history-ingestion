@@ -659,52 +659,6 @@ func showDBSizes(config IngestionConfig) {
 	log.Printf("  Total:                  %s", formatBytes(total))
 }
 
-// openRocksDB opens or creates a RocksDB database with optimized settings
-func openRocksDB(path string, createNew bool) (*grocksdb.DB, *grocksdb.Options, error) {
-	// Check if database exists
-	if _, err := os.Stat(path); err == nil {
-		log.Printf("Opening existing database at %s", path)
-	} else {
-		log.Printf("Creating new database at %s", path)
-		// Create parent directory if it doesn't exist
-		parentDir := filepath.Dir(path)
-		if err := os.MkdirAll(parentDir, 0755); err != nil {
-			return nil, nil, errors.Wrap(err, "failed to create database parent directory")
-		}
-	}
-
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetCreateIfMissing(true)
-	opts.SetCreateIfMissingColumnFamilies(true)
-	opts.SetErrorIfExists(false)
-
-	// Optimize for bulk writes and large datasets
-	opts.SetCompression(grocksdb.NoCompression)
-	opts.SetWriteBufferSize(128 << 20) // 128 MB
-	opts.SetMaxWriteBufferNumber(3)
-	opts.SetTargetFileSizeBase(128 << 20) // 128 MB
-	opts.SetMaxBackgroundJobs(6)
-	opts.SetMaxOpenFiles(1000)
-
-	// Reduce RocksDB logging
-	opts.SetInfoLogLevel(grocksdb.WarnInfoLogLevel)
-	opts.SetMaxLogFileSize(10 << 20) // 10 MB
-	opts.SetKeepLogFileNum(2)
-
-	opts.SetDisableAutoCompactions(false)
-	opts.SetLevel0FileNumCompactionTrigger(4)
-	opts.SetLevel0SlowdownWritesTrigger(20)
-	opts.SetLevel0StopWritesTrigger(30)
-
-	db, err := grocksdb.OpenDb(opts, path)
-	if err != nil {
-		opts.Destroy()
-		return nil, nil, errors.Wrap(err, "failed to open RocksDB")
-	}
-
-	return db, opts, nil
-}
-
 // uint32ToBytes converts a uint32 to big-endian bytes
 func uint32ToBytes(n uint32) []byte {
 	b := make([]byte, 4)
