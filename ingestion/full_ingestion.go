@@ -53,7 +53,7 @@ func main() {
 	var db1Path, db2Path, db3Path string
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
-	flag.IntVar(&batchSize, "batch-size", 1000, "Batch size for commit")
+	flag.IntVar(&batchSize, "batch-size", 2000, "Batch size for commit")
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
 	flag.StringVar(&db1Path, "db1", "", "Optional path for DataStore 1 (ledgerSeq -> compressed LCM)")
 	flag.StringVar(&db2Path, "db2", "", "Path for DataStore 2 (txHash -> compressed TxData)")
@@ -89,7 +89,7 @@ func main() {
 	// Only open DB1 if path is provided
 	if config.EnableDB1 {
 		var err error
-		db1, opts1, err = openRocksDB(config.DB1Path, true)
+		db1, opts1, err = openRocksDBForBulkLoad(config.DB1Path)
 		if err != nil {
 			log.Fatalf("Failed to open DB1 (ledgerSeq -> LCM): %v", err)
 		}
@@ -102,7 +102,7 @@ func main() {
 		log.Printf("ℹ DB1 (ledgerSeq -> LCM) is disabled (no path provided)")
 	}
 
-	db2, opts2, err := openRocksDB(config.DB2Path, true)
+	db2, opts2, err := openRocksDBForBulkLoad(config.DB2Path)
 	if err != nil {
 		log.Fatalf("Failed to open DB2 (txHash -> TxData): %v", err)
 	}
@@ -112,7 +112,7 @@ func main() {
 	}()
 	log.Printf("✓ DB2 opened at: %s", config.DB2Path)
 
-	db3, opts3, err := openRocksDB(config.DB3Path, true)
+	db3, opts3, err := openRocksDBForBulkLoad(config.DB3Path)
 	if err != nil {
 		log.Fatalf("Failed to open DB3 (txHash -> ledgerSeq): %v", err)
 	}
@@ -255,6 +255,11 @@ func main() {
 			}
 			txHashToTxData = make(map[string][]byte)
 			txHashToLedgerSeq = make(map[string]uint32)
+		}
+
+		if processedCount%(config.BatchSize*10) == 0 {
+			monitorRocksDBStats(db2, "DB2")
+			monitorRocksDBStats(db3, "DB3")
 		}
 
 		// Report progress every 1%
@@ -657,4 +662,228 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+// openRocksDBForBulkLoad opens or creates a RocksDB database with settings optimized
+// for large-scale bulk ingestion with periodic flushes but delayed final compaction
+func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error) {
+	if _, err := os.Stat(path); err == nil {
+		log.Printf("Opening existing database at %s", path)
+	} else {
+		log.Printf("Creating new database at %s", path)
+		parentDir := filepath.Dir(path)
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return nil, nil, errors.Wrap(err, "failed to create database parent directory")
+		}
+	}
+
+	opts := grocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(true)
+	opts.SetCreateIfMissingColumnFamilies(true)
+	opts.SetErrorIfExists(false)
+
+	// ============================================================================
+	// THE CORE PROBLEM YOU'RE EXPERIENCING:
+	// ============================================================================
+	// When you flush periodically but don't compact, L0 fills with SST files.
+	// Each flush creates a new L0 file with overlapping key ranges.
+	// As L0 grows to hundreds/thousands of files:
+	//   - Writes slow down (must check all L0 files for conflicts)
+	//   - Memory pressure increases (bloom filters for all L0 files)
+	//   - Eventually hits L0_slowdown or L0_stop triggers
+	//
+	// SOLUTION: Allow CONTROLLED compactions during ingestion to prevent L0 explosion
+	// ============================================================================
+
+	// ============================================================================
+	// 1. WRITE BUFFER (MEMTABLE) CONFIGURATION
+	// ============================================================================
+	// Larger memtables = fewer flushes = fewer L0 files = better performance
+
+	// CRITICAL: Increase this significantly to reduce flush frequency
+	opts.SetWriteBufferSize(512 << 20) // 512 MB per memtable (was 128 MB)
+
+	// Allow multiple memtables to accumulate before forcing flush
+	opts.SetMaxWriteBufferNumber(6) // Up from 3
+
+	// Minimum number to merge before flushing
+	opts.SetMinWriteBufferNumberToMerge(2)
+
+	// ============================================================================
+	// 2. L0 FILE MANAGEMENT - THIS IS KEY TO YOUR ISSUE
+	// ============================================================================
+	// These settings control when compactions trigger as L0 fills up
+
+	// CRITICAL: Allow many more L0 files before compaction starts
+	// Default is often 4, but for bulk load we can tolerate many more
+	opts.SetLevel0FileNumCompactionTrigger(50) // Start compacting when L0 has 50 files
+
+	// CRITICAL: Slowdown writes when L0 gets very full (soft limit)
+	// This prevents L0 explosion while still allowing ingestion to continue
+	opts.SetLevel0SlowdownWritesTrigger(100) // Slow down at 100 L0 files
+
+	// CRITICAL: Stop writes completely if L0 gets extremely full (hard limit)
+	// This is your safety valve to prevent catastrophic L0 growth
+	opts.SetLevel0StopWritesTrigger(150) // Hard stop at 150 L0 files
+
+	// ============================================================================
+	// 3. COMPACTION STRATEGY
+	// ============================================================================
+	// IMPORTANT: Don't disable auto compactions completely!
+	// Let RocksDB do SOME compaction during ingestion to keep L0 manageable
+	opts.SetDisableAutoCompactions(false) // Keep enabled!
+
+	// Use Level-based compaction (default, good for bulk sequential writes)
+	opts.SetCompactionStyle(grocksdb.LevelCompactionStyle)
+
+	// Target file size for L1 and above (larger = fewer files)
+	opts.SetTargetFileSizeBase(256 << 20) // 256 MB (up from 128 MB)
+	opts.SetTargetFileSizeMultiplier(2)   // Each level is 2x the previous
+
+	// Maximum bytes for level 1
+	opts.SetMaxBytesForLevelBase(1024 << 20) // 1 GB for L1
+	opts.SetMaxBytesForLevelMultiplier(10)   // Each level is 10x the previous
+
+	// ============================================================================
+	// 4. BACKGROUND JOB CONFIGURATION
+	// ============================================================================
+	// CRITICAL: Increase background threads to handle compactions faster
+	// This allows RocksDB to compact L0->L1 while you continue writing
+
+	// Total background jobs (flushes + compactions)
+	opts.SetMaxBackgroundJobs(12) // Increased from 6 or 8
+
+	// Or set separately (alternative to SetMaxBackgroundJobs):
+	// opts.SetMaxBackgroundCompactions(8)
+	// opts.SetMaxBackgroundFlushes(4)
+
+	// Number of threads for compaction
+	opts.IncreaseParallelism(8) // Use 8 CPU cores for background work
+
+	// ============================================================================
+	// 5. COMPRESSION SETTINGS
+	// ============================================================================
+	// Since you're already compressing with Zstd at application level
+	opts.SetCompression(grocksdb.NoCompression)
+
+	// If disk space becomes a concern, use light compression at lower levels:
+	// opts.SetCompressionPerLevel([]grocksdb.CompressionType{
+	// 	grocksdb.NoCompression,      // L0 - no compression
+	// 	grocksdb.NoCompression,      // L1 - no compression
+	// 	grocksdb.SnappyCompression,  // L2+ - light compression
+	// })
+
+	// ============================================================================
+	// 6. MEMORY AND FILE MANAGEMENT
+	// ============================================================================
+	// CRITICAL: Increase this significantly for large databases
+	opts.SetMaxOpenFiles(5000) // Up from 1000-2000
+
+	// Table cache settings
+	// Uncomment if you have memory to spare:
+	//opts.SetTableCacheNumshardbits(6)
+
+	// ============================================================================
+	// 7. WRITE-AHEAD LOG (WAL) SETTINGS
+	// ============================================================================
+	// For bulk loading, WAL is often disabled in write options (wo.DisableWAL(true))
+	// But set reasonable limits here in case it's enabled
+	opts.SetMaxTotalWalSize(2048 << 20) // 2 GB max WAL size
+
+	// ============================================================================
+	// 9. LOGGING SETTINGS
+	// ============================================================================
+	// Reduce log spam
+	opts.SetInfoLogLevel(grocksdb.WarnInfoLogLevel)
+	opts.SetMaxLogFileSize(20 << 20) // 20 MB max log file
+	opts.SetKeepLogFileNum(3)        // Keep last 3 log files
+
+	// ============================================================================
+	// 10. OPTIMIZATION HINTS
+	// ============================================================================
+	// Tell RocksDB you're doing bulk sequential inserts
+	opts.PrepareForBulkLoad()
+	// NOTE: PrepareForBulkLoad() sets:
+	//   - write_buffer_size to 64MB (we override above with 512MB)
+	//   - max_write_buffer_number to 7
+	//   - Disables compactions (we re-enable with controlled settings)
+	//   - Increases L0 thresholds
+	// Our custom settings above override these to be even more aggressive
+
+	// ============================================================================
+	// 11. ADVANCED: COMPACTION PRIORITY
+	// ============================================================================
+	// Prioritize reducing number of L0 files first
+	// opts.SetCompactionPri(grocksdb.MinOverlappingRatio)
+	// Or use default (ByCompensatedSize)
+
+	// ============================================================================
+	// 12. UNIVERSAL COMPACTION (ALTERNATIVE STRATEGY)
+	// ============================================================================
+	// If Level compaction still causes issues, try Universal compaction
+	// Universal compaction works better for write-heavy workloads
+	// Uncomment to try:
+	//
+	// opts.SetCompactionStyle(grocksdb.UniversalCompactionStyle)
+	// ucOpts := grocksdb.NewDefaultUniversalCompactionOptions()
+	// ucOpts.SetSizeRatio(1)                    // More aggressive compaction
+	// ucOpts.SetMinMergeWidth(2)                // Minimum files to compact together
+	// ucOpts.SetMaxMergeWidth(10)               // Maximum files to compact together
+	// ucOpts.SetMaxSizeAmplificationPercent(200) // Allow 200% size amplification
+	// opts.SetUniversalCompactionOptions(ucOpts)
+
+	// ============================================================================
+	// OPEN DATABASE
+	// ============================================================================
+	db, err := grocksdb.OpenDb(opts, path)
+	if err != nil {
+		opts.Destroy()
+		return nil, nil, errors.Wrap(err, "failed to open RocksDB")
+	}
+
+	// ============================================================================
+	// LOG CONFIGURATION SUMMARY
+	// ============================================================================
+	log.Printf("RocksDB Configuration for %s:", path)
+	log.Printf("  Write Buffer: 512 MB × 6 = 3 GB total")
+	log.Printf("  L0 Compaction Trigger: 50 files")
+	log.Printf("  L0 Slowdown: 100 files")
+	log.Printf("  L0 Stop: 150 files")
+	log.Printf("  Background Jobs: 12")
+	log.Printf("  Max Open Files: 5000")
+	log.Printf("  Auto Compactions: ENABLED (controlled)")
+	log.Printf("  Strategy: Let L0 accumulate but compact before slowdown")
+
+	return db, opts, nil
+}
+
+// ============================================================================
+// MONITORING FUNCTION - Call this periodically to see L0 file count
+// ============================================================================
+func monitorRocksDBStats(db *grocksdb.DB, dbName string) {
+	// Get L0 file count
+	l0Files := db.GetProperty("rocksdb.num-files-at-level0")
+	l1Files := db.GetProperty("rocksdb.num-files-at-level1")
+	l2Files := db.GetProperty("rocksdb.num-files-at-level2")
+
+	// Get estimated number of keys
+	estimatedKeys := db.GetProperty("rocksdb.estimate-num-keys")
+
+	// Get total SST file size
+	totalSSTSize := db.GetProperty("rocksdb.total-sst-files-size")
+
+	// Get current memtable usage
+	curMemtable := db.GetProperty("rocksdb.cur-size-all-mem-tables")
+
+	// Get compaction pending info
+	compactionPending := db.GetProperty("rocksdb.compaction-pending")
+
+	log.Printf("[%s] RocksDB Stats:", dbName)
+	log.Printf("  L0 Files: %s", l0Files)
+	log.Printf("  L1 Files: %s", l1Files)
+	log.Printf("  L2 Files: %s", l2Files)
+	log.Printf("  Estimated Keys: %s", estimatedKeys)
+	log.Printf("  Total SST Size: %s", totalSSTSize)
+	log.Printf("  Memtable Usage: %s", curMemtable)
+	log.Printf("  Compaction Pending: %s", compactionPending)
 }
