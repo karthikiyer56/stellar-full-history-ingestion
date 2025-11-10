@@ -232,8 +232,8 @@ func main() {
 			if config.EnableDB1 {
 				lcmCount = len(ledgerSeqToLcm)
 			}
-			log.Printf("\n(startLedger - %d, endLedger - %d)[Ledger %d] Writing batch to disk (%d ledgers, %d transactions)...",
-				config.StartLedger, config.EndLedger, ledgerSeq, lcmCount, len(txHashToTxData))
+			log.Printf("\n(startLedger - %d, endLedger - %d)[Ledger %d] Writing batch to disk (%d ledgers, %d transactions)... DB2: %s, DB3: %s\n",
+				config.StartLedger, config.EndLedger, ledgerSeq, lcmCount, len(txHashToTxData), config.DB2Path, config.DB3Path)
 
 			// Write to databases
 			if err := writeBatchToDB(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config.EnableDB1); err != nil {
@@ -276,9 +276,11 @@ func main() {
 				eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
 			}
 
-			log.Printf("\n(startLedger - %d, endLedger - %d) Progress: %d/%d ledgers (%d%%) | %.2f ledgers/sec | %s transactions | ETA: %s",
+			log.Printf("\n(startLedger - %d, endLedger - %d) Progress: %d/%d ledgers (%d%%) | %.2f ledgers/sec | %s transactions | ETA: %s....  DB2: %s, DB3: %s \n",
 				config.StartLedger, config.EndLedger, processedCount, totalLedgers, currentPercent,
-				ledgersPerSec, formatNumber(totalStats.TxCount), formatDuration(eta))
+				ledgersPerSec, formatNumber(totalStats.TxCount), formatDuration(eta),
+				config.DB2Path, config.DB3Path,
+			)
 
 			lastReportedPercent = currentPercent
 		}
