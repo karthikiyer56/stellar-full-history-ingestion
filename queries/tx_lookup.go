@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
 	"github.com/klauspost/compress/zstd"
@@ -46,15 +47,13 @@ func main() {
 	opts2 := grocksdb.NewDefaultOptions()
 	defer opts2.Destroy()
 
+	start := time.Now()
+
 	db, err := grocksdb.OpenDbForReadOnly(opts2, dbPath, false)
 	if err != nil {
 		log.Fatalf("Failed to open DB2: %v", err)
 	}
 	defer db.Close()
-
-	// Open DB3 (txHash -> ledgerSeq)
-	opts3 := grocksdb.NewDefaultOptions()
-	defer opts3.Destroy()
 
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
@@ -97,6 +96,8 @@ func main() {
 	txResultBase64 := base64.StdEncoding.EncodeToString(txData.TxResult)
 	txMetaBase64 := base64.StdEncoding.EncodeToString(txData.TxMeta)
 
+	elapsed := time.Since(start)
+
 	// Display results
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Transaction Hash: %s\n", txHashHex)
@@ -119,6 +120,8 @@ func main() {
 	fmt.Printf("\nTxResult (base64):\n%s\n", wrapText(txResultBase64, 80))
 	fmt.Printf("\nTxMeta (base64):\n%s\n", wrapText(txMetaBase64, 80))
 	fmt.Printf("========================================\n\n")
+
+	fmt.Println("Time Elapsed: ", formatDuration(elapsed))
 }
 
 // hexStringToBytes converts a hex string to bytes
@@ -156,4 +159,26 @@ func formatBytes(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// formatDuration formats a time.Duration into a human-readable string
+// supporting hours, minutes, seconds, and milliseconds.
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Millisecond)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+	d -= s * time.Second
+	ms := d / time.Millisecond
+
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm %ds %dms", h, m, s, ms)
+	} else if m > 0 {
+		return fmt.Sprintf("%dm %ds %dms", m, s, ms)
+	} else if s > 0 {
+		return fmt.Sprintf("%ds %dms", s, ms)
+	}
+	return fmt.Sprintf("%dms", ms)
 }
