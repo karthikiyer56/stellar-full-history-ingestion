@@ -31,8 +31,7 @@ func main() {
 	opts.SetCreateIfMissing(false)
 
 	// Set compaction settings for the redistribution
-	opts.SetMaxBackgroundCompactions(10)
-	opts.SetMaxBackgroundFlushes(2)
+	opts.SetMaxBackgroundJobs(12)
 	opts.SetTargetFileSizeBase(256 << 20)    // 256 MB
 	opts.SetMaxBytesForLevelBase(1024 << 20) // 1 GB for L1
 	opts.SetMaxBytesForLevelMultiplier(10)   // Each level 10x previous
