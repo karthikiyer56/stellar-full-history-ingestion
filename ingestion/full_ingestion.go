@@ -46,6 +46,19 @@ type CompressionStats struct {
 	TxCount         int64
 }
 
+func createDir(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		log.Printf("Opening existing database at %s", path)
+	} else {
+		log.Printf("Creating new database at %s", path)
+		parentDir := filepath.Dir(path)
+		if err := os.MkdirAll(parentDir, 0755); err != nil {
+			return errors.Wrap(err, "failed to create database parent directory")
+		}
+	}
+	return nil
+}
+
 func main() {
 	// Command-line flags
 	var startLedger, endLedger uint
@@ -71,15 +84,48 @@ func main() {
 		log.Fatal("Database paths db2 and db3 are required")
 	}
 
+	enableDb1 := db1Path != ""
+
+	// Convert to full paths
+	var db1FullPath string
+	var err error
+	if enableDb1 {
+		if err := createDir(db1Path); err != nil {
+			log.Fatalf("Error creating database directory: %v", err)
+		}
+		db1FullPath, err = filepath.Abs(db1Path)
+		if err != nil {
+			log.Fatalf("Error getting absolute path for db1: %v", err)
+		}
+	}
+
+	if err := createDir(db2Path); err != nil {
+		log.Fatalf("Error creating database directory: %v", err)
+	}
+	db2FullPath, err := filepath.Abs(db2Path)
+	if err != nil {
+		log.Fatalf("Error getting absolute path for db2: %v", err)
+	}
+
+	if err := createDir(db3Path); err != nil {
+		log.Fatalf("Error creating database directory: %v", err)
+	}
+	db3FullPath, err := filepath.Abs(db3Path)
+	if err != nil {
+		log.Fatalf("Error getting absolute path for db3: %v", err)
+	}
+
+	// Print full paths
+
 	// Create config
 	config := IngestionConfig{
 		StartLedger: uint32(startLedger),
 		EndLedger:   uint32(endLedger),
 		BatchSize:   batchSize,
-		DB1Path:     db1Path,
-		DB2Path:     db2Path,
-		DB3Path:     db3Path,
-		EnableDB1:   db1Path != "",
+		DB1Path:     db1FullPath,
+		DB2Path:     db2FullPath,
+		DB3Path:     db3FullPath,
+		EnableDB1:   enableDb1,
 	}
 
 	// Initialize RocksDB instances
@@ -678,15 +724,6 @@ func formatDuration(d time.Duration) string {
 // openRocksDBForBulkLoad opens or creates a RocksDB database with settings optimized
 // for large-scale bulk ingestion with periodic flushes but delayed final compaction
 func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error) {
-	if _, err := os.Stat(path); err == nil {
-		log.Printf("Opening existing database at %s", path)
-	} else {
-		log.Printf("Creating new database at %s", path)
-		parentDir := filepath.Dir(path)
-		if err := os.MkdirAll(parentDir, 0755); err != nil {
-			return nil, nil, errors.Wrap(err, "failed to create database parent directory")
-		}
-	}
 
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
