@@ -63,7 +63,7 @@ func main() {
 	flag.StringVar(&db1Path, "db1", "", "Optional path for DataStore 1 (ledgerSeq -> compressed LCM)")
 	flag.StringVar(&db2Path, "db2", "", "Path for DataStore 2 (txHash -> compressed TxData)")
 	flag.StringVar(&db3Path, "db3", "", "Path for DataStore 3 (txHash -> ledgerSeq)")
-	flag.BoolVar(&rocksdbCompression, "rocks-db-compression", false, "Compress using RocksDB")
+	flag.BoolVar(&rocksdbCompression, "rocksdb-compression", false, "Compress using RocksDB")
 	flag.BoolVar(&dataCompression, "data-compression", true, "Compress using zstd in application code")
 	flag.Parse()
 
@@ -309,10 +309,21 @@ func main() {
 
 	// Trigger final compaction to ensure everything is optimized
 	log.Printf("\nPerforming final compaction...")
+
+	log.Printf("\n========================================")
+	log.Printf("------ DB SIZES before compaction -----")
+	showDBSizes(config)
+	log.Printf("\n========================================")
+
 	finalCompactionStart := time.Now()
 	compactAllDBs(db1, db2, db3, config.EnableDB1)
 	totalFlushTime += time.Since(finalCompactionStart)
+
 	log.Printf("Final compaction complete in %s", formatDuration(time.Since(finalCompactionStart)))
+	log.Printf("\n========================================")
+	log.Printf("------ DB SIZES after compaction -----")
+	showDBSizes(config)
+	log.Printf("\n========================================")
 
 	// Print final statistics
 	log.Printf("\n========================================")
@@ -331,27 +342,28 @@ func main() {
 	log.Printf("")
 
 	// Compression statistics
-	if config.EnableDB1 && totalStats.UncompressedLCM > 0 {
-		compressionRatio := 100 * (1 - float64(totalStats.CompressedLCM)/float64(totalStats.UncompressedLCM))
-		log.Printf("LCM Compression:")
-		log.Printf("  Original size:          %s", formatBytes(totalStats.UncompressedLCM))
-		log.Printf("  Compressed size:        %s", formatBytes(totalStats.CompressedLCM))
-		log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
-		log.Printf("  Space saved:            %s", formatBytes(totalStats.UncompressedLCM-totalStats.CompressedLCM))
-	}
+	if config.dataCompression {
+		if config.EnableDB1 && totalStats.UncompressedLCM > 0 {
+			compressionRatio := 100 * (1 - float64(totalStats.CompressedLCM)/float64(totalStats.UncompressedLCM))
+			log.Printf("LCM Compression:")
+			log.Printf("  Original size:          %s", formatBytes(totalStats.UncompressedLCM))
+			log.Printf("  Compressed size:        %s", formatBytes(totalStats.CompressedLCM))
+			log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
+			log.Printf("  Space saved:            %s", formatBytes(totalStats.UncompressedLCM-totalStats.CompressedLCM))
+		}
 
-	if totalStats.UncompressedTx > 0 {
-		compressionRatio := 100 * (1 - float64(totalStats.CompressedTx)/float64(totalStats.UncompressedTx))
-		log.Printf("")
-		log.Printf("TxData Compression:")
-		log.Printf("  Original size:          %s", formatBytes(totalStats.UncompressedTx))
-		log.Printf("  Compressed size:        %s", formatBytes(totalStats.CompressedTx))
-		log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
-		log.Printf("  Space saved:            %s", formatBytes(totalStats.UncompressedTx-totalStats.CompressedTx))
+		if totalStats.UncompressedTx > 0 {
+			compressionRatio := 100 * (1 - float64(totalStats.CompressedTx)/float64(totalStats.UncompressedTx))
+			log.Printf("")
+			log.Printf("TxData Compression:")
+			log.Printf("  Original size:          %s", formatBytes(totalStats.UncompressedTx))
+			log.Printf("  Compressed size:        %s", formatBytes(totalStats.CompressedTx))
+			log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
+			log.Printf("  Space saved:            %s", formatBytes(totalStats.UncompressedTx-totalStats.CompressedTx))
+		}
 	}
 
 	log.Printf("")
-	showDBSizes(config)
 	log.Printf("========================================\n")
 }
 
