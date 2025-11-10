@@ -116,7 +116,7 @@ func openDestinationDB(path string) (*grocksdb.DB, *grocksdb.Options, error) {
 
 	// Settings for ingestion
 	opts.SetWriteBufferSize(512 << 20)
-	opts.SetMaxBackgroundJobs(12)
+	opts.SetMaxBackgroundJobs(20)
 	opts.SetTargetFileSizeBase(256 << 20)
 	opts.SetMaxBytesForLevelBase(1024 << 20)
 	opts.SetMaxBytesForLevelMultiplier(10)

@@ -202,7 +202,7 @@ func openDestinationDB(path string) (*grocksdb.DB, *grocksdb.Options, error) {
 	opts.SetMaxBytesForLevelMultiplier(10)
 
 	// 5. BACKGROUND JOBS
-	opts.SetMaxBackgroundJobs(12)
+	opts.SetMaxBackgroundJobs(20)
 
 	// 6. OPEN FILES
 	opts.SetMaxOpenFiles(5000)

@@ -53,7 +53,7 @@ func main() {
 	var db1Path, db2Path, db3Path string
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
-	flag.IntVar(&batchSize, "batch-size", 2000, "Batch size for commit")
+	flag.IntVar(&batchSize, "ledger-batch-size", 2000, "Ledger-Batch size for commit")
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
 	flag.StringVar(&db1Path, "db1", "", "Optional path for DataStore 1 (ledgerSeq -> compressed LCM)")
 	flag.StringVar(&db2Path, "db2", "", "Path for DataStore 2 (txHash -> compressed TxData)")
@@ -759,7 +759,7 @@ func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error
 	// CRITICAL: Increase background threads to handle compactions faster
 	// This allows RocksDB to compact L0->L1 while you continue writing
 	// Total background jobs (flushes + compactions)
-	opts.SetMaxBackgroundJobs(12) // Increased from 6 or 8
+	opts.SetMaxBackgroundJobs(20) // Increased from 6 or 8
 
 	// Number of threads for compaction
 	// THIS IS OLD. Do not use this when SetMaxBackgroundJobs is already used.
