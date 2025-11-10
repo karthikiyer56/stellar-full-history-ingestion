@@ -258,8 +258,11 @@ func main() {
 		}
 
 		if processedCount%(config.BatchSize*10) == 0 {
+			log.Printf("\n========================================")
+			log.Printf("\n========= ROCKSDB STATS =====\n")
 			monitorRocksDBStats(db2, "DB2")
 			monitorRocksDBStats(db3, "DB3")
+			log.Printf("\n========================================\n")
 		}
 
 		// Report progress every 1%
@@ -309,6 +312,12 @@ func main() {
 	compactAllDBs(db1, db2, db3, config.EnableDB1)
 	totalFlushTime += time.Since(finalCompactionStart)
 	log.Printf("Final compaction complete in %s", formatDuration(time.Since(finalCompactionStart)))
+
+	log.Printf("\n========================================")
+	log.Printf("\n========= FINAL ROCKSDB STATS after compaction =====\n")
+	monitorRocksDBStats(db2, "DB2")
+	monitorRocksDBStats(db3, "DB3")
+	log.Printf("\n========================================")
 
 	// Print final statistics
 	log.Printf("\n========================================")
@@ -749,16 +758,18 @@ func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error
 	// ============================================================================
 	// CRITICAL: Increase background threads to handle compactions faster
 	// This allows RocksDB to compact L0->L1 while you continue writing
-
 	// Total background jobs (flushes + compactions)
 	opts.SetMaxBackgroundJobs(12) // Increased from 6 or 8
 
-	// Or set separately (alternative to SetMaxBackgroundJobs):
-	// opts.SetMaxBackgroundCompactions(8)
-	// opts.SetMaxBackgroundFlushes(4)
-
 	// Number of threads for compaction
-	opts.IncreaseParallelism(8) // Use 8 CPU cores for background work
+	// THIS IS OLD. Do not use this when SetMaxBackgroundJobs is already used.
+	// IncreaseParallelism is an older setting
+	// opts.IncreaseParallelism(8) // Use 8 CPU cores for background work
+
+	// Or set separately (alternative to SetMaxBackgroundJobs):
+	// These are deprecated though. Prefer to use SetMaxBackgroundJobs
+	//opts.SetMaxBackgroundCompactions(8)
+	//opts.SetMaxBackgroundFlushes(4)
 
 	// ============================================================================
 	// 5. COMPRESSION SETTINGS
@@ -798,11 +809,13 @@ func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error
 	opts.SetMaxLogFileSize(20 << 20) // 20 MB max log file
 	opts.SetKeepLogFileNum(3)        // Keep last 3 log files
 
+	////// DO NOT RUN THESE SETTINGS BELOW THOUGH
+
 	//// ============================================================================
 	//// 10. OPTIMIZATION HINTS
 	//// ============================================================================
 	//// Tell RocksDB you're doing bulk sequential inserts
-	//opts.PrepareForBulkLoad()
+	// opts.PrepareForBulkLoad()
 	//// NOTE: PrepareForBulkLoad() sets:
 	////   - write_buffer_size to 64MB (we override above with 512MB)
 	////   - max_write_buffer_number to 7
