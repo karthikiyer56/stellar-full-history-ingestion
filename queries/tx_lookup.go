@@ -1,16 +1,17 @@
 package main
 
 // Filename: tx_lookup.go
-// Usage: go run tx_lookup.go <db2-path> <db3-path> <tx-hash-hex>
-// Example: go run tx_lookup.go /data/db2 /data/db3 abc123...
+// Usage: go run tx_lookup.go <db-path> <db3-path> <tx-hash-hex>
+// Example: go run tx_lookup.go /data/db /data/db3 abc123...
 
 import (
 	"encoding/base64"
-	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
 	"github.com/klauspost/compress/zstd"
@@ -22,14 +23,13 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 3 {
-		fmt.Println("Usage: tx_lookup <db2-path> <db3-path> <tx-hash-hex>")
-		fmt.Println("Example: tx_lookup /data/db2 /data/db3 abc123...")
+		fmt.Println("Usage: tx_lookup <path to txHash->txData db> <tx-hash-hex>")
+		fmt.Println("Example: tx_lookup /data/db  abc123...")
 		os.Exit(1)
 	}
 
-	db2Path := flag.Arg(0)
-	db3Path := flag.Arg(1)
-	txHashHex := flag.Arg(2)
+	dbPath := flag.Arg(0)
+	txHashHex := flag.Arg(1)
 
 	// Convert hex string to binary bytes
 	txHashBytes, err := hexStringToBytes(txHashHex)
@@ -38,64 +38,38 @@ func main() {
 	}
 
 	// Check if databases exist
-	if _, err := os.Stat(db2Path); os.IsNotExist(err) {
-		log.Fatalf("Error: DB2 directory does not exist: %s", db2Path)
-	}
-	if _, err := os.Stat(db3Path); os.IsNotExist(err) {
-		log.Fatalf("Error: DB3 directory does not exist: %s", db3Path)
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		log.Fatalf("Error: DB directory does not exist: %s", dbPath)
 	}
 
 	// Open DB2 (txHash -> TxData)
 	opts2 := grocksdb.NewDefaultOptions()
 	defer opts2.Destroy()
 
-	db2, err := grocksdb.OpenDbForReadOnly(opts2, db2Path, false)
+	db, err := grocksdb.OpenDbForReadOnly(opts2, dbPath, false)
 	if err != nil {
 		log.Fatalf("Failed to open DB2: %v", err)
 	}
-	defer db2.Close()
+	defer db.Close()
 
 	// Open DB3 (txHash -> ledgerSeq)
 	opts3 := grocksdb.NewDefaultOptions()
 	defer opts3.Destroy()
 
-	db3, err := grocksdb.OpenDbForReadOnly(opts3, db3Path, false)
-	if err != nil {
-		log.Fatalf("Failed to open DB3: %v", err)
-	}
-	defer db3.Close()
-
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
-	// Query DB3 first for ledger sequence
-	value3, err := db3.Get(ro, txHashBytes)
-	if err != nil {
-		log.Fatalf("Failed to read from DB3: %v", err)
-	}
-	defer value3.Free()
-
-	data3 := value3.Data()
-	if len(data3) == 0 {
-		fmt.Printf("\n========================================\n")
-		fmt.Printf("Transaction %s: NOT FOUND\n", txHashHex)
-		fmt.Printf("========================================\n\n")
-		return
-	}
-
-	ledgerSeq := binary.BigEndian.Uint32(data3)
-
 	// Query DB2 for transaction data
-	value2, err := db2.Get(ro, txHashBytes)
+	value, err := db.Get(ro, txHashBytes)
 	if err != nil {
-		log.Fatalf("Failed to read from DB2: %v", err)
+		log.Fatalf("Failed to read from DB: %v", err)
 	}
-	defer value2.Free()
+	defer value.Free()
 
-	data2 := value2.Data()
-	if len(data2) == 0 {
+	data := value.Data()
+	if len(data) == 0 {
 		fmt.Printf("\n========================================\n")
-		fmt.Printf("Transaction data not found in DB2\n")
+		fmt.Printf("Transaction data not found in DB\n")
 		fmt.Printf("========================================\n\n")
 		return
 	}
@@ -107,7 +81,7 @@ func main() {
 	}
 	defer decoder.Close()
 
-	decompressedData, err := decoder.DecodeAll(data2, nil)
+	decompressedData, err := decoder.DecodeAll(data, nil)
 	if err != nil {
 		log.Fatalf("Failed to decompress data: %v", err)
 	}
@@ -127,13 +101,13 @@ func main() {
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Transaction Hash: %s\n", txHashHex)
 	fmt.Printf("========================================\n")
-	fmt.Printf("Ledger sequence:      %d\n", ledgerSeq)
+	fmt.Printf("Ledger sequence:      %d\n", txData.LedgerSequence)
 	fmt.Printf("Transaction index:    %d\n", txData.Index)
 	fmt.Printf("Closed at:            %v\n", txData.ClosedAt.AsTime())
 	fmt.Printf("\nData sizes:\n")
-	fmt.Printf("  Compressed:         %s\n", formatBytes(int64(len(data2))))
+	fmt.Printf("  Compressed:         %s\n", formatBytes(int64(len(data))))
 	fmt.Printf("  Uncompressed:       %s\n", formatBytes(int64(len(decompressedData))))
-	fmt.Printf("  Compression ratio:  %.2f%%\n", 100*(1-float64(len(data2))/float64(len(decompressedData))))
+	fmt.Printf("  Compression ratio:  %.2f%%\n", 100*(1-float64(len(data))/float64(len(decompressedData))))
 	fmt.Printf("\nComponent sizes:\n")
 	fmt.Printf("  Envelope:           %s\n", formatBytes(int64(len(txData.TxEnvelope))))
 	fmt.Printf("  Result:             %s\n", formatBytes(int64(len(txData.TxResult))))
@@ -148,23 +122,10 @@ func main() {
 }
 
 // hexStringToBytes converts a hex string to bytes
+// hexStringToBytes converts a hex string to bytes
 func hexStringToBytes(hexStr string) ([]byte, error) {
-	// Remove "0x" prefix if present
-	if len(hexStr) >= 2 && hexStr[0:2] == "0x" {
-		hexStr = hexStr[2:]
-	}
-
-	// Decode hex string to bytes
-	bytes := make([]byte, len(hexStr)/2)
-	for i := 0; i < len(bytes); i++ {
-		var b byte
-		_, err := fmt.Sscanf(hexStr[i*2:i*2+2], "%02x", &b)
-		if err != nil {
-			return nil, err
-		}
-		bytes[i] = b
-	}
-	return bytes, nil
+	hexStr = strings.TrimPrefix(hexStr, "0x")
+	return hex.DecodeString(hexStr)
 }
 
 // wrapText wraps text at the specified width
