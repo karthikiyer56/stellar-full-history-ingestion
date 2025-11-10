@@ -798,39 +798,39 @@ func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error
 	opts.SetMaxLogFileSize(20 << 20) // 20 MB max log file
 	opts.SetKeepLogFileNum(3)        // Keep last 3 log files
 
-	// ============================================================================
-	// 10. OPTIMIZATION HINTS
-	// ============================================================================
-	// Tell RocksDB you're doing bulk sequential inserts
-	opts.PrepareForBulkLoad()
-	// NOTE: PrepareForBulkLoad() sets:
-	//   - write_buffer_size to 64MB (we override above with 512MB)
-	//   - max_write_buffer_number to 7
-	//   - Disables compactions (we re-enable with controlled settings)
-	//   - Increases L0 thresholds
-	// Our custom settings above override these to be even more aggressive
-
-	// ============================================================================
-	// 11. ADVANCED: COMPACTION PRIORITY
-	// ============================================================================
-	// Prioritize reducing number of L0 files first
-	// opts.SetCompactionPri(grocksdb.MinOverlappingRatio)
-	// Or use default (ByCompensatedSize)
-
-	// ============================================================================
-	// 12. UNIVERSAL COMPACTION (ALTERNATIVE STRATEGY)
-	// ============================================================================
-	// If Level compaction still causes issues, try Universal compaction
-	// Universal compaction works better for write-heavy workloads
-	// Uncomment to try:
+	//// ============================================================================
+	//// 10. OPTIMIZATION HINTS
+	//// ============================================================================
+	//// Tell RocksDB you're doing bulk sequential inserts
+	//opts.PrepareForBulkLoad()
+	//// NOTE: PrepareForBulkLoad() sets:
+	////   - write_buffer_size to 64MB (we override above with 512MB)
+	////   - max_write_buffer_number to 7
+	////   - Disables compactions (we re-enable with controlled settings)
+	////   - Increases L0 thresholds
+	//// Our custom settings above override these to be even more aggressive
 	//
-	// opts.SetCompactionStyle(grocksdb.UniversalCompactionStyle)
-	// ucOpts := grocksdb.NewDefaultUniversalCompactionOptions()
-	// ucOpts.SetSizeRatio(1)                    // More aggressive compaction
-	// ucOpts.SetMinMergeWidth(2)                // Minimum files to compact together
-	// ucOpts.SetMaxMergeWidth(10)               // Maximum files to compact together
-	// ucOpts.SetMaxSizeAmplificationPercent(200) // Allow 200% size amplification
-	// opts.SetUniversalCompactionOptions(ucOpts)
+	//// ============================================================================
+	//// 11. ADVANCED: COMPACTION PRIORITY
+	//// ============================================================================
+	//// Prioritize reducing number of L0 files first
+	//// opts.SetCompactionPri(grocksdb.MinOverlappingRatio)
+	//// Or use default (ByCompensatedSize)
+	//
+	//// ============================================================================
+	//// 12. UNIVERSAL COMPACTION (ALTERNATIVE STRATEGY)
+	//// ============================================================================
+	//// If Level compaction still causes issues, try Universal compaction
+	//// Universal compaction works better for write-heavy workloads
+	//// Uncomment to try:
+	////
+	//// opts.SetCompactionStyle(grocksdb.UniversalCompactionStyle)
+	//// ucOpts := grocksdb.NewDefaultUniversalCompactionOptions()
+	//// ucOpts.SetSizeRatio(1)                    // More aggressive compaction
+	//// ucOpts.SetMinMergeWidth(2)                // Minimum files to compact together
+	//// ucOpts.SetMaxMergeWidth(10)               // Maximum files to compact together
+	//// ucOpts.SetMaxSizeAmplificationPercent(200) // Allow 200% size amplification
+	//// opts.SetUniversalCompactionOptions(ucOpts)
 
 	// ============================================================================
 	// OPEN DATABASE
