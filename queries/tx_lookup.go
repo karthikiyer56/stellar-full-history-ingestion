@@ -20,16 +20,16 @@ import (
 )
 
 func main() {
+
+	var dbPath, txHashHex string
+
+	flag.StringVar(&dbPath, "db", "", "txHash->txData database path")
+	flag.StringVar(&txHashHex, "tx", "", "tx hash in hex")
 	flag.Parse()
 
-	if flag.NArg() < 3 {
-		fmt.Println("Usage: tx_lookup <path to txHash->txData db> <tx-hash-hex>")
-		fmt.Println("Example: tx_lookup /data/db  abc123...")
-		os.Exit(1)
+	if dbPath == "" || txHashHex == "" {
+		log.Fatal("Usage: go run tx_lookup.go --db /path/to/db --tx abc12...")
 	}
-
-	dbPath := flag.Arg(0)
-	txHashHex := flag.Arg(1)
 
 	// Convert hex string to binary bytes
 	txHashBytes, err := hexStringToBytes(txHashHex)
