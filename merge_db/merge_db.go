@@ -111,7 +111,7 @@ func main() {
 		fmt.Sscanf(estimatedKeys, "%d", &keyCount)
 		stats.TotalKeysToMerge += keyCount
 
-		log.Printf("  [%d/%d] %s: ~%s keys", i+1, len(sources), filepath.Base(srcPath), formatNumber(keyCount))
+		log.Printf("  [%d/%d] %s: ~%s keys", i+1, len(sources), srcPath, formatNumber(keyCount))
 
 		srcDB.Close()
 	}
@@ -252,7 +252,7 @@ func mergeDatabase(destDB *grocksdb.DB, srcPath string, stats *MergeStats, batch
 	defer srcDB.Close()
 
 	// Show source DB stats
-	showStats(srcDB, fmt.Sprintf("Source: %s", filepath.Base(srcPath)))
+	showStats(srcDB, fmt.Sprintf("Source: %s", srcPath))
 
 	// Create iterator for source database
 	readOpts := grocksdb.NewDefaultReadOptions()
@@ -355,7 +355,7 @@ func reportProgress(stats *MergeStats, db *grocksdb.DB) {
 		recentKeysPerSec,
 		formatBytes(stats.TotalBytes),
 		l0Files,
-		filepath.Base(stats.CurrentSource))
+		stats.CurrentSource)
 
 	stats.LastReportTime = time.Now()
 	stats.KeysSinceReport = 0
