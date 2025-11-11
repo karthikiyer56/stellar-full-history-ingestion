@@ -1092,10 +1092,10 @@ func monitorRocksDBStats(db *grocksdb.DB, title string) {
 	l0Files := db.GetProperty("rocksdb.num-files-at-level0")
 	l1Files := db.GetProperty("rocksdb.num-files-at-level1")
 	l2Files := db.GetProperty("rocksdb.num-files-at-level2")
-	l3Files := db.GetProperty("rocksdb.num-files-at-level2")
-	l4Files := db.GetProperty("rocksdb.num-files-at-level2")
-	l5Files := db.GetProperty("rocksdb.num-files-at-level2")
-	l6Files := db.GetProperty("rocksdb.num-files-at-level2")
+	l3Files := db.GetProperty("rocksdb.num-files-at-level3")
+	l4Files := db.GetProperty("rocksdb.num-files-at-level4")
+	l5Files := db.GetProperty("rocksdb.num-files-at-level5")
+	l6Files := db.GetProperty("rocksdb.num-files-at-level6")
 
 	estimatedKeys := db.GetProperty("rocksdb.estimate-num-keys")
 	totalSSTSize := db.GetProperty("rocksdb.total-sst-files-size")
@@ -1111,14 +1111,17 @@ func monitorRocksDBStats(db *grocksdb.DB, title string) {
 	log.Printf("  L5 Files: %s", l5Files)
 	log.Printf("  L6 Files: %s", l6Files)
 
-	log.Printf("  Estimated Keys: %s", estimatedKeys)
+	log.Printf("  Estimated Keys: %s", formatNumber(int64(AtoiIgnoreError(estimatedKeys))))
 
-	if AtoiIgnoreError(estimatedKeys) > 0 && AtoiIgnoreError(totalSSTSize) > 0 {
-		avgKeySize := float64(AtoiIgnoreError(totalSSTSize)) / float64(AtoiIgnoreError(estimatedKeys))
-		fmt.Printf("Avg Key+Value Size:      %.2f bytes\n", avgKeySize)
+	estimatedKeysInt := int64(AtoiIgnoreError(estimatedKeys))
+	totalSSTSizeInt := int64(AtoiIgnoreError(totalSSTSize))
+
+	if estimatedKeysInt > 0 && totalSSTSizeInt > 0 {
+		avgKeySize := float64(totalSSTSizeInt) / float64(estimatedKeysInt)
+		log.Printf("  Avg Key+Value Size: %.2f bytes", avgKeySize)
 	}
 
-	log.Printf("  Total SST Size: %s", totalSSTSize)
-	log.Printf("  Memtable Usage: %s", curMemtable)
+	log.Printf("  Total SST Size: %s", formatBytes(totalSSTSizeInt))
+	log.Printf("  Memtable Usage: %s", formatBytes(int64(AtoiIgnoreError(curMemtable))))
 	log.Printf("  Compaction Pending: %s", compactionPending)
 }
