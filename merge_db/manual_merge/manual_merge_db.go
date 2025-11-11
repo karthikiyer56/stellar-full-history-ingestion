@@ -34,8 +34,8 @@ func main() {
 
 	flag.StringVar(&finalPath, "final-path", "", "Destination database path")
 	flag.StringVar(&sourcePaths, "paths", "", "Space-separated source database paths")
-	flag.IntVar(&batchSize, "batch-size", 10000, "Number of keys to write per batch")
-	flag.IntVar(&reportInterval, "report-interval", 100000, "Report progress every N keys")
+	flag.IntVar(&batchSize, "batch-size", 1_000_000, "Number of keys to write per batch")
+	flag.IntVar(&reportInterval, "report-interval", 1_000_000, "Report progress every N keys")
 	flag.Parse()
 
 	if finalPath == "" || sourcePaths == "" {
@@ -177,57 +177,45 @@ func openDestinationDB(path string) (*grocksdb.DB, *grocksdb.Options, error) {
 	// OPTIMIZED SETTINGS FOR MERGING/BULK LOADING
 	// ============================================================================
 
-	// 1. LARGE WRITE BUFFERS
-	// Accumulate more data in memory before flushing to reduce number of L0 files
-	opts.SetWriteBufferSize(512 << 20) // 512 MB per memtable
-	opts.SetMaxWriteBufferNumber(6)    // Allow 6 memtables (3 GB total)
+	// 1. LARGER WRITE BUFFERS (you said you're okay with more memory)
+	opts.SetWriteBufferSize(1024 << 20) // 1 GB per memtable (was 512 MB)
+	opts.SetMaxWriteBufferNumber(8)     // 8 memtables = 8 GB total (was 3 GB)
 	opts.SetMinWriteBufferNumberToMerge(2)
 
-	// 2. COMPRESSION
-	// No compression since source data is already compressed
+	// 2. COMPRESSION - keep as is
 	opts.SetCompression(grocksdb.NoCompression)
 
-	// 3. COMPACTION SETTINGS
-	// Enable auto-compactions but with high thresholds to batch work
+	// 3. COMPACTION SETTINGS - MORE AGGRESSIVE L0 THRESHOLDS (for TB-scale data)
 	opts.SetDisableAutoCompactions(false)
-	opts.SetLevel0FileNumCompactionTrigger(50) // Start compacting at 50 L0 files
-	opts.SetLevel0SlowdownWritesTrigger(100)   // Soft limit
-	opts.SetLevel0StopWritesTrigger(150)       // Hard limit
+	opts.SetLevel0FileNumCompactionTrigger(80) // 80 files (was 50)
+	opts.SetLevel0SlowdownWritesTrigger(150)   // 150 files (was 100)
+	opts.SetLevel0StopWritesTrigger(200)       // 200 files (was 150)
 
-	// 4. FILE SIZES
-	// Larger files reduce total file count
-	opts.SetTargetFileSizeBase(256 << 20) // 256 MB per file
+	// 4. LARGER FILE SIZES (fewer files for TB-scale)
+	opts.SetTargetFileSizeBase(512 << 20) // 512 MB (was 256 MB)
 	opts.SetTargetFileSizeMultiplier(2)
-	opts.SetMaxBytesForLevelBase(1024 << 20) // 1 GB for L1
+	opts.SetMaxBytesForLevelBase(2048 << 20) // 2 GB for L1 (was 1 GB)
 	opts.SetMaxBytesForLevelMultiplier(10)
 
-	// 5. BACKGROUND JOBS
-	opts.SetMaxBackgroundJobs(20)
+	// 5. MORE BACKGROUND JOBS (you have 16 cores)
+	opts.SetMaxBackgroundJobs(24) // Up from 20, utilize more cores
 
-	// 6. OPEN FILES
-	opts.SetMaxOpenFiles(5000)
+	// 6. MORE OPEN FILES (for large database)
+	opts.SetMaxOpenFiles(10000) // Up from 5000
 
-	// 7. WAL
-	opts.SetMaxTotalWalSize(2048 << 20) // 2 GB max WAL
-
-	// 8. BLOCK CACHE
-	// Cache for better performance during merge
+	// 7. LARGER BLOCK CACHE (more memory available)
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetBlockSize(32 << 10)                         // 32 KB blocks
-	bbto.SetBlockCache(grocksdb.NewLRUCache(512 << 20)) // 512 MB cache
+	bbto.SetBlockSize(64 << 10)                          // 64 KB (was 32 KB)
+	bbto.SetBlockCache(grocksdb.NewLRUCache(1024 << 20)) // 1 GB (was 512 MB)
 	opts.SetBlockBasedTableFactory(bbto)
+
+	// 8. LARGER WAL
+	opts.SetMaxTotalWalSize(4096 << 20) // 4 GB (was 2 GB)
 
 	// 9. LOGGING
 	opts.SetInfoLogLevel(grocksdb.WarnInfoLogLevel)
 	opts.SetMaxLogFileSize(20 << 20)
 	opts.SetKeepLogFileNum(3)
-
-	log.Printf("Destination DB Settings:")
-	log.Printf("  Write Buffer: 512 MB × 6 = 3 GB")
-	log.Printf("  L0 Trigger: 50 files")
-	log.Printf("  Background Compactions: 10")
-	log.Printf("  Block Cache: 512 MB")
-	log.Printf("  Auto-compactions: Enabled (controlled)")
 
 	db, err := grocksdb.OpenDb(opts, path)
 	if err != nil {
@@ -335,6 +323,10 @@ func mergeDatabase(destDB *grocksdb.DB, srcPath string, stats *MergeStats, batch
 	flushDB(destDB)
 
 	log.Printf("  Keys merged from this source: %s", formatNumber(keysInSource))
+	log.Printf("  Performing interim compaction after %s...", srcPath)
+	compactStart := time.Now()
+	destDB.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+	log.Printf("  ✓ Interim compaction done in %s\n", formatDuration(time.Since(compactStart)))
 
 	return nil
 }
@@ -407,6 +399,19 @@ func checkPercentageMilestone(stats *MergeStats, db *grocksdb.DB) {
 
 		log.Printf("  SST Files: L0=%s, L1=%s, L2=%s, L3=%s, L4=%s, L5=%s, L6=%s",
 			l0, l1, l2, l3, l4, l5, l6)
+
+		var l0Count int
+		fmt.Sscanf(l0, "%d", &l0Count)
+
+		if l0Count > 120 {
+			log.Printf("  ⚠️  WARNING: L0 at %d files - approaching slowdown!", l0Count)
+		}
+		if l0Count > 170 {
+			log.Printf("  🚨 CRITICAL: L0 at %d files - approaching write stop!", l0Count)
+		}
+
+		memtableUsage := db.GetProperty("rocksdb.cur-size-all-mem-tables")
+		log.Printf("  Memtable Memory: %s", memtableUsage)
 
 		// Compaction status
 		compactionPending := db.GetProperty("rocksdb.compaction-pending")
