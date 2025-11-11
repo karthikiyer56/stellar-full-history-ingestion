@@ -31,10 +31,17 @@ func main() {
 	opts.SetCreateIfMissing(false)
 
 	// Set compaction settings for the redistribution
-	opts.SetMaxBackgroundJobs(20)
-	opts.SetTargetFileSizeBase(256 << 20)    // 256 MB
-	opts.SetMaxBytesForLevelBase(1024 << 20) // 1 GB for L1
+	opts.SetMaxBackgroundJobs(24)
+	opts.SetTargetFileSizeBase(512 << 20) // 512 MB
+	opts.SetTargetFileSizeMultiplier(2)
+
+	opts.SetMaxBytesForLevelBase(2048 << 20) // 2 GB for L1
 	opts.SetMaxBytesForLevelMultiplier(10)   // Each level 10x previous
+
+	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
+	bbto.SetBlockSize(64 << 10)                          // 64 KB (was 32 KB)
+	bbto.SetBlockCache(grocksdb.NewLRUCache(1024 << 20)) // 1 GB (was 512 MB)
+	opts.SetBlockBasedTableFactory(bbto)
 
 	db, err := grocksdb.OpenDb(opts, dbPath)
 	if err != nil {
