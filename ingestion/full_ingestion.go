@@ -365,8 +365,8 @@ func main() {
 				txCount = len(txHashToTxData)
 			}
 
-			log.Printf("\n\n[Ledger %d-%d] Writing batch to disk (%d ledgers, %d transactions)...",
-				batchInfo.StartLedger, batchInfo.EndLedger, lcmCount, txCount)
+			log.Printf("\n\n[Ledger %d-%d] Writing batch to disk at ledger: %d,  (%d ledgers, %d transactions)...",
+				batchInfo.StartLedger, batchInfo.EndLedger, ledgerSeq, lcmCount, txCount)
 
 			// Write to databases with timing
 			dbTiming, err := writeBatchToDBWithTiming(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config)
@@ -462,8 +462,9 @@ func main() {
 			ioPct := 100 * totalIOTime.Seconds() / elapsed.Seconds()
 
 			log.Printf("\n========================================")
-			log.Printf("Progress: %d/%d ledgers (%d%%)", processedCount, totalLedgers, currentPercent)
-			log.Printf("Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s",
+			log.Printf("========== Progress: %d/%d ledgers (%d%%) (current: %d, startLedger:%d, endLedger:%d) ==========", processedCount, totalLedgers, currentPercent,
+				ledgerSeq, startLedger, endLedger)
+			log.Printf("========== Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s ==========",
 				ledgersPerSec, formatNumber(totalStats.TxCount), formatDuration(eta))
 			log.Printf("Time breakdown: Processing=%.1f%%, I/O=%.1f%%", processingPct, ioPct)
 
