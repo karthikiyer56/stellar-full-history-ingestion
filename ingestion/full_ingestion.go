@@ -29,16 +29,17 @@ import (
 
 // IngestionConfig holds configuration for the ingestion process
 type IngestionConfig struct {
-	StartLedger       uint32
-	EndLedger         uint32
-	BatchSize         int
-	DB1Path           string // Optional: ledgerSeq -> compressed LCM
-	DB2Path           string // Optional: txHash -> compressed TxData
-	DB3Path           string // Optional: txHash -> ledgerSeq
-	EnableDB1         bool   // Derived: true if DB1Path is provided
-	EnableDB2         bool   // Derived: true if DB2Path is provided
-	EnableDB3         bool   // Derived: true if DB3Path is provided
-	EnableCompression bool   // true to enable compression
+	StartLedger                  uint32
+	EndLedger                    uint32
+	BatchSize                    int
+	DB1Path                      string // Optional: ledgerSeq -> compressed LCM
+	DB2Path                      string // Optional: txHash -> compressed TxData
+	DB3Path                      string // Optional: txHash -> ledgerSeq
+	EnableDB1                    bool   // Derived: true if DB1Path is provided
+	EnableDB2                    bool   // Derived: true if DB2Path is provided
+	EnableDB3                    bool   // Derived: true if DB3Path is provided
+	EnableApplicationCompression bool   // true to enable compression in code before writing to rocksdb
+	EnableRocksdbCompression     bool   // true to enable native rocksdb compression via set options
 }
 
 // CompressionStats tracks compression metrics for a batch
@@ -87,7 +88,7 @@ func main() {
 	var startLedger, endLedger uint
 	var batchSize int
 	var db1Path, db2Path, db3Path string
-	var enableCompression bool
+	var enableApplicationCompression, enableRocksdbCompression bool
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
 	flag.IntVar(&batchSize, "ledger-batch-size", 2000, "Ledger-Batch size for commit")
@@ -95,7 +96,8 @@ func main() {
 	flag.StringVar(&db1Path, "db1", "", "Optional path for DataStore 1 (ledgerSeq -> compressed LCM)")
 	flag.StringVar(&db2Path, "db2", "", "Optional path for DataStore 2 (txHash -> compressed TxData)")
 	flag.StringVar(&db3Path, "db3", "", "Optional path for DataStore 3 (txHash -> ledgerSeq)")
-	flag.BoolVar(&enableCompression, "compression", true, "Enable compression (default: true)")
+	flag.BoolVar(&enableApplicationCompression, "app-compression", true, "Enable compression before saving to rocksdb (default: true)")
+	flag.BoolVar(&enableRocksdbCompression, "rocksdb-compression", false, "Enable rocksdb native compression (default: false)")
 	flag.Parse()
 
 	// Validate required arguments
@@ -152,16 +154,17 @@ func main() {
 
 	// Create config
 	config := IngestionConfig{
-		StartLedger:       uint32(startLedger),
-		EndLedger:         uint32(endLedger),
-		BatchSize:         batchSize,
-		DB1Path:           db1FullPath,
-		DB2Path:           db2FullPath,
-		DB3Path:           db3FullPath,
-		EnableDB1:         enableDb1,
-		EnableDB2:         enableDb2,
-		EnableDB3:         enableDb3,
-		EnableCompression: enableCompression,
+		StartLedger:                  uint32(startLedger),
+		EndLedger:                    uint32(endLedger),
+		BatchSize:                    batchSize,
+		DB1Path:                      db1FullPath,
+		DB2Path:                      db2FullPath,
+		DB3Path:                      db3FullPath,
+		EnableDB1:                    enableDb1,
+		EnableDB2:                    enableDb2,
+		EnableDB3:                    enableDb3,
+		EnableApplicationCompression: enableApplicationCompression,
+		EnableRocksdbCompression:     enableRocksdbCompression,
 	}
 
 	// Initialize RocksDB instances
@@ -171,7 +174,7 @@ func main() {
 	// Only open DB1 if path is provided
 	if config.EnableDB1 {
 		var err error
-		db1, opts1, err = openRocksDBForBulkLoad(config.DB1Path)
+		db1, opts1, err = openRocksDBForBulkLoad(config.DB1Path, config)
 		if err != nil {
 			log.Fatalf("Failed to open DB1 (ledgerSeq -> LCM): %v", err)
 		}
@@ -179,7 +182,7 @@ func main() {
 			db1.Close()
 			opts1.Destroy()
 		}()
-		log.Printf("✓ DB1 opened at: %s", config.DB1Path)
+		log.Printf("✓ DB1 opened at: %s. Application Compression Enabled: %v, Rocksdb compression Enabled: %v", config.DB1Path, enableApplicationCompression, enableRocksdbCompression)
 	} else {
 		log.Printf("ℹ DB1 (ledgerSeq -> LCM) is disabled (no path provided)")
 	}
@@ -187,7 +190,7 @@ func main() {
 	var db2 *grocksdb.DB
 	var opts2 *grocksdb.Options
 	if config.EnableDB2 {
-		db2, opts2, err = openRocksDBForBulkLoad(config.DB2Path)
+		db2, opts2, err = openRocksDBForBulkLoad(config.DB2Path, config)
 		if err != nil {
 			log.Fatalf("Failed to open DB2 (txHash -> TxData): %v", err)
 		}
@@ -195,7 +198,7 @@ func main() {
 			db2.Close()
 			opts2.Destroy()
 		}()
-		log.Printf("✓ DB2 opened at: %s", config.DB2Path)
+		log.Printf("✓ DB2 opened at: %s. Application Compression Enabled: %v, Rocksdb compression Enabled: %v", config.DB2Path, enableApplicationCompression, enableRocksdbCompression)
 	} else {
 		log.Printf("ℹ DB2 (txHash -> TxData) is disabled (no path provided)")
 	}
@@ -203,7 +206,7 @@ func main() {
 	var db3 *grocksdb.DB
 	var opts3 *grocksdb.Options
 	if config.EnableDB3 {
-		db3, opts3, err = openRocksDBForBulkLoad(config.DB3Path)
+		db3, opts3, err = openRocksDBForBulkLoad(config.DB3Path, config)
 		if err != nil {
 			log.Fatalf("Failed to open DB3 (txHash -> ledgerSeq): %v", err)
 		}
@@ -211,7 +214,7 @@ func main() {
 			db3.Close()
 			opts3.Destroy()
 		}()
-		log.Printf("✓ DB3 opened at: %s", config.DB3Path)
+		log.Printf("✓ DB3 opened at: %s. Application Compression Enabled: %v, Rocksdb compression Enabled: %v", config.DB3Path, enableApplicationCompression, enableRocksdbCompression)
 	} else {
 		log.Printf("ℹ DB3 (txHash -> ledgerSeq) is disabled (no path provided)")
 	}
@@ -269,7 +272,8 @@ func main() {
 	log.Printf("DB1 (LCM) storage: %v", config.EnableDB1)
 	log.Printf("DB2 (TxData) storage: %v", config.EnableDB2)
 	log.Printf("DB3 (Hash->Seq) storage: %v", config.EnableDB3)
-	log.Printf("Compression: %v", config.EnableCompression)
+	log.Printf("Application Compression: %v", config.EnableApplicationCompression)
+	log.Printf("Rocksdb Compression: %v", config.EnableRocksdbCompression)
 
 	// Set up metrics tracking
 	startTime := time.Now()
@@ -277,7 +281,7 @@ func main() {
 	lastReportedPercent := -1
 
 	var totalRuntime time.Duration
-	var totalDBTimingStats DBTimingStats
+	var totalDbTimingStats DBTimingStats
 	var totalCompressionStats CompressionStats
 
 	// Track global min/max ledger for DB1 compaction
@@ -300,7 +304,7 @@ func main() {
 
 	// Create a reusable zstd encoder for better performance (only if compression enabled)
 	var encoder *zstd.Encoder
-	if config.EnableCompression {
+	if config.EnableApplicationCompression {
 		encoder, err = zstd.NewWriter(nil)
 		if err != nil {
 			log.Fatal(errors.Wrap(err, "failed to create zstd encoder"))
@@ -322,7 +326,7 @@ func main() {
 		}
 
 		// Process ledger and update maps
-		stats, err := processLedger(encoder, ledger, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config.EnableDB1, config.EnableDB2, config.EnableDB3, config.EnableCompression)
+		stats, err := processLedger(encoder, ledger, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config)
 		if err != nil {
 			log.Printf("Error processing ledger %d: %v", ledgerSeq, err)
 			continue
@@ -382,15 +386,15 @@ func main() {
 			currentBatchDbProcessingTotalTime := time.Since(currentBatchDbProcessingStart)
 
 			// Accumulate timing stats
-			totalDBTimingStats.DB1Write += dbTiming.DB1Write
-			totalDBTimingStats.DB2Write += dbTiming.DB2Write
-			totalDBTimingStats.DB3Write += dbTiming.DB3Write
-			totalDBTimingStats.DB1Flush += flushTiming.DB1Flush
-			totalDBTimingStats.DB2Flush += flushTiming.DB2Flush
-			totalDBTimingStats.DB3Flush += flushTiming.DB3Flush
-			totalDBTimingStats.DB1Compact += compactTiming.DB1Compact
-			totalDBTimingStats.DB2Compact += compactTiming.DB2Compact
-			totalDBTimingStats.DB3Compact += compactTiming.DB3Compact
+			totalDbTimingStats.DB1Write += dbTiming.DB1Write
+			totalDbTimingStats.DB2Write += dbTiming.DB2Write
+			totalDbTimingStats.DB3Write += dbTiming.DB3Write
+			totalDbTimingStats.DB1Flush += flushTiming.DB1Flush
+			totalDbTimingStats.DB2Flush += flushTiming.DB2Flush
+			totalDbTimingStats.DB3Flush += flushTiming.DB3Flush
+			totalDbTimingStats.DB1Compact += compactTiming.DB1Compact
+			totalDbTimingStats.DB2Compact += compactTiming.DB2Compact
+			totalDbTimingStats.DB3Compact += compactTiming.DB3Compact
 
 			// Log timing breakdown
 			log.Printf("\n[Ledger %d-%d] Batch timing:", currentBatchInfo.StartLedger, currentBatchInfo.EndLedger)
@@ -452,9 +456,9 @@ func main() {
 			}
 
 			processingPct := 100 * totalRuntime.Seconds() / elapsed.Seconds()
-			totalIOTime := totalDBTimingStats.DB1Write + totalDBTimingStats.DB2Write + totalDBTimingStats.DB3Write +
-				totalDBTimingStats.DB1Flush + totalDBTimingStats.DB2Flush + totalDBTimingStats.DB3Flush +
-				totalDBTimingStats.DB1Compact + totalDBTimingStats.DB2Compact + totalDBTimingStats.DB3Compact // ADD COMPACT TIMES
+			totalIOTime := totalDbTimingStats.DB1Write + totalDbTimingStats.DB2Write + totalDbTimingStats.DB3Write +
+				totalDbTimingStats.DB1Flush + totalDbTimingStats.DB2Flush + totalDbTimingStats.DB3Flush +
+				totalDbTimingStats.DB1Compact + totalDbTimingStats.DB2Compact + totalDbTimingStats.DB3Compact // ADD COMPACT TIMES
 			ioPct := 100 * totalIOTime.Seconds() / elapsed.Seconds()
 
 			log.Printf("\n========================================")
@@ -465,25 +469,25 @@ func main() {
 			log.Printf("Time breakdown: Processing=%.1f%%, I/O=%.1f%%", processingPct, ioPct)
 
 			if config.EnableDB1 {
-				db1TotalTime := totalDBTimingStats.DB1Write + totalDBTimingStats.DB1Flush + totalDBTimingStats.DB1Compact
+				db1TotalTime := totalDbTimingStats.DB1Write + totalDbTimingStats.DB1Flush + totalDbTimingStats.DB1Compact
 				db1Pct := 100 * db1TotalTime.Seconds() / elapsed.Seconds()
 				log.Printf("  DB1: %.1f%% (write=%s, flush=%s, compact=%s)",
-					db1Pct, formatDuration(totalDBTimingStats.DB1Write),
-					formatDuration(totalDBTimingStats.DB1Flush), formatDuration(totalDBTimingStats.DB1Compact))
+					db1Pct, formatDuration(totalDbTimingStats.DB1Write),
+					formatDuration(totalDbTimingStats.DB1Flush), formatDuration(totalDbTimingStats.DB1Compact))
 			}
 			if config.EnableDB2 {
-				db2TotalTime := totalDBTimingStats.DB2Write + totalDBTimingStats.DB2Flush + totalDBTimingStats.DB2Compact
+				db2TotalTime := totalDbTimingStats.DB2Write + totalDbTimingStats.DB2Flush + totalDbTimingStats.DB2Compact
 				db2Pct := 100 * db2TotalTime.Seconds() / elapsed.Seconds()
 				log.Printf("  DB2: %.1f%% (write=%s, flush=%s, compact=%s)",
-					db2Pct, formatDuration(totalDBTimingStats.DB2Write),
-					formatDuration(totalDBTimingStats.DB2Flush), formatDuration(totalDBTimingStats.DB2Compact))
+					db2Pct, formatDuration(totalDbTimingStats.DB2Write),
+					formatDuration(totalDbTimingStats.DB2Flush), formatDuration(totalDbTimingStats.DB2Compact))
 			}
 			if config.EnableDB3 {
-				db3TotalTime := totalDBTimingStats.DB3Write + totalDBTimingStats.DB3Flush + totalDBTimingStats.DB3Compact
+				db3TotalTime := totalDbTimingStats.DB3Write + totalDbTimingStats.DB3Flush + totalDbTimingStats.DB3Compact
 				db3Pct := 100 * db3TotalTime.Seconds() / elapsed.Seconds()
 				log.Printf("  DB3: %.1f%% (write=%s, flush=%s, compact=%s)",
-					db3Pct, formatDuration(totalDBTimingStats.DB3Write),
-					formatDuration(totalDBTimingStats.DB3Flush), formatDuration(totalDBTimingStats.DB3Compact))
+					db3Pct, formatDuration(totalDbTimingStats.DB3Write),
+					formatDuration(totalDbTimingStats.DB3Flush), formatDuration(totalDbTimingStats.DB3Compact))
 			}
 			log.Printf("========================================\n")
 
@@ -520,12 +524,12 @@ func main() {
 		finalBatchDbProcessingTime := time.Since(finalBatchDbProcessingStart)
 
 		// Accumulate timing stats
-		totalDBTimingStats.DB1Write += dbTiming.DB1Write
-		totalDBTimingStats.DB2Write += dbTiming.DB2Write
-		totalDBTimingStats.DB3Write += dbTiming.DB3Write
-		totalDBTimingStats.DB1Flush += flushTiming.DB1Flush
-		totalDBTimingStats.DB2Flush += flushTiming.DB2Flush
-		totalDBTimingStats.DB3Flush += flushTiming.DB3Flush
+		totalDbTimingStats.DB1Write += dbTiming.DB1Write
+		totalDbTimingStats.DB2Write += dbTiming.DB2Write
+		totalDbTimingStats.DB3Write += dbTiming.DB3Write
+		totalDbTimingStats.DB1Flush += flushTiming.DB1Flush
+		totalDbTimingStats.DB2Flush += flushTiming.DB2Flush
+		totalDbTimingStats.DB3Flush += flushTiming.DB3Flush
 
 		log.Printf("Final batch timing: %s", formatDuration(finalBatchDbProcessingTime))
 	}
@@ -540,9 +544,9 @@ func main() {
 	compactionTiming := compactAllDBsWithRange(db1, db2, db3, config, globalMinLedger, globalMaxLedger)
 
 	// Add to total timing
-	totalDBTimingStats.DB1Compact += compactionTiming.DB1Compact
-	totalDBTimingStats.DB2Compact += compactionTiming.DB2Compact
-	totalDBTimingStats.DB3Compact += compactionTiming.DB3Compact
+	totalDbTimingStats.DB1Compact += compactionTiming.DB1Compact
+	totalDbTimingStats.DB2Compact += compactionTiming.DB2Compact
+	totalDbTimingStats.DB3Compact += compactionTiming.DB3Compact
 
 	log.Printf("\n========================================")
 	log.Printf("COMPACTION SUMMARY")
@@ -574,9 +578,9 @@ func main() {
 	log.Printf("\n========================================")
 
 	// Calculate total I/O time
-	totalIOTime := totalDBTimingStats.DB1Write + totalDBTimingStats.DB2Write + totalDBTimingStats.DB3Write +
-		totalDBTimingStats.DB1Flush + totalDBTimingStats.DB2Flush + totalDBTimingStats.DB3Flush +
-		totalDBTimingStats.DB1Compact + totalDBTimingStats.DB2Compact + totalDBTimingStats.DB3Compact
+	totalIOTime := totalDbTimingStats.DB1Write + totalDbTimingStats.DB2Write + totalDbTimingStats.DB3Write +
+		totalDbTimingStats.DB1Flush + totalDbTimingStats.DB2Flush + totalDbTimingStats.DB3Flush +
+		totalDbTimingStats.DB1Compact + totalDbTimingStats.DB2Compact + totalDbTimingStats.DB3Compact
 
 	// Print final statistics
 	log.Printf("\n========================================")
@@ -594,28 +598,28 @@ func main() {
 		100*totalIOTime.Seconds()/elapsed.Seconds())
 
 	if config.EnableDB1 {
-		db1Total := totalDBTimingStats.DB1Write + totalDBTimingStats.DB1Flush + totalDBTimingStats.DB1Compact
+		db1Total := totalDbTimingStats.DB1Write + totalDbTimingStats.DB1Flush + totalDbTimingStats.DB1Compact
 		log.Printf("    DB1:                  %s (write: %s, flush: %s, compact: %s)",
-			formatDuration(db1Total), formatDuration(totalDBTimingStats.DB1Write),
-			formatDuration(totalDBTimingStats.DB1Flush), formatDuration(totalDBTimingStats.DB1Compact))
+			formatDuration(db1Total), formatDuration(totalDbTimingStats.DB1Write),
+			formatDuration(totalDbTimingStats.DB1Flush), formatDuration(totalDbTimingStats.DB1Compact))
 	}
 	if config.EnableDB2 {
-		db2Total := totalDBTimingStats.DB2Write + totalDBTimingStats.DB2Flush + totalDBTimingStats.DB2Compact
+		db2Total := totalDbTimingStats.DB2Write + totalDbTimingStats.DB2Flush + totalDbTimingStats.DB2Compact
 		log.Printf("    DB2:                  %s (write: %s, flush: %s, compact: %s)",
-			formatDuration(db2Total), formatDuration(totalDBTimingStats.DB2Write),
-			formatDuration(totalDBTimingStats.DB2Flush), formatDuration(totalDBTimingStats.DB2Compact))
+			formatDuration(db2Total), formatDuration(totalDbTimingStats.DB2Write),
+			formatDuration(totalDbTimingStats.DB2Flush), formatDuration(totalDbTimingStats.DB2Compact))
 	}
 	if config.EnableDB3 {
-		db3Total := totalDBTimingStats.DB3Write + totalDBTimingStats.DB3Flush + totalDBTimingStats.DB3Compact
+		db3Total := totalDbTimingStats.DB3Write + totalDbTimingStats.DB3Flush + totalDbTimingStats.DB3Compact
 		log.Printf("    DB3:                  %s (write: %s, flush: %s, compact: %s)",
-			formatDuration(db3Total), formatDuration(totalDBTimingStats.DB3Write),
-			formatDuration(totalDBTimingStats.DB3Flush), formatDuration(totalDBTimingStats.DB3Compact))
+			formatDuration(db3Total), formatDuration(totalDbTimingStats.DB3Write),
+			formatDuration(totalDbTimingStats.DB3Flush), formatDuration(totalDbTimingStats.DB3Compact))
 	}
 
 	log.Printf("")
 
 	// Compression statistics
-	if config.EnableCompression {
+	if config.EnableApplicationCompression {
 		if config.EnableDB1 && totalCompressionStats.UncompressedLCM > 0 {
 			compressionRatio := 100 * (1 - float64(totalCompressionStats.CompressedLCM)/float64(totalCompressionStats.UncompressedLCM))
 			log.Printf("LCM Compression:")
@@ -646,10 +650,7 @@ func processLedger(
 	ledgerSeqToLcm map[uint32][]byte,
 	txHashToTxData map[string][]byte,
 	txHashToLedgerSeq map[string]uint32,
-	enableDB1 bool,
-	enableDB2 bool,
-	enableDB3 bool,
-	enableCompression bool,
+	config IngestionConfig,
 ) (*CompressionStats, error) {
 	stats := &CompressionStats{}
 
@@ -663,7 +664,7 @@ func processLedger(
 	closedAt := lcm.ClosedAt()
 
 	// Process and compress LedgerCloseMeta only if DB1 is enabled
-	if enableDB1 {
+	if config.EnableDB1 {
 		lcmBytes, err := lcm.MarshalBinary()
 		if err != nil {
 			return stats, errors.Wrapf(err, "failed to marshal lcm for ledger: %d", ledgerSeq)
@@ -672,7 +673,7 @@ func processLedger(
 		stats.UncompressedLCM = int64(len(lcmBytes))
 
 		var dataToStore []byte
-		if enableCompression {
+		if config.EnableApplicationCompression {
 			dataToStore = compressData(encoder, lcmBytes)
 			stats.CompressedLCM = int64(len(dataToStore))
 		} else {
@@ -684,7 +685,7 @@ func processLedger(
 	}
 
 	// Process each transaction
-	if enableDB2 || enableDB3 {
+	if config.EnableDB2 || config.EnableDB3 {
 		for {
 			tx, err := txReader.Read()
 			if err == io.EOF {
@@ -727,7 +728,7 @@ func processLedger(
 
 			// Compress TxData if compression is enabled
 			var dataToStore []byte
-			if enableCompression {
+			if config.EnableApplicationCompression {
 				dataToStore = compressData(encoder, txDataBytes)
 				stats.CompressedTx += int64(len(dataToStore))
 			} else {
@@ -737,10 +738,10 @@ func processLedger(
 
 			// Use hex string as map key (for convenience), but we'll convert to binary when writing to DB
 			txHashHex := tx.Hash.HexString()
-			if enableDB2 {
+			if config.EnableDB2 {
 				txHashToTxData[txHashHex] = dataToStore
 			}
-			if enableDB3 {
+			if config.EnableDB3 {
 				txHashToLedgerSeq[txHashHex] = ledgerSeq
 			}
 
@@ -953,7 +954,7 @@ func formatDuration(d time.Duration) string {
 
 // openRocksDBForBulkLoad opens or creates a RocksDB database with settings optimized
 // for large-scale bulk ingestion with periodic flushes but delayed final compaction
-func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error) {
+func openRocksDBForBulkLoad(path string, config IngestionConfig) (*grocksdb.DB, *grocksdb.Options, error) {
 
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
@@ -992,7 +993,11 @@ func openRocksDBForBulkLoad(path string) (*grocksdb.DB, *grocksdb.Options, error
 	// ============================================================================
 	// 5. COMPRESSION SETTINGS
 	// ============================================================================
-	opts.SetCompression(grocksdb.NoCompression)
+	if config.EnableRocksdbCompression {
+		opts.SetCompression(grocksdb.ZSTDCompression)
+	} else {
+		opts.SetCompression(grocksdb.NoCompression)
+	}
 
 	// ============================================================================
 	// 6. MEMORY AND FILE MANAGEMENT
