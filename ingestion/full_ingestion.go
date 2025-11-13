@@ -466,6 +466,7 @@ func main() {
 				ledgerSeq, startLedger, endLedger)
 			log.Printf("========== Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s ==========",
 				ledgersPerSec, formatNumber(totalCompressionStats.TxCount), formatDuration(eta))
+			log.Printf("Paths:::: DB1: '%s', DB2: '%s', DB3: '%s'", config.DB1Path, config.DB2Path, config.DB3Path)
 			log.Printf("Time breakdown: Processing=%.1f%%, I/O=%.1f%%", processingPct, ioPct)
 
 			if config.EnableDB1 {
@@ -586,6 +587,7 @@ func main() {
 	log.Printf("\n========================================")
 	log.Printf("INGESTION COMPLETE")
 	log.Printf("========================================")
+	log.Printf("Paths:::: DB1: '%s', DB2: '%s', DB3: '%s'", config.DB1Path, config.DB2Path, config.DB3Path)
 	log.Printf("Total ledgers processed:  %s", formatNumber(int64(processedLedgerCount)))
 	log.Printf("Total transactions:       %s", formatNumber(totalCompressionStats.TxCount))
 	log.Printf("Total time:               %s", formatDuration(elapsed))
