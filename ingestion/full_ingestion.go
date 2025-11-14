@@ -441,7 +441,10 @@ func main() {
 			if config.EnableDB3 {
 				monitorRocksDBStats(db3, "DB3")
 			}
+			log.Printf("")
+			showCompressionStats(config, totalCompressionStats)
 			log.Printf("\n========================================\n")
+
 		}
 
 		// Report progress every 1%
@@ -621,28 +624,33 @@ func main() {
 	log.Printf("")
 
 	// Compression statistics
+	showCompressionStats(config, totalCompressionStats)
+}
+
+func showCompressionStats(config IngestionConfig, stats CompressionStats) {
+
 	if config.EnableApplicationCompression {
-		if config.EnableDB1 && totalCompressionStats.UncompressedLCM > 0 {
-			compressionRatio := 100 * (1 - float64(totalCompressionStats.CompressedLCM)/float64(totalCompressionStats.UncompressedLCM))
+		log.Printf("\nCompression Stats\n")
+		if config.EnableDB1 && stats.UncompressedLCM > 0 {
+			compressionRatio := 100 * (1 - float64(stats.CompressedLCM)/float64(stats.UncompressedLCM))
 			log.Printf("LCM Compression:")
-			log.Printf("  Original size:          %s", formatBytes(totalCompressionStats.UncompressedLCM))
-			log.Printf("  Compressed size:        %s", formatBytes(totalCompressionStats.CompressedLCM))
+			log.Printf("  Original size:          %s", formatBytes(stats.UncompressedLCM))
+			log.Printf("  Compressed size:        %s", formatBytes(stats.CompressedLCM))
 			log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
-			log.Printf("  Space saved:            %s", formatBytes(totalCompressionStats.UncompressedLCM-totalCompressionStats.CompressedLCM))
+			log.Printf("  Space saved:            %s", formatBytes(stats.UncompressedLCM-stats.CompressedLCM))
 		}
 
-		if config.EnableDB2 && totalCompressionStats.UncompressedTx > 0 {
-			compressionRatio := 100 * (1 - float64(totalCompressionStats.CompressedTx)/float64(totalCompressionStats.UncompressedTx))
+		if config.EnableDB2 && stats.UncompressedTx > 0 {
+			compressionRatio := 100 * (1 - float64(stats.CompressedTx)/float64(stats.UncompressedTx))
 			log.Printf("")
 			log.Printf("TxData Compression:")
-			log.Printf("  Original size:          %s", formatBytes(totalCompressionStats.UncompressedTx))
-			log.Printf("  Compressed size:        %s", formatBytes(totalCompressionStats.CompressedTx))
+			log.Printf("  Original size:          %s", formatBytes(stats.UncompressedTx))
+			log.Printf("  Compressed size:        %s", formatBytes(stats.CompressedTx))
 			log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
-			log.Printf("  Space saved:            %s", formatBytes(totalCompressionStats.UncompressedTx-totalCompressionStats.CompressedTx))
+			log.Printf("  Space saved:            %s", formatBytes(stats.UncompressedTx-stats.CompressedTx))
 		}
+		log.Printf("\n========================================\n")
 	}
-
-	log.Printf("\n\n========================================\n")
 }
 
 // processLedger processes a single ledger and updates the batch maps
