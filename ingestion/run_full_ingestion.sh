@@ -69,7 +69,7 @@ fi
 # -----------------------------
 # Temporary output file
 # -----------------------------
-OUTFILE=$(mktemp /tmp/ledger_range.json)
+OUTFILE="/tmp/.ledger_range.json"
 
 cleanup() {
   rm -f "$OUTFILE"
