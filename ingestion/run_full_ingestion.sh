@@ -102,5 +102,5 @@ full_ingestion \
   --db1 "$DB1_PATH" \
   --db2 "$DB2_PATH" \
   --db3 "$DB3_PATH" \
-  --app-compression "$ENABLE_APP_COMPRESSION" \
-  --rocksdb-compression "$ENABLE_ROCKSDB_COMPRESSION"
+  --app-compression="$ENABLE_APP_COMPRESSION" \
+  --rocksdb-compression="$ENABLE_ROCKSDB_COMPRESSION"
