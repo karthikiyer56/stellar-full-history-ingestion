@@ -80,6 +80,7 @@ trap cleanup EXIT
 # Run stellar-etl to get range
 # -----------------------------
 docker run --rm --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
   -v /tmp:/tmp stellar/stellar-etl:latest \
   stellar-etl get_ledger_range_from_times \
   --start-time "$START_TIME" \
