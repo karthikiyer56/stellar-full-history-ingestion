@@ -429,20 +429,21 @@ func main() {
 
 			log.Printf("Batch Total Time: %s...", formatDuration(currentBatchInfo.BatchTotalTimeTaken))
 			log.Printf("\tBatch GetLedger Time: %s...", formatDuration(currentBatchInfo.GetLegerTimeTaken))
+			log.Printf("\tBatch Total Compression Time: %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken+currentBatchInfo.Db2CompressionTimeTaken))
 			log.Printf("\tBatch IO Time: %s...", formatDuration(currentBatchDbProcessingTotalTime))
 			log.Printf("\tBatch Compute Time (?): %s...", formatDuration(computeTime))
 			log.Printf("")
 
 			if config.EnableDB1 {
 				log.Printf("\tDB1:")
-				log.Printf("\t\tBatch CompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
+				log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
 				log.Printf("\t\twrite=%s, flush=%s, compact=%s",
 					formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact))
 				log.Printf("")
 			}
 			if config.EnableDB2 {
 				log.Printf("\tDB2:")
-				log.Printf("\t\tBatch CompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
+				log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
 				log.Printf("\t\twrite=%s, flush=%s, compact=%s",
 					formatDuration(dbTiming.DB2Write), formatDuration(flushTiming.DB2Flush), formatDuration(compactTiming.DB2Compact))
 				log.Printf("")
@@ -563,20 +564,21 @@ func main() {
 
 		log.Printf("Batch Total Time: %s...", formatDuration(currentBatchInfo.BatchTotalTimeTaken))
 		log.Printf("\tBatch GetLedger Time: %s...", formatDuration(currentBatchInfo.GetLegerTimeTaken))
+		log.Printf("\tBatch Total Compression Time: %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken+currentBatchInfo.Db2CompressionTimeTaken))
 		log.Printf("\tBatch IO Time: %s...", formatDuration(currentBatchDbProcessingTotalTime))
 		log.Printf("\tBatch Compute Time (?): %s...", formatDuration(computeTime))
 		log.Printf("")
 
 		if config.EnableDB1 {
 			log.Printf("\tDB1:")
-			log.Printf("\t\tBatch CompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
+			log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
 			log.Printf("\t\twrite=%s, flush=%s",
 				formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush))
 			log.Printf("")
 		}
 		if config.EnableDB2 {
 			log.Printf("\tDB2:")
-			log.Printf("\t\tBatch CompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
+			log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
 			log.Printf("\t\twrite=%s, flush=%s",
 				formatDuration(dbTiming.DB2Write), formatDuration(flushTiming.DB2Flush))
 			log.Printf("")
