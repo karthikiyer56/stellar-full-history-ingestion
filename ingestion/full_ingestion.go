@@ -66,8 +66,10 @@ type DBTimingStats struct {
 
 // BatchInfo tracks information about the current batch
 type BatchInfo struct {
-	StartLedger uint32
-	EndLedger   uint32
+	StartLedger         uint32
+	EndLedger           uint32
+	BatchStartTime      time.Time
+	BatchTotalTimeTaken time.Duration
 }
 
 func createDir(path string) error {
@@ -314,6 +316,7 @@ func main() {
 
 	// Track batch info
 	var currentBatchInfo BatchInfo
+	currentBatchInfo.BatchStartTime = time.Now()
 	batchStartLedger := ledgerRange.From()
 
 	// Iterate through the ledger sequence. DO NOT INCLUDE LAST LEDGER. THIS IS DELIBERATE
@@ -385,6 +388,12 @@ func main() {
 
 			currentBatchDbProcessingTotalTime := time.Since(currentBatchDbProcessingStart)
 
+			// Do some match to calculate time spent on I/O vs on other things (getLedgers, compress them etc)
+			currentBatchInfo.BatchTotalTimeTaken = time.Since(currentBatchInfo.BatchStartTime)
+
+			currentBatchIoTime := dbTiming.DB1Write + dbTiming.DB2Write + dbTiming.DB3Write + flushTiming.DB1Flush + flushTiming.DB2Flush + flushTiming.DB3Flush + compactTiming.DB1Compact + compactTiming.DB2Compact + compactTiming.DB3Compact
+			computeTime := currentBatchInfo.BatchTotalTimeTaken - currentBatchIoTime
+
 			// Accumulate timing stats
 			totalDbTimingStats.DB1Write += dbTiming.DB1Write
 			totalDbTimingStats.DB2Write += dbTiming.DB2Write
@@ -399,7 +408,8 @@ func main() {
 			// Log timing breakdown
 			log.Printf("\n[Ledger %d-%d] Batch timing:", currentBatchInfo.StartLedger, currentBatchInfo.EndLedger)
 			if config.EnableDB1 {
-				log.Printf("  DB1: write=%s, flush=%s, compact=%s. Compaction Range: [%d - %d]",
+				log.Printf("Compute (Non IO) Tinme: %s... IOTIME:  DB1: write=%s, flush=%s, compact=%s. Compaction Range: [%d - %d]",
+					formatDuration(computeTime),
 					formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact),
 					currentBatchInfo.StartLedger, currentBatchInfo.EndLedger)
 			}
@@ -426,6 +436,7 @@ func main() {
 
 			// Update batch start ledger for next batch
 			batchStartLedger = ledgerSeq + 1
+			currentBatchInfo.BatchStartTime = time.Now()
 			log.Printf("\n========== Batch processing complete ==========")
 		}
 
@@ -527,6 +538,8 @@ func main() {
 
 		finalBatchDbProcessingTime := time.Since(finalBatchDbProcessingStart)
 
+		currentBatchInfo.BatchTotalTimeTaken = time.Since(currentBatchInfo.BatchStartTime)
+
 		// Accumulate timing stats
 		totalDbTimingStats.DB1Write += dbTiming.DB1Write
 		totalDbTimingStats.DB2Write += dbTiming.DB2Write
@@ -535,7 +548,8 @@ func main() {
 		totalDbTimingStats.DB2Flush += flushTiming.DB2Flush
 		totalDbTimingStats.DB3Flush += flushTiming.DB3Flush
 
-		log.Printf("Final batch timing: %s", formatDuration(finalBatchDbProcessingTime))
+		log.Printf("Final batch times: Compute (Non IO) tiime %s, I/O time :%s.... ",
+			formatDuration(currentBatchInfo.BatchTotalTimeTaken), formatDuration(finalBatchDbProcessingTime))
 	}
 
 	elapsed := time.Since(startTime)
