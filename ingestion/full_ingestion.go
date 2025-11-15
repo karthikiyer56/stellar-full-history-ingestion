@@ -637,12 +637,15 @@ func main() {
 	log.Printf("\n========= FINAL ROCKSDB STATS after compaction =====\n")
 	if config.EnableDB1 {
 		monitorRocksDBStats(db1, "DB1")
+		log.Printf("")
 	}
 	if config.EnableDB2 {
 		monitorRocksDBStats(db2, "DB2")
+		log.Printf("")
 	}
 	if config.EnableDB3 {
 		monitorRocksDBStats(db3, "DB3")
+		log.Printf("")
 	}
 	log.Printf("\n========================================")
 
