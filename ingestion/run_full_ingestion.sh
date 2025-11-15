@@ -71,6 +71,18 @@ fi
 # -----------------------------
 OUTFILE="/tmp/.ledger_range.json"
 
+echo "----------------------------------"
+echo "🔧 Parsed arguments:"
+echo "  START_TIME=$START_TIME"
+echo "  END_TIME=$END_TIME"
+echo "  DB1_PATH=$DB1_PATH"
+echo "  DB2_PATH=$DB2_PATH"
+echo "  DB3_PATH=$DB3_PATH"
+echo "  BATCH_SIZE=$BATCH_SIZE"
+echo "  ENABLE_APP_COMPRESSION=$ENABLE_APP_COMPRESSION"
+echo "  ENABLE_ROCKSDB_COMPRESSION=$ENABLE_ROCKSDB_COMPRESSION"
+echo "----------------------------------"
+
 cleanup() {
   rm -f "$OUTFILE"
 }
