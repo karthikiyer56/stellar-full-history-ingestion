@@ -387,12 +387,9 @@ func main() {
 			compactTiming := compactAllDBsWithRange(db1, db2, db3, config, currentBatchInfo.StartLedger, currentBatchInfo.EndLedger)
 
 			currentBatchDbProcessingTotalTime := time.Since(currentBatchDbProcessingStart)
-
 			// Do some match to calculate time spent on I/O vs on other things (getLedgers, compress them etc)
 			currentBatchInfo.BatchTotalTimeTaken = time.Since(currentBatchInfo.BatchStartTime)
-
-			currentBatchIoTime := dbTiming.DB1Write + dbTiming.DB2Write + dbTiming.DB3Write + flushTiming.DB1Flush + flushTiming.DB2Flush + flushTiming.DB3Flush + compactTiming.DB1Compact + compactTiming.DB2Compact + compactTiming.DB3Compact
-			computeTime := currentBatchInfo.BatchTotalTimeTaken - currentBatchIoTime
+			computeTime := currentBatchInfo.BatchTotalTimeTaken - currentBatchDbProcessingTotalTime
 
 			// Accumulate timing stats
 			totalDbTimingStats.DB1Write += dbTiming.DB1Write
@@ -407,21 +404,19 @@ func main() {
 
 			// Log timing breakdown
 			log.Printf("\n[Ledger %d-%d] Batch timing:", currentBatchInfo.StartLedger, currentBatchInfo.EndLedger)
+			log.Printf("Compute Time: %s... IO Time: %s...\n", formatDuration(computeTime), formatDuration(currentBatchDbProcessingTotalTime))
 			if config.EnableDB1 {
-				log.Printf("Compute (Non IO) Tinme: %s... IOTIME:  DB1: write=%s, flush=%s, compact=%s. Compaction Range: [%d - %d]",
-					formatDuration(computeTime),
-					formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact),
-					currentBatchInfo.StartLedger, currentBatchInfo.EndLedger)
+				log.Printf("DB1: write=%s, flush=%s, compact=%s",
+					formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact))
 			}
 			if config.EnableDB2 {
-				log.Printf("  DB2: write=%s, flush=%s, compact=%s. Compaction Range: full)",
+				log.Printf("DB2: write=%s, flush=%s, compact=%s",
 					formatDuration(dbTiming.DB2Write), formatDuration(flushTiming.DB2Flush), formatDuration(compactTiming.DB2Compact))
 			}
 			if config.EnableDB3 {
-				log.Printf("  DB3: write=%s, flush=%s, compact=%s. Compactin Range: full",
+				log.Printf("DB3: write=%s, flush=%s, compact=%s",
 					formatDuration(dbTiming.DB3Write), formatDuration(flushTiming.DB3Flush), formatDuration(compactTiming.DB3Compact))
 			}
-			log.Printf("  Total I/O time: %s\n", formatDuration(currentBatchDbProcessingTotalTime))
 
 			// Clear batch maps
 			if config.EnableDB1 {
@@ -539,6 +534,7 @@ func main() {
 		finalBatchDbProcessingTime := time.Since(finalBatchDbProcessingStart)
 
 		currentBatchInfo.BatchTotalTimeTaken = time.Since(currentBatchInfo.BatchStartTime)
+		computeTime := currentBatchInfo.BatchTotalTimeTaken - finalBatchDbProcessingTime
 
 		// Accumulate timing stats
 		totalDbTimingStats.DB1Write += dbTiming.DB1Write
@@ -548,8 +544,9 @@ func main() {
 		totalDbTimingStats.DB2Flush += flushTiming.DB2Flush
 		totalDbTimingStats.DB3Flush += flushTiming.DB3Flush
 
-		log.Printf("Final batch times: Compute (Non IO) tiime %s, I/O time :%s.... ",
-			formatDuration(currentBatchInfo.BatchTotalTimeTaken), formatDuration(finalBatchDbProcessingTime))
+		log.Printf("Final batch times: Total time: %s,  Compute (Non IO) Time %s, I/O time :%s.... ",
+			formatDuration(currentBatchInfo.BatchTotalTimeTaken),
+			formatDuration(computeTime), formatDuration(finalBatchDbProcessingTime))
 	}
 
 	elapsed := time.Since(startTime)
