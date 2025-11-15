@@ -385,7 +385,7 @@ func main() {
 
 			currentBatchDbProcessingStart := time.Now()
 			// Write to databases with timing
-			dbTiming, err := writeBatchToDBWithTiming(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config)
+			writeTiming, err := writeBatchToDBWithTiming(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config)
 			if err != nil {
 				log.Printf("Error writing batch: %v", err)
 			}
@@ -405,9 +405,9 @@ func main() {
 				currentBatchInfo.GetLegerTimeTaken
 
 			// Accumulate timing stats PER BATCH
-			totalTimingStats.DB1Write += dbTiming.DB1Write
-			totalTimingStats.DB2Write += dbTiming.DB2Write
-			totalTimingStats.DB3Write += dbTiming.DB3Write
+			totalTimingStats.DB1Write += writeTiming.DB1Write
+			totalTimingStats.DB2Write += writeTiming.DB2Write
+			totalTimingStats.DB3Write += writeTiming.DB3Write
 
 			totalTimingStats.DB1Flush += flushTiming.DB1Flush
 			totalTimingStats.DB2Flush += flushTiming.DB2Flush
@@ -435,23 +435,29 @@ func main() {
 			log.Printf("")
 
 			if config.EnableDB1 {
-				log.Printf("\tDB1:")
+				db1Total := writeTiming.DB1Write + flushTiming.DB1Flush + compactTiming.DB1Compact
+				log.Printf("\tDB1: %s", config.DB1Path)
 				log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
-				log.Printf("\t\twrite=%s, flush=%s, compact=%s",
-					formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact))
+				log.Printf("\t\tI/O time: %s (write: %s, flush: %s, compact: %s)",
+					formatDuration(db1Total),
+					formatDuration(writeTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact))
 				log.Printf("")
 			}
 			if config.EnableDB2 {
-				log.Printf("\tDB2:")
+				db2Total := writeTiming.DB2Write + flushTiming.DB2Flush + compactTiming.DB2Compact
+				log.Printf("\tDB2: %s", config.DB2Path)
 				log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
-				log.Printf("\t\twrite=%s, flush=%s, compact=%s",
-					formatDuration(dbTiming.DB2Write), formatDuration(flushTiming.DB2Flush), formatDuration(compactTiming.DB2Compact))
+				log.Printf("\t\tI/O time: %s (write: %s, flush: %s, compact: %s)",
+					formatDuration(db2Total),
+					formatDuration(writeTiming.DB2Write), formatDuration(flushTiming.DB2Flush), formatDuration(compactTiming.DB2Compact))
 				log.Printf("")
 			}
 			if config.EnableDB3 {
-				log.Printf("\tDB3:")
-				log.Printf("\t\twrite=%s, flush=%s, compact=%s",
-					formatDuration(dbTiming.DB3Write), formatDuration(flushTiming.DB3Flush), formatDuration(compactTiming.DB3Compact))
+				db3Total := writeTiming.DB3Write + flushTiming.DB3Flush + compactTiming.DB3Compact
+				log.Printf("\tDB3: %s", config.DB3Path)
+				log.Printf("\t\tI/O time: %s (write: %s, flush: %s, compact: %s)",
+					formatDuration(db3Total),
+					formatDuration(writeTiming.DB3Write), formatDuration(flushTiming.DB3Flush), formatDuration(compactTiming.DB3Compact))
 				log.Printf("")
 			}
 
@@ -531,7 +537,7 @@ func main() {
 		currentBatchInfo.EndLedger = ledgerRange.To() - 1
 
 		currentBatchDbProcessingStart := time.Now()
-		dbTiming, err := writeBatchToDBWithTiming(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config)
+		writeTiming, err := writeBatchToDBWithTiming(db1, db2, db3, ledgerSeqToLcm, txHashToTxData, txHashToLedgerSeq, config)
 		if err != nil {
 			log.Printf("Error writing final batch: %v", err)
 		}
@@ -546,9 +552,9 @@ func main() {
 			currentBatchInfo.GetLegerTimeTaken
 
 		// Accumulate timing stats PER BATCH
-		totalTimingStats.DB1Write += dbTiming.DB1Write
-		totalTimingStats.DB2Write += dbTiming.DB2Write
-		totalTimingStats.DB3Write += dbTiming.DB3Write
+		totalTimingStats.DB1Write += writeTiming.DB1Write
+		totalTimingStats.DB2Write += writeTiming.DB2Write
+		totalTimingStats.DB3Write += writeTiming.DB3Write
 
 		totalTimingStats.DB1Flush += flushTiming.DB1Flush
 		totalTimingStats.DB2Flush += flushTiming.DB2Flush
@@ -570,23 +576,29 @@ func main() {
 		log.Printf("")
 
 		if config.EnableDB1 {
-			log.Printf("\tDB1:")
+			db1Total := writeTiming.DB1Write + flushTiming.DB1Flush
+			log.Printf("\tDB1: %s", config.DB1Path)
 			log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
-			log.Printf("\t\twrite=%s, flush=%s",
-				formatDuration(dbTiming.DB1Write), formatDuration(flushTiming.DB1Flush))
+			log.Printf("\t\tI/O time: %s (write: %s, flush: %s)",
+				formatDuration(db1Total),
+				formatDuration(writeTiming.DB1Write), formatDuration(flushTiming.DB1Flush))
 			log.Printf("")
 		}
 		if config.EnableDB2 {
-			log.Printf("\tDB2:")
+			db2Total := writeTiming.DB2Write + flushTiming.DB2Flush
+			log.Printf("\tDB2: %s", config.DB2Path)
 			log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
-			log.Printf("\t\twrite=%s, flush=%s",
-				formatDuration(dbTiming.DB2Write), formatDuration(flushTiming.DB2Flush))
+			log.Printf("\t\tI/O time: %s (write: %s, flush: %s)",
+				formatDuration(db2Total),
+				formatDuration(writeTiming.DB2Write), formatDuration(flushTiming.DB2Flush))
 			log.Printf("")
 		}
 		if config.EnableDB3 {
-			log.Printf("\tDB3:")
-			log.Printf("\t\twrite=%s, flush=%s",
-				formatDuration(dbTiming.DB3Write), formatDuration(flushTiming.DB3Flush))
+			db3Total := writeTiming.DB3Write + flushTiming.DB3Flush
+			log.Printf("\tDB3: %s", config.DB3Path)
+			log.Printf("\t\tI/O time: %s (write: %s, flush: %s)",
+				formatDuration(db3Total),
+				formatDuration(writeTiming.DB3Write), formatDuration(flushTiming.DB3Flush))
 			log.Printf("")
 		}
 	}
@@ -680,6 +692,7 @@ func main() {
 			formatDuration(totalTimingStats.DB2Flush), formatDuration(totalTimingStats.DB2Compact))
 	}
 	if config.EnableDB3 {
+		log.Printf("\tDB1:::")
 		db3Total := totalTimingStats.DB3Write + totalTimingStats.DB3Flush + totalTimingStats.DB3Compact
 		log.Printf("\t\tTotal I/O time: %s (write: %s, flush: %s, compact: %s)",
 			formatDuration(db3Total), formatDuration(totalTimingStats.DB3Write),
