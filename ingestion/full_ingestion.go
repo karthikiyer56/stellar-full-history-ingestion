@@ -396,7 +396,7 @@ func main() {
 
 			// Do some match to calculate time spent on I/O vs on other things (getLedgers, compress them etc)
 			currentBatchInfo.BatchTotalTimeTaken = time.Since(currentBatchInfo.BatchStartTime)
-			computeTime := currentBatchInfo.BatchTotalTimeTaken - currentBatchDbProcessingTotalTime - currentBatchInfo.CompressionTimeTaken
+			computeTime := currentBatchInfo.BatchTotalTimeTaken - currentBatchDbProcessingTotalTime - currentBatchInfo.CompressionTimeTaken - currentBatchInfo.GetLegerTimeTaken
 
 			// Accumulate timing stats
 			totalTimingStats.DB1Write += dbTiming.DB1Write
@@ -413,7 +413,7 @@ func main() {
 
 			totalTimingStats.DB1CompressionTime += dbTiming.DB1CompressionTime
 			totalTimingStats.DB2CompressionTime += dbTiming.DB2CompressionTime
-			
+
 			totalTimingStats.GetLedgerTime += getLedgerTime
 
 			// Log timing breakdown
