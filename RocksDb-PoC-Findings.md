@@ -1,6 +1,6 @@
 # RocksDB Stellar Blockchain Ingestion Performance Analysis
 
-## Executive Summary
+## BLUF
 
 This report analyzes the performance of a RocksDB-based ingestion system for Stellar blockchain data across two EC2 instance types. The findings reveal **critical scalability issues with RocksDB for random-key workloads** (DB2 and DB3), while demonstrating acceptable performance for sequential-key workloads (DB1).
 
