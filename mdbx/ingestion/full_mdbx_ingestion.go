@@ -26,6 +26,9 @@ import (
 	"io"
 )
 
+const GB = 1024 * 1024 * 1024
+const TB = 1024 * GB
+
 // IngestionConfig holds configuration for the ingestion process
 type IngestionConfig struct {
 	StartLedger                  uint32
@@ -464,13 +467,12 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 	}
 
 	// Set geometry (size limits)
-	const GB = 1024 * 1024 * 1024
-	const TB = 1024 * GB
+
 	err = env.SetGeometry(
-		100*GB, // size_lower: 200 GB initial
+		200*GB, // size_lower: 200 GB initial
 		-1,     // size_now: -1 = use default
-		2*TB,   // size_upper: 6 TB maximum
-		100*GB, // growth_step: 200 GB per growth
+		2*TB,   // size_upper: 2 TB maximum
+		200*GB, // growth_step: 200 GB per growth
 		-1,     // shrink_threshold: -1 = disabled
 		8192,   // pagesize: 4 KB
 	)
