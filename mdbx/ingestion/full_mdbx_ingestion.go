@@ -62,7 +62,7 @@ type BatchInfo struct {
 	EndLedger          uint32
 	StartTime          time.Time
 	TxCount            int
-	GetLedgertime      time.Duration
+	GetLedgerTime      time.Duration
 	Db2CompressionTime time.Duration
 }
 
@@ -183,7 +183,7 @@ func main() {
 
 	// Configure the BufferedStorageBackend
 	backendConfig := ledgerbackend.BufferedStorageBackendConfig{
-		BufferSize: 1000,
+		BufferSize: 5000,
 		NumWorkers: 100,
 		RetryLimit: 3,
 		RetryWait:  5 * time.Second,
@@ -276,7 +276,7 @@ func main() {
 		totalTimingStats.DB2CompressionTime += compressionTime
 
 		// Add to current batch as well
-		currentBatch.GetLedgertime += getLedgerTime
+		currentBatch.GetLedgerTime += getLedgerTime
 		currentBatch.Db2CompressionTime += compressionTime
 
 		processedLedgerCount++
@@ -287,12 +287,10 @@ func main() {
 			currentBatch.TxCount = len(txHashToTxData)
 
 			// Write to databases
-			batchStart := time.Now()
 			dbTiming, err := writeBatchToDatabases(db2, db3, txHashToTxData, txHashToLedgerSeq, config)
 			if err != nil {
 				log.Printf("Error writing batch: %v", err)
 			}
-			batchDuration := time.Since(batchStart)
 
 			// Accumulate timing
 			totalTimingStats.DB2WriteTime += dbTiming.DB2WriteTime
@@ -301,7 +299,7 @@ func main() {
 			totalTimingStats.DB3SyncTime += dbTiming.DB3SyncTime
 
 			// Log batch completion
-			logBatchCompletion(currentBatch, batchDuration, dbTiming, config)
+			logBatchCompletion(currentBatch, dbTiming, config)
 
 			// Clear batch maps
 			if config.EnableDB2 {
@@ -316,7 +314,7 @@ func main() {
 			currentBatch.StartLedger = ledgerSeq + 1
 			currentBatch.StartTime = time.Now()
 			currentBatch.Db2CompressionTime = 0
-			currentBatch.GetLedgertime = 0
+			currentBatch.GetLedgerTime = 0
 		}
 
 		// Report database stats every 10 batches
@@ -365,19 +363,17 @@ func main() {
 		currentBatch.EndLedger = ledgerRange.To() - 1
 		currentBatch.TxCount = len(txHashToTxData)
 
-		batchStart := time.Now()
 		dbTiming, err := writeBatchToDatabases(db2, db3, txHashToTxData, txHashToLedgerSeq, config)
 		if err != nil {
 			log.Printf("Error writing final batch: %v", err)
 		}
-		batchDuration := time.Since(batchStart)
 
 		totalTimingStats.DB2WriteTime += dbTiming.DB2WriteTime
 		totalTimingStats.DB2SyncTime += dbTiming.DB2SyncTime
 		totalTimingStats.DB3WriteTime += dbTiming.DB3WriteTime
 		totalTimingStats.DB3SyncTime += dbTiming.DB3SyncTime
 
-		logBatchCompletion(currentBatch, batchDuration, dbTiming, config)
+		logBatchCompletion(currentBatch, dbTiming, config)
 	}
 
 	// Final sync to ensure all data is durably written
@@ -755,16 +751,23 @@ func logMDBXStats(name string, stats MDBXStats) {
 }
 
 // logBatchCompletion logs batch completion information
-func logBatchCompletion(batch BatchInfo, totalDuration time.Duration, timing DBTimingStats, config IngestionConfig) {
+func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionConfig) {
+	totalBatchDuration := time.Since(batch.StartTime)
+	cpuTime := batch.GetLedgerTime + batch.Db2CompressionTime
+	ioTime := timing.DB2WriteTime + timing.DB2SyncTime + timing.DB3WriteTime + timing.DB3SyncTime
+	computeTime := totalBatchDuration - cpuTime - ioTime
+
 	log.Printf("\n===== Batch #%d Complete [Ledger %d-%d] (%d transactions) =====",
 		batch.BatchNum, batch.StartLedger, batch.EndLedger, batch.TxCount)
-	log.Printf("Total time: %s", formatDuration(totalDuration))
-	log.Printf("\tGetLedgerTime: %s", formatDuration(batch.GetLedgertime))
+	log.Printf("Total batch time time: %s", formatDuration(totalBatchDuration))
+	log.Printf("\t GetLedger Time: %s", formatDuration(batch.GetLedgerTime))
+	log.Printf("\t Compute Time (?): %s", formatDuration(computeTime))
 
 	if config.EnableDB2 {
 		db2Total := timing.DB2WriteTime + timing.DB2SyncTime
-		log.Printf("\tCompressionTime: %s", formatDuration(batch.Db2CompressionTime))
-		log.Printf("\t DB2 I/O time: %s (write: %s, sync: %s)",
+		log.Printf("\t DB2:: %s", config.DB2Path)
+		log.Printf("\t\t CompressionTime: %s", formatDuration(batch.Db2CompressionTime))
+		log.Printf("\t\t I/O time: %s (write: %s, sync: %s)",
 			formatDuration(db2Total),
 			formatDuration(timing.DB2WriteTime),
 			formatDuration(timing.DB2SyncTime))
@@ -772,7 +775,8 @@ func logBatchCompletion(batch BatchInfo, totalDuration time.Duration, timing DBT
 
 	if config.EnableDB3 {
 		db3Total := timing.DB3WriteTime + timing.DB3SyncTime
-		log.Printf("\tDB3 I/O time: %s (write: %s, sync: %s)",
+		log.Printf("\t DB3:: %s", config.DB3Path)
+		log.Printf("\t\t I/O time: %s (write: %s, sync: %s)",
 			formatDuration(db3Total),
 			formatDuration(timing.DB3WriteTime),
 			formatDuration(timing.DB3SyncTime))
