@@ -41,3 +41,75 @@ $(PROTO_CHECKSUM):
 	@touch $(PROTO_CHECKSUM)
 
 .PHONY: generate-proto regenerate-proto
+
+
+##############
+# MDBX Build
+##############
+MDBX_HOME := $(HOME)/local/libmdbx
+MDBX_BINARY := $(HOME)/bin/full_mdbx_ingestion
+
+# CGO settings for MDBX
+CGO_ENABLED := 1
+CGO_CFLAGS := -I$(MDBX_HOME)/include
+CGO_LDFLAGS := -L$(MDBX_HOME)/lib -lmdbx -Wl,-rpath,$(MDBX_HOME)/lib
+
+# Mac specific
+GOARCH := arm64
+GOOS := darwin
+
+.PHONY: build-mdbx clean-mdbx test-mdbx run-mdbx check-mdbx-env
+
+build-mdbx:
+	@echo "🔨 Building MDBX ingestion binary..."
+	CGO_ENABLED=$(CGO_ENABLED) \
+	GOARCH=$(GOARCH) \
+	GOOS=$(GOOS) \
+	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
+	go build -o $(MDBX_BINARY) mdbx/ingestion/full_mdbx_ingestion.go
+	@echo "✅ Binary created at: $(MDBX_BINARY)"
+
+clean-mdbx:
+	@echo "🧹 Cleaning MDBX binaries..."
+	rm -f $(MDBX_BINARY)
+	@echo "✅ Clean complete"
+
+test-mdbx:
+	@echo "Testing MDBX installation..."
+	@echo "MDBX_HOME: $(MDBX_HOME)"
+	@echo ""
+	@echo "Checking files..."
+	@test -f $(MDBX_HOME)/lib/libmdbx.dylib && echo "  ✅ libmdbx.dylib found" || echo "  ❌ libmdbx.dylib NOT found"
+	@test -f $(MDBX_HOME)/lib/libmdbx.a && echo "  ✅ libmdbx.a found" || echo "  ❌ libmdbx.a NOT found"
+	@test -f $(MDBX_HOME)/include/mdbx.h && echo "  ✅ mdbx.h found" || echo "  ❌ mdbx.h NOT found"
+	@echo ""
+	@echo "Testing Go compilation..."
+	@echo 'package main; import ("fmt"; "github.com/erigontech/mdbx-go/mdbx"); func main() { env, err := mdbx.NewEnv(); if err != nil { panic(err) }; defer env.Close(); fmt.Println("✅ MDBX working!") }' > /tmp/test_mdbx.go
+	@CGO_ENABLED=1 \
+	CGO_CFLAGS="$(CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
+	DYLD_LIBRARY_PATH=$(MDBX_HOME)/lib \
+	go run /tmp/test_mdbx.go
+	@rm /tmp/test_mdbx.go
+
+run-mdbx: build-mdbx
+	@echo "Running MDBX ingestion..."
+	DYLD_LIBRARY_PATH=$(MDBX_HOME)/lib ./$(MDBX_BINARY)
+
+check-mdbx-env:
+	@echo "Environment Check:"
+	@echo "  MDBX_HOME: $(MDBX_HOME)"
+	@echo "  CGO_ENABLED: $(CGO_ENABLED)"
+	@echo "  CGO_CFLAGS: $(CGO_CFLAGS)"
+	@echo "  CGO_LDFLAGS: $(CGO_LDFLAGS)"
+	@echo "  GOARCH: $(GOARCH)"
+	@echo "  GOOS: $(GOOS)"
+	@echo ""
+	@echo "Files Check:"
+	@test -f $(MDBX_HOME)/lib/libmdbx.dylib && echo "  ✅ libmdbx.dylib" || echo "  ❌ libmdbx.dylib NOT FOUND"
+	@test -f $(MDBX_HOME)/lib/libmdbx.a && echo "  ✅ libmdbx.a" || echo "  ❌ libmdbx.a NOT FOUND"
+	@test -f $(MDBX_HOME)/include/mdbx.h && echo "  ✅ mdbx.h" || echo "  ❌ mdbx.h NOT FOUND"
+	@echo ""
+	@echo "Source Check:"
+	@test -f mdbx/ingestion/full_mdbx_ingestion.go && echo "  ✅ full_mdbx_ingestion.go" || echo "  ❌ full_mdbx_ingestion.go NOT FOUND"
