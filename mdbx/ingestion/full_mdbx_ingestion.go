@@ -188,8 +188,8 @@ func main() {
 
 	// Configure the BufferedStorageBackend
 	backendConfig := ledgerbackend.BufferedStorageBackendConfig{
-		BufferSize: 2000,
-		NumWorkers: 100,
+		BufferSize: 10000,
+		NumWorkers: 200,
 		RetryLimit: 3,
 		RetryWait:  5 * time.Second,
 	}
@@ -494,8 +494,7 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 	}
 
 	// Open environment with optimized flags
-	flags := mdbx.NoSubdir | mdbx.Coalesce | mdbx.LifoReclaim | mdbx.NoMetaSync | mdbx.WriteMap
-	err = env.Open(path, flags, 0644)
+	err = env.Open(path, mdbx.NoSubdir|mdbx.Coalesce|mdbx.LifoReclaim|mdbx.NoMetaSync|mdbx.WriteMap, 0644)
 	if err != nil {
 		env.Close()
 		return nil, errors.Wrap(err, "failed to open database")
