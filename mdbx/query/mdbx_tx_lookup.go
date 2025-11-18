@@ -1,9 +1,19 @@
 package main
 
 // Filename: mdbx_tx_lookup.go
-// Usage: go run mdbx_tx_lookup.go --db /path/to/db --tx abc123...
+// Usage:
+//   Single query:
+//     go run mdbx_tx_lookup.go --db /path/to/db --tx abc123...
+//
+//   Ongoing stdin:
+//     go run mdbx_tx_lookup.go --db /path/to/db --ongoing
+//     (then type hashes or pipe them)
+//
+//   Quiet mode:
+//     go run mdbx_tx_lookup.go --db /path --ongoing --quiet
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/hex"
 	"flag"
@@ -21,52 +31,54 @@ import (
 
 func main() {
 	var dbPath, txHashHex string
+	var ongoing bool
+	var quiet bool
 
 	flag.StringVar(&dbPath, "db", "", "txHash->txData MDBX database path")
-	flag.StringVar(&txHashHex, "tx", "", "tx hash in hex")
+	flag.StringVar(&txHashHex, "tx", "", "tx hash in hex (omit when using --ongoing)")
+	flag.BoolVar(&ongoing, "ongoing", false, "read transaction hashes from stdin continuously")
+	flag.BoolVar(&quiet, "quiet", false, "print only metrics instead of full tx data output")
+
 	flag.Parse()
 
-	if dbPath == "" || txHashHex == "" {
-		log.Fatal("Usage: go run mdbx_tx_lookup.go --db /path/to/db --tx abc12...")
+	if dbPath == "" {
+		log.Fatalf("Missing required --db path")
+	}
+	if ongoing && txHashHex != "" {
+		log.Fatalf("--tx cannot be used when --ongoing is provided")
+	}
+	if !ongoing && txHashHex == "" {
+		log.Fatalf("Provide --tx OR --ongoing")
 	}
 
-	// Convert hex string to binary bytes
-	txHashBytes, err := hexStringToBytes(txHashHex)
-	if err != nil {
-		log.Fatalf("Failed to convert tx hash to bytes: %v", err)
-	}
-
-	// Check if database exists
+	// Check DB exists
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		log.Fatalf("Error: DB directory does not exist: %s", dbPath)
 	}
 
-	// Open MDBX environment
+	// Open environment
 	env, err := mdbx.NewEnv()
 	if err != nil {
-		log.Fatalf("Failed to create MDBX environment: %v", err)
+		log.Fatalf("Failed to create MDBX env: %v", err)
 	}
 	defer env.Close()
 
-	// Set max DBs
 	t1 := time.Now()
 	err = env.SetOption(mdbx.OptMaxDB, uint64(2))
 	if err != nil {
-		log.Fatalf("Failed to set max DBs: %v", err)
+		log.Fatalf("Failed SetOption: %v", err)
 	}
 	setOptTime := time.Since(t1)
 
-	// Open in read-only mode
 	t2 := time.Now()
 	err = env.Open(dbPath, mdbx.Readonly|mdbx.Accede, 0644)
 	if err != nil {
-		log.Fatalf("Failed to open MDBX database: %v", err)
+		log.Fatalf("Failed env.Open: %v", err)
 	}
 	envOpenTime := time.Since(t2)
 
-	// First DBI open
-	t3 := time.Now()
 	var dbi mdbx.DBI
+	t3 := time.Now()
 	err = env.View(func(txn *mdbx.Txn) error {
 		var err error
 		dbi, err = txn.OpenDBI("data", 0, nil, nil)
@@ -77,12 +89,11 @@ func main() {
 	}
 	dbiOpenTime := time.Since(t3)
 
-	totalOpenTime := setOptTime + envOpenTime + dbiOpenTime
+	totalOpen := setOptTime + envOpenTime + dbiOpenTime
 
-	// Get database stats
+	// Stats before
 	var statsBefore mdbx.Stat
 	var envInfoBefore *mdbx.EnvInfo
-
 	err = env.View(func(txn *mdbx.Txn) error {
 		stat, err := txn.StatDBI(dbi)
 		if err != nil {
@@ -99,16 +110,72 @@ func main() {
 		return nil
 	})
 	if err != nil {
-		log.Fatalf("Failed to get initial stats: %v", err)
+		log.Fatalf("Failed to get stats: %v", err)
 	}
 
-	// Query for the transaction
+	// Print initialization once
+	fmt.Printf("\n=== MDBX Initialization ===\n")
+	fmt.Printf("SetOption:    %s\n", formatDuration(setOptTime))
+	fmt.Printf("env.Open:     %s\n", formatDuration(envOpenTime))
+	fmt.Printf("DBI open:     %s\n", formatDuration(dbiOpenTime))
+	fmt.Printf("Total open:   %s\n\n", formatDuration(totalOpen))
+
+	// ------------------------------------------------------------
+	// ONGOING MODE
+	// ------------------------------------------------------------
+	if ongoing {
+		reader := bufio.NewScanner(os.Stdin)
+
+		fmt.Println("Ongoing mode: enter tx hashes (or STOP to quit):")
+		for reader.Scan() {
+			line := strings.TrimSpace(reader.Text())
+			if line == "" {
+				continue
+			}
+			if strings.EqualFold(line, "STOP") {
+				fmt.Println("Stopping.")
+				return
+			}
+
+			runQuery(env, dbi, statsBefore, envInfoBefore, line, quiet)
+		}
+		return
+	}
+
+	// ------------------------------------------------------------
+	// SINGLE QUERY MODE
+	// ------------------------------------------------------------
+	runQuery(env, dbi, statsBefore, envInfoBefore, txHashHex, quiet)
+}
+
+///////////////////////////////////////////////////////////////////////////
+// runQuery
+///////////////////////////////////////////////////////////////////////////
+
+func runQuery(
+	env *mdbx.Env,
+	dbi mdbx.DBI,
+	statsBefore mdbx.Stat,
+	envInfoBefore *mdbx.EnvInfo,
+	txHashHex string,
+	quiet bool,
+) {
+	// Parse key
+	keyBytes, err := hexStringToBytes(txHashHex)
+	if err != nil {
+		fmt.Printf("Invalid hex: %s\n", txHashHex)
+		return
+	}
+
+	// ----------------------------------
+	// Query database
+	// ----------------------------------
 	var data []byte
 	var found bool
 
 	queryStart := time.Now()
 	err = env.View(func(txn *mdbx.Txn) error {
-		val, err := txn.Get(dbi, txHashBytes)
+		val, err := txn.Get(dbi, keyBytes)
 		if err != nil {
 			if mdbx.IsNotFound(err) {
 				found = false
@@ -116,71 +183,89 @@ func main() {
 			}
 			return err
 		}
-
-		// Copy the data since it's only valid within the transaction
-		data = make([]byte, len(val))
-		copy(data, val)
+		data = append([]byte{}, val...)
 		found = true
-
 		return nil
 	})
 	queryTime := time.Since(queryStart)
 
 	if err != nil {
-		log.Fatalf("Failed to query database: %v", err)
-	}
-
-	if !found {
-		fmt.Printf("\n========================================\n")
-		fmt.Printf("Transaction not found in DB\n")
-		fmt.Printf("========================================\n")
-		fmt.Printf("TX Hash: %s\n", txHashHex)
-		fmt.Printf("DB Path: %s\n", dbPath)
-		fmt.Printf("\nOpen Timing Breakdown:\n")
-		fmt.Printf("  SetOption:    %s\n", formatDuration(setOptTime))
-		fmt.Printf("  env.Open:     %s\n", formatDuration(envOpenTime))
-		fmt.Printf("  DBI open:     %s\n", formatDuration(dbiOpenTime))
-		fmt.Printf("  Total open:   %s\n", formatDuration(totalOpenTime))
-		fmt.Printf("  Query time:   %s\n", formatDuration(queryTime))
-		fmt.Printf("========================================\n\n")
+		fmt.Printf("DB error: %v\n", err)
 		return
 	}
 
-	// Decompress the data
-	decompressStart := time.Now()
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		log.Fatalf("Failed to create zstd decoder: %v", err)
+	if !found {
+		fmt.Printf("TX %s not found.\n", txHashHex)
+		return
 	}
-	defer decoder.Close()
 
-	decompressedData, err := decoder.DecodeAll(data, nil)
+	// ----------------------------------
+	// Decompress
+	// ----------------------------------
+	decStart := time.Now()
+	dec, _ := zstd.NewReader(nil)
+	defer dec.Close()
+	decompressed, err := dec.DecodeAll(data, nil)
 	if err != nil {
-		log.Fatalf("Failed to decompress data: %v", err)
+		fmt.Printf("Decompress failed: %v\n", err)
+		return
 	}
-	decompressTime := time.Since(decompressStart)
+	decTime := time.Since(decStart)
 
-	// Unmarshal TxData proto
+	// ----------------------------------
+	// Unmarshal
+	// ----------------------------------
 	unmarshalStart := time.Now()
 	var txData tx_data.TxData
-	if err := proto.Unmarshal(decompressedData, &txData); err != nil {
-		log.Fatalf("Failed to unmarshal TxData: %v", err)
+	if err := proto.Unmarshal(decompressed, &txData); err != nil {
+		fmt.Printf("Unmarshal failed: %v\n", err)
+		return
 	}
 	unmarshalTime := time.Since(unmarshalStart)
 
-	// Convert transaction components to base64
+	// ----------------------------------
+	// Compute per-query metrics
+	// ----------------------------------
+	pageSize := int(statsBefore.PSize)
+	overflowPages := (len(data) / pageSize) + 1
+	pagesRead := int(statsBefore.Depth) + overflowPages
+	bytesRead := int64(pagesRead) * int64(pageSize)
+
+	// ----------------------------------
+	// QUIET MODE OUTPUT
+	// ----------------------------------
+	if quiet {
+		fmt.Printf("TX: %s\n", txHashHex)
+		fmt.Printf("Compressed:         %s\n", formatBytes(int64(len(data))))
+		fmt.Printf("Uncompressed:       %s\n", formatBytes(int64(len(decompressed))))
+		fmt.Printf("Compression Ratio:  %.2f%%\n\n", 100*(1-float64(len(data))/float64(len(decompressed))))
+
+		fmt.Printf("Query:              %s\n", formatDuration(queryTime))
+		fmt.Printf("Decompress:         %s\n", formatDuration(decTime))
+		fmt.Printf("Unmarshal:          %s\n", formatDuration(unmarshalTime))
+		fmt.Printf("Total:              %s\n\n", formatDuration(queryTime+decTime+unmarshalTime))
+
+		fmt.Printf("TreeDepth:          %d\n", statsBefore.Depth)
+		fmt.Printf("OverflowPages:      %d\n", overflowPages)
+		fmt.Printf("PagesRead:          %d\n", pagesRead)
+		fmt.Printf("BytesRead:          %s\n\n", formatBytes(bytesRead))
+		return
+	}
+
+	// -----------------------------------------------------------------
+	// FULL VERBOSE MODE (ORIGINAL OUTPUT)
+	// -----------------------------------------------------------------
+
 	txEnvelopeBase64 := base64.StdEncoding.EncodeToString(txData.TxEnvelope)
 	txResultBase64 := base64.StdEncoding.EncodeToString(txData.TxResult)
 	txMetaBase64 := base64.StdEncoding.EncodeToString(txData.TxMeta)
 
-	totalTime := totalOpenTime + queryTime + decompressTime + unmarshalTime
+	totalTime := queryTime + decTime + unmarshalTime
 
-	// Display results
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("MDBX Transaction Lookup\n")
 	fmt.Printf("========================================\n")
 	fmt.Printf("Transaction Hash: %s\n", txHashHex)
-	fmt.Printf("DB Path: %s\n", dbPath)
 	fmt.Printf("========================================\n")
 
 	fmt.Printf("\nTransaction Details:\n")
@@ -190,8 +275,8 @@ func main() {
 
 	fmt.Printf("\nData Sizes:\n")
 	fmt.Printf("  Compressed:         %s\n", formatBytes(int64(len(data))))
-	fmt.Printf("  Uncompressed:       %s\n", formatBytes(int64(len(decompressedData))))
-	fmt.Printf("  Compression ratio:  %.2f%%\n", 100*(1-float64(len(data))/float64(len(decompressedData))))
+	fmt.Printf("  Uncompressed:       %s\n", formatBytes(int64(len(decompressed))))
+	fmt.Printf("  Compression ratio:  %.2f%%\n", 100*(1-float64(len(data))/float64(len(decompressed))))
 
 	fmt.Printf("\nComponent Sizes:\n")
 	fmt.Printf("  Envelope:           %s\n", formatBytes(int64(len(txData.TxEnvelope))))
@@ -209,31 +294,18 @@ func main() {
 	fmt.Printf("  Total entries:      %s\n", formatNumber(int64(statsBefore.Entries)))
 	fmt.Printf("  Map size:           %s\n", formatBytes(int64(envInfoBefore.MapSize)))
 
-	// Calculate pages read for this query
-	pagesRead := statsBefore.Depth
-	overflowPagesRead := uint((len(data) / int(statsBefore.PSize)) + 1)
-	if len(data) > int(statsBefore.PSize)/2 {
-		pagesRead += overflowPagesRead
-	}
-
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Query Performance Metrics\n")
 	fmt.Printf("========================================\n")
-	fmt.Printf("\nOpen Timing Breakdown:\n")
-	fmt.Printf("  SetOption:          %s\n", formatDuration(setOptTime))
-	fmt.Printf("  env.Open:           %s\n", formatDuration(envOpenTime))
-	fmt.Printf("  DBI open:           %s\n", formatDuration(dbiOpenTime))
-	fmt.Printf("  Total open:         %s\n", formatDuration(totalOpenTime))
-	fmt.Printf("\nQuery Timing:\n")
 	fmt.Printf("  Query time:         %s\n", formatDuration(queryTime))
-	fmt.Printf("  Decompress time:    %s\n", formatDuration(decompressTime))
+	fmt.Printf("  Decompress time:    %s\n", formatDuration(decTime))
 	fmt.Printf("  Unmarshal time:     %s\n", formatDuration(unmarshalTime))
 	fmt.Printf("  Total time:         %s\n", formatDuration(totalTime))
 	fmt.Printf("\nI/O Metrics:\n")
-	fmt.Printf("  Pages traversed:    %d (tree depth)\n", statsBefore.Depth)
-	fmt.Printf("  Est. pages read:    %d\n", pagesRead)
-	fmt.Printf("  Bytes read (data):  %s\n", formatBytes(int64(len(data))))
-	fmt.Printf("  Est. I/O (pages):   %s\n", formatBytes(int64(pagesRead)*int64(statsBefore.PSize)))
+	fmt.Printf("  Tree depth:         %d\n", statsBefore.Depth)
+	fmt.Printf("  Overflow pages:     %d\n", overflowPages)
+	fmt.Printf("  Pages read:         %d\n", pagesRead)
+	fmt.Printf("  Bytes read:         %s\n", formatBytes(bytesRead))
 
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Transaction Data (Base64 Encoded)\n")
@@ -244,18 +316,19 @@ func main() {
 	fmt.Printf("========================================\n\n")
 }
 
-// hexStringToBytes converts a hex string to bytes
+///////////////////////////////////////////////////////////////////////////
+// Helpers
+///////////////////////////////////////////////////////////////////////////
+
 func hexStringToBytes(hexStr string) ([]byte, error) {
 	hexStr = strings.TrimPrefix(hexStr, "0x")
 	return hex.DecodeString(hexStr)
 }
 
-// wrapText wraps text at the specified width
 func wrapText(text string, width int) string {
 	if len(text) <= width {
 		return text
 	}
-
 	result := ""
 	for i := 0; i < len(text); i += width {
 		end := i + width
@@ -302,7 +375,6 @@ func formatDuration(d time.Duration) string {
 	if d < time.Second {
 		return fmt.Sprintf("%.2fms", float64(d.Microseconds())/1000)
 	}
-
 	d = d.Round(time.Millisecond)
 	h := d / time.Hour
 	d -= h * time.Hour
@@ -311,7 +383,6 @@ func formatDuration(d time.Duration) string {
 	s := d / time.Second
 	d -= s * time.Second
 	ms := d / time.Millisecond
-
 	if h > 0 {
 		return fmt.Sprintf("%dh %dm %ds %dms", h, m, s, ms)
 	} else if m > 0 {
