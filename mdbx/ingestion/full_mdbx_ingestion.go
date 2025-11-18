@@ -654,7 +654,7 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 	}
 
 	// Open environment with optimized flags
-	err = env.Open(path, mdbx.NoSubdir|mdbx.Coalesce|mdbx.LifoReclaim|mdbx.NoMetaSync|mdbx.WriteMap, 0644)
+	err = env.Open(path, mdbx.NoSubdir|mdbx.Coalesce|mdbx.LifoReclaim|mdbx.WriteMap, 0644)
 	if err != nil {
 		env.Close()
 		return nil, errors.Wrap(err, "failed to open database")
