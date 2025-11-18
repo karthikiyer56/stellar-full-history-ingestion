@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/stellar/go/ingest/ledgerbackend"
+	"github.com/stellar/go/support/datastore"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,9 +21,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/pkg/errors"
 	"github.com/stellar/go/ingest"
-	"github.com/stellar/go/ingest/ledgerbackend"
 	"github.com/stellar/go/network"
-	"github.com/stellar/go/support/datastore"
 	"github.com/stellar/go/xdr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -89,6 +89,13 @@ type MDBXStats struct {
 	MapSize       uint64
 	LastPageNum   uint64
 	RecentTxnID   uint64
+}
+
+// Raw transaction data for batch processing
+type rawTxData struct {
+	tx        ingest.LedgerTransaction
+	ledgerSeq uint32
+	closedAt  time.Time
 }
 
 func main() {
@@ -227,31 +234,72 @@ func main() {
 	var totalTimingStats DBTimingStats
 	var totalCompressionStats CompressionStats
 
-	// Batch maps
-	var txHashToTxData map[string][]byte
-	if config.EnableDB2 {
-		txHashToTxData = make(map[string][]byte)
-	}
-	var txHashToLedgerSeq map[string]uint32
-	if config.EnableDB3 {
-		txHashToLedgerSeq = make(map[string]uint32)
-	}
-
-	// Create a reusable zstd encoder
-	var encoder *zstd.Encoder
-	if config.EnableApplicationCompression {
-		encoder, err = zstd.NewWriter(nil)
-		if err != nil {
-			log.Fatal(errors.Wrap(err, "failed to create zstd encoder"))
-		}
-		defer encoder.Close()
-	}
+	// Batch data
+	var batchTransactions []rawTxData
 
 	// Track current batch
 	currentBatch := BatchInfo{
 		BatchNum:    1,
 		StartLedger: ledgerRange.From(),
 		StartTime:   time.Now(),
+	}
+
+	// Helper function to process a batch
+	processBatch := func() {
+		if len(batchTransactions) == 0 {
+			return
+		}
+
+		// Process all transactions in parallel
+		compressionStart := time.Now()
+
+		txHashToTxData := make(map[string][]byte)
+		txHashToLedgerSeq := make(map[string]uint32)
+
+		stats, err := processTransactionBatch(
+			batchTransactions,
+			txHashToTxData,
+			txHashToLedgerSeq,
+			config,
+		)
+		if err != nil {
+			log.Fatalf("Failed to process batch: %v", err)
+		}
+
+		compressionTime := time.Since(compressionStart)
+		totalTimingStats.DB2CompressionTime += compressionTime
+		currentBatch.Db2CompressionTime = compressionTime
+
+		// Update stats
+		totalCompressionStats.UncompressedTx += stats.UncompressedTx
+		totalCompressionStats.CompressedTx += stats.CompressedTx
+		totalCompressionStats.TxCount += stats.TxCount
+
+		currentBatch.TxCount = int(stats.TxCount)
+
+		// Write to databases
+		dbTiming, err := writeBatchToDatabases(db2, db3, txHashToTxData, txHashToLedgerSeq, config)
+		if err != nil {
+			log.Printf("Error writing batch: %v", err)
+		}
+
+		// Accumulate timing
+		totalTimingStats.DB2WriteTime += dbTiming.DB2WriteTime
+		totalTimingStats.DB2SyncTime += dbTiming.DB2SyncTime
+		totalTimingStats.DB3WriteTime += dbTiming.DB3WriteTime
+		totalTimingStats.DB3SyncTime += dbTiming.DB3SyncTime
+
+		// Log batch completion
+		logBatchCompletion(currentBatch, dbTiming, config)
+
+		// Clear batch
+		batchTransactions = nil
+
+		// Update for next batch
+		currentBatch.BatchNum++
+		currentBatch.StartTime = time.Now()
+		currentBatch.Db2CompressionTime = 0
+		currentBatch.GetLedgerTime = 0
 	}
 
 	// Iterate through ledgers
@@ -264,62 +312,39 @@ func main() {
 		}
 		getLedgerTime := time.Since(getLedgerStart)
 
-		// Process ledger
-		compressionStats, compressionTime, err := processLedgerParallel(
-			encoder, ledger, txHashToTxData, txHashToLedgerSeq, config)
+		totalTimingStats.GetLedgerTime += getLedgerTime
+		currentBatch.GetLedgerTime += getLedgerTime
+
+		// Read all transactions from this ledger
+		txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(network.PublicNetworkPassphrase, ledger)
 		if err != nil {
-			log.Printf("Error processing ledger %d: %v", ledgerSeq, err)
-			continue
+			log.Fatalf("Failed to create tx reader for ledger %d: %v", ledgerSeq, err)
 		}
 
-		// Accumulate stats
-		totalCompressionStats.UncompressedTx += compressionStats.UncompressedTx
-		totalCompressionStats.CompressedTx += compressionStats.CompressedTx
-		totalCompressionStats.TxCount += compressionStats.TxCount
-
-		totalTimingStats.GetLedgerTime += getLedgerTime
-		totalTimingStats.DB2CompressionTime += compressionTime
-
-		// Add to current batch as well
-		currentBatch.GetLedgerTime += getLedgerTime
-		currentBatch.Db2CompressionTime += compressionTime
+		closedAt := ledger.ClosedAt()
+		for {
+			tx, err := txReader.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Fatalf("Error reading transaction in ledger %d: %v", ledgerSeq, err)
+			}
+			batchTransactions = append(batchTransactions, rawTxData{
+				tx:        tx,
+				ledgerSeq: ledger.LedgerSequence(),
+				closedAt:  closedAt,
+			})
+		}
+		txReader.Close()
 
 		processedLedgerCount++
 
-		// Write batch every batchSize ledgers
+		// Process batch when we hit batch size
 		if processedLedgerCount%config.BatchSize == 0 {
 			currentBatch.EndLedger = ledgerSeq
-			currentBatch.TxCount = len(txHashToTxData)
-
-			// Write to databases
-			dbTiming, err := writeBatchToDatabases(db2, db3, txHashToTxData, txHashToLedgerSeq, config)
-			if err != nil {
-				log.Printf("Error writing batch: %v", err)
-			}
-
-			// Accumulate timing
-			totalTimingStats.DB2WriteTime += dbTiming.DB2WriteTime
-			totalTimingStats.DB2SyncTime += dbTiming.DB2SyncTime
-			totalTimingStats.DB3WriteTime += dbTiming.DB3WriteTime
-			totalTimingStats.DB3SyncTime += dbTiming.DB3SyncTime
-
-			// Log batch completion
-			logBatchCompletion(currentBatch, dbTiming, config)
-
-			// Clear batch maps
-			if config.EnableDB2 {
-				txHashToTxData = make(map[string][]byte)
-			}
-			if config.EnableDB3 {
-				txHashToLedgerSeq = make(map[string]uint32)
-			}
-
-			// Update for next batch
-			currentBatch.BatchNum++
+			processBatch()
 			currentBatch.StartLedger = ledgerSeq + 1
-			currentBatch.StartTime = time.Now()
-			currentBatch.Db2CompressionTime = 0
-			currentBatch.GetLedgerTime = 0
 		}
 
 		// Report database stats every 10 batches
@@ -363,22 +388,10 @@ func main() {
 		}
 	}
 
-	// Write remaining batch
-	if (config.EnableDB2 && len(txHashToTxData) > 0) || (config.EnableDB3 && len(txHashToLedgerSeq) > 0) {
-		currentBatch.EndLedger = ledgerRange.To() - 1
-		currentBatch.TxCount = len(txHashToTxData)
-
-		dbTiming, err := writeBatchToDatabases(db2, db3, txHashToTxData, txHashToLedgerSeq, config)
-		if err != nil {
-			log.Printf("Error writing final batch: %v", err)
-		}
-
-		totalTimingStats.DB2WriteTime += dbTiming.DB2WriteTime
-		totalTimingStats.DB2SyncTime += dbTiming.DB2SyncTime
-		totalTimingStats.DB3WriteTime += dbTiming.DB3WriteTime
-		totalTimingStats.DB3SyncTime += dbTiming.DB3SyncTime
-
-		logBatchCompletion(currentBatch, dbTiming, config)
+	// Process remaining batch (the last batch that may not be full)
+	if len(batchTransactions) > 0 {
+		currentBatch.EndLedger = ledgerRange.To()
+		processBatch()
 	}
 
 	// Final sync to ensure all data is durably written
@@ -452,6 +465,153 @@ func main() {
 
 	showCompressionStats(config, totalCompressionStats)
 	log.Printf("========================================")
+}
+
+type result struct {
+	hash             string
+	compressedData   []byte
+	uncompressedSize int64
+	compressedSize   int64
+	ledgerSeq        uint32
+	err              error
+}
+
+// Use the same struct type for jobs
+type jobData struct {
+	tx        ingest.LedgerTransaction
+	ledgerSeq uint32
+	closedAt  time.Time
+}
+
+// processTransactionBatch processes all transactions in parallel
+func processTransactionBatch(
+	transactions []rawTxData,
+	txHashToTxData map[string][]byte,
+	txHashToLedgerSeq map[string]uint32,
+	config IngestionConfig,
+) (*CompressionStats, error) {
+	stats := &CompressionStats{}
+
+	if len(transactions) == 0 {
+		return stats, nil
+	}
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 16 {
+		numWorkers = 16
+	}
+
+	jobs := make(chan jobData, len(transactions))
+	results := make(chan result, len(transactions))
+
+	// Start worker pool
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			var localEncoder *zstd.Encoder
+			if config.EnableApplicationCompression {
+				localEncoder, _ = zstd.NewWriter(nil)
+				defer localEncoder.Close()
+			}
+
+			for job := range jobs {
+				res := result{
+					hash:      job.tx.Hash.HexString(),
+					ledgerSeq: job.ledgerSeq,
+				}
+
+				// Marshal
+				txEnvelopeBytes, err := job.tx.Envelope.MarshalBinary()
+				if err != nil {
+					res.err = fmt.Errorf("error marshalling tx envelope: %w", err)
+					results <- res
+					continue
+				}
+
+				txResultBytes, err := job.tx.Result.MarshalBinary()
+				if err != nil {
+					res.err = fmt.Errorf("error marshalling tx result: %w", err)
+					results <- res
+					continue
+				}
+
+				txMetaBytes, err := job.tx.UnsafeMeta.MarshalBinary()
+				if err != nil {
+					res.err = fmt.Errorf("error marshalling tx meta: %w", err)
+					results <- res
+					continue
+				}
+
+				// Create protobuf
+				txDataProto := tx_data.TxData{
+					LedgerSequence: job.ledgerSeq,
+					ClosedAt:       timestamppb.New(job.closedAt),
+					Index:          job.tx.Index,
+					TxEnvelope:     txEnvelopeBytes,
+					TxResult:       txResultBytes,
+					TxMeta:         txMetaBytes,
+				}
+
+				txDataBytes, err := proto.Marshal(&txDataProto)
+				if err != nil {
+					res.err = fmt.Errorf("error marshalling proto: %w", err)
+					results <- res
+					continue
+				}
+
+				res.uncompressedSize = int64(len(txDataBytes))
+
+				// Compress
+				if config.EnableApplicationCompression {
+					res.compressedData = localEncoder.EncodeAll(txDataBytes, make([]byte, 0, len(txDataBytes)))
+					res.compressedSize = int64(len(res.compressedData))
+				} else {
+					res.compressedData = txDataBytes
+					res.compressedSize = int64(len(txDataBytes))
+				}
+
+				results <- res
+			}
+		}()
+	}
+
+	// Send ALL jobs
+	for _, tx := range transactions {
+		jobs <- jobData{
+			tx:        tx.tx,
+			ledgerSeq: tx.ledgerSeq,
+			closedAt:  tx.closedAt,
+		}
+	}
+	close(jobs)
+
+	// Collect results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for res := range results {
+		if res.err != nil {
+			return stats, res.err
+		}
+
+		stats.UncompressedTx += res.uncompressedSize
+		stats.CompressedTx += res.compressedSize
+		stats.TxCount++
+
+		if config.EnableDB2 {
+			txHashToTxData[res.hash] = res.compressedData
+		}
+		if config.EnableDB3 {
+			txHashToLedgerSeq[res.hash] = res.ledgerSeq
+		}
+	}
+
+	return stats, nil
 }
 
 // openMDBXDatabase opens or creates an MDBX database
