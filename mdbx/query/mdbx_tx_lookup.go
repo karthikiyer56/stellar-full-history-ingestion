@@ -1,5 +1,8 @@
 package main
 
+// Filename: mdbx_tx_lookup.go
+// Usage: go run mdbx_tx_lookup.go --db /path/to/db --tx abc123...
+
 import (
 	"encoding/base64"
 	"encoding/hex"
@@ -46,29 +49,41 @@ func main() {
 	defer env.Close()
 
 	// Set max DBs
+	t1 := time.Now()
 	err = env.SetOption(mdbx.OptMaxDB, uint64(2))
 	if err != nil {
 		log.Fatalf("Failed to set max DBs: %v", err)
 	}
+	setOptTime := time.Since(t1)
 
 	// Open in read-only mode
-	start := time.Now()
+	t2 := time.Now()
 	err = env.Open(dbPath, mdbx.Readonly|mdbx.Accede, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open MDBX database: %v", err)
 	}
-	openTime := time.Since(start)
+	envOpenTime := time.Since(t2)
 
-	// Get database stats before query
+	// First DBI open
+	t3 := time.Now()
+	var dbi mdbx.DBI
+	err = env.View(func(txn *mdbx.Txn) error {
+		var err error
+		dbi, err = txn.OpenDBI("data", 0, nil, nil)
+		return err
+	})
+	if err != nil {
+		log.Fatalf("Failed to open DBI: %v", err)
+	}
+	dbiOpenTime := time.Since(t3)
+
+	totalOpenTime := setOptTime + envOpenTime + dbiOpenTime
+
+	// Get database stats
 	var statsBefore mdbx.Stat
 	var envInfoBefore *mdbx.EnvInfo
 
 	err = env.View(func(txn *mdbx.Txn) error {
-		dbi, err := txn.OpenDBI("data", 0, nil, nil)
-		if err != nil {
-			return err
-		}
-
 		stat, err := txn.StatDBI(dbi)
 		if err != nil {
 			return err
@@ -93,11 +108,6 @@ func main() {
 
 	queryStart := time.Now()
 	err = env.View(func(txn *mdbx.Txn) error {
-		dbi, err := txn.OpenDBI("data", 0, nil, nil)
-		if err != nil {
-			return err
-		}
-
 		val, err := txn.Get(dbi, txHashBytes)
 		if err != nil {
 			if mdbx.IsNotFound(err) {
@@ -126,7 +136,12 @@ func main() {
 		fmt.Printf("========================================\n")
 		fmt.Printf("TX Hash: %s\n", txHashHex)
 		fmt.Printf("DB Path: %s\n", dbPath)
-		fmt.Printf("Query Time: %s\n", formatDuration(queryTime))
+		fmt.Printf("\nOpen Timing Breakdown:\n")
+		fmt.Printf("  SetOption:    %s\n", formatDuration(setOptTime))
+		fmt.Printf("  env.Open:     %s\n", formatDuration(envOpenTime))
+		fmt.Printf("  DBI open:     %s\n", formatDuration(dbiOpenTime))
+		fmt.Printf("  Total open:   %s\n", formatDuration(totalOpenTime))
+		fmt.Printf("  Query time:   %s\n", formatDuration(queryTime))
 		fmt.Printf("========================================\n\n")
 		return
 	}
@@ -158,7 +173,7 @@ func main() {
 	txResultBase64 := base64.StdEncoding.EncodeToString(txData.TxResult)
 	txMetaBase64 := base64.StdEncoding.EncodeToString(txData.TxMeta)
 
-	totalTime := time.Since(start)
+	totalTime := totalOpenTime + queryTime + decompressTime + unmarshalTime
 
 	// Display results
 	fmt.Printf("\n========================================\n")
@@ -194,9 +209,8 @@ func main() {
 	fmt.Printf("  Total entries:      %s\n", formatNumber(int64(statsBefore.Entries)))
 	fmt.Printf("  Map size:           %s\n", formatBytes(int64(envInfoBefore.MapSize)))
 
-	// Calculate pages read for this query (tree depth = pages traversed)
+	// Calculate pages read for this query
 	pagesRead := statsBefore.Depth
-	// If data spans multiple pages (overflow), add those
 	overflowPagesRead := uint((len(data) / int(statsBefore.PSize)) + 1)
 	if len(data) > int(statsBefore.PSize)/2 {
 		pagesRead += overflowPagesRead
@@ -205,12 +219,17 @@ func main() {
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Query Performance Metrics\n")
 	fmt.Printf("========================================\n")
-	fmt.Printf("  DB open time:       %s\n", formatDuration(openTime))
+	fmt.Printf("\nOpen Timing Breakdown:\n")
+	fmt.Printf("  SetOption:          %s\n", formatDuration(setOptTime))
+	fmt.Printf("  env.Open:           %s\n", formatDuration(envOpenTime))
+	fmt.Printf("  DBI open:           %s\n", formatDuration(dbiOpenTime))
+	fmt.Printf("  Total open:         %s\n", formatDuration(totalOpenTime))
+	fmt.Printf("\nQuery Timing:\n")
 	fmt.Printf("  Query time:         %s\n", formatDuration(queryTime))
 	fmt.Printf("  Decompress time:    %s\n", formatDuration(decompressTime))
 	fmt.Printf("  Unmarshal time:     %s\n", formatDuration(unmarshalTime))
 	fmt.Printf("  Total time:         %s\n", formatDuration(totalTime))
-	fmt.Printf("\n")
+	fmt.Printf("\nI/O Metrics:\n")
 	fmt.Printf("  Pages traversed:    %d (tree depth)\n", statsBefore.Depth)
 	fmt.Printf("  Est. pages read:    %d\n", pagesRead)
 	fmt.Printf("  Bytes read (data):  %s\n", formatBytes(int64(len(data))))
