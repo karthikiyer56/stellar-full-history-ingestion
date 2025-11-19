@@ -10,6 +10,7 @@ DB2_PATH=""
 DB3_PATH=""
 BATCH_SIZE=2000
 ENABLE_APP_COMPRESSION=true
+ROCKSDB_LCM_STORE=""
 
 # -----------------------------
 # Usage/help function
@@ -27,6 +28,7 @@ Optional:
   --db3                Path for DB3 (txHash -> ledgerSeq)
   --ledger-batch-size  Ledger batch size for commit (default: 2000)
   --app-compression    true/false (default: true)
+  --rocksdb-lcm-store  Path to RocksDB store containing compressed LedgerCloseMeta
   --help               Show this help message and exit
 EOF
 }
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --db3) DB3_PATH="$2"; shift 2 ;;
     --ledger-batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --app-compression) ENABLE_APP_COMPRESSION="$2"; shift 2 ;;
+    --rocksdb-lcm-store) ROCKSDB_LCM_STORE="$2"; shift 2 ;;
     --help) usage; exit 0 ;;
     *)
       echo "❌ Unknown argument: $1" >&2
@@ -79,6 +82,7 @@ echo "  DB2_PATH=$DB2_PATH"
 echo "  DB3_PATH=$DB3_PATH"
 echo "  BATCH_SIZE=$BATCH_SIZE"
 echo "  ENABLE_APP_COMPRESSION=$ENABLE_APP_COMPRESSION"
+echo "  ROCKSDB_LCM_STORE=$ROCKSDB_LCM_STORE"
 echo "----------------------------------"
 
 cleanup() {
@@ -127,13 +131,18 @@ echo ""
 echo "🚀 Starting MDBX ingestion..."
 echo ""
 
+set -x
+
 "$MDBX_BINARY" \
   --start-ledger "$START_LEDGER" \
   --end-ledger "$END_LEDGER" \
   --ledger-batch-size "$BATCH_SIZE" \
   ${DB2_PATH:+--db2 "$DB2_PATH"} \
   ${DB3_PATH:+--db3 "$DB3_PATH"} \
+  ${ROCKSDB_LCM_STORE:+--rocksdb-lcm-store "$ROCKSDB_LCM_STORE"} \
   --app-compression="$ENABLE_APP_COMPRESSION"
+
+set +x
 
 echo ""
 echo "✅ MDBX ingestion complete!"
