@@ -355,15 +355,15 @@ func main() {
 		if config.UseRocksDB {
 			// Get ledger from RocksDB
 			getLedgerStart := time.Now()
-			var timing RocksDBTimingStats
-			ledger, timing, err = rocksReader.GetLedger(ledgerSeq)
+			//var timing RocksDBTimingStats
+			ledger, err = rocksReader.GetLedger(ledgerSeq)
 			getLedgerTime = time.Since(getLedgerStart)
 
 			// Accumulate RocksDB timing stats
-			totalRocksDBTiming.ReadTime += timing.ReadTime
-			totalRocksDBTiming.DecompressTime += timing.DecompressTime
-			totalRocksDBTiming.UnmarshalTime += timing.UnmarshalTime
-			totalRocksDBTiming.TotalTime += timing.TotalTime
+			//totalRocksDBTiming.ReadTime += timing.ReadTime
+			//totalRocksDBTiming.DecompressTime += timing.DecompressTime
+			//totalRocksDBTiming.UnmarshalTime += timing.UnmarshalTime
+			//totalRocksDBTiming.TotalTime += timing.TotalTime
 
 			if err != nil {
 				log.Printf("===== Warning: Failed to get ledger %d from RocksDB: %v, skipping =====\n", ledgerSeq, err)
@@ -434,9 +434,9 @@ func main() {
 				}
 			}
 			showCompressionStats(config, totalCompressionStats)
-			if config.UseRocksDB {
-				showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
-			}
+			//if config.UseRocksDB {
+			//	showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+			//}
 			log.Printf("Time taken for MDBX stats: %s", formatDuration(time.Since(st)))
 			log.Printf("========================================\n")
 		}
@@ -551,9 +551,9 @@ func main() {
 	}
 
 	showCompressionStats(config, totalCompressionStats)
-	if config.UseRocksDB {
-		showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
-	}
+	//if config.UseRocksDB {
+	//	showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+	//}
 	log.Printf("========================================")
 }
 
@@ -599,56 +599,56 @@ func (r *RocksDBReader) Close() {
 }
 
 // GetLedger retrieves and decompresses a ledger from RocksDB
-func (r *RocksDBReader) GetLedger(ledgerSeq uint32) (xdr.LedgerCloseMeta, RocksDBTimingStats, error) {
+func (r *RocksDBReader) GetLedger(ledgerSeq uint32) (xdr.LedgerCloseMeta, error) {
 	var ledger xdr.LedgerCloseMeta
-	var timing RocksDBTimingStats
+	//var timing RocksDBTimingStats
 
-	totalStart := time.Now()
+	//  totalStart := time.Now()
 
 	// Convert ledger sequence to 4-byte big-endian key
 	key := uint32ToBytes(ledgerSeq)
 
 	// Read from RocksDB
-	readStart := time.Now()
+	// readStart := time.Now()
 	slice, err := r.db.Get(r.ro, key)
-	timing.ReadTime = time.Since(readStart)
+	// timing.ReadTime = time.Since(readStart)
 
 	if err != nil {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, errors.Wrap(err, "failed to read from RocksDB")
+		// timing.TotalTime = time.Since(totalStart)
+		return ledger, errors.Wrap(err, "failed to read from RocksDB")
 	}
 	defer slice.Free()
 
 	// Check if key exists
 	if !slice.Exists() {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
+		// timing.TotalTime = time.Since(totalStart)
+		return ledger, fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
 	}
 
 	compressedData := slice.Data()
 
 	// Decompress zstd data
-	decompressStart := time.Now()
+	// decompressStart := time.Now()
 	uncompressedData, err := r.decoder.DecodeAll(compressedData, nil)
-	timing.DecompressTime = time.Since(decompressStart)
+	// timing.DecompressTime = time.Since(decompressStart)
 
 	if err != nil {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, errors.Wrap(err, "failed to decompress ledger data")
+		// timing.TotalTime = time.Since(totalStart)
+		return ledger, errors.Wrap(err, "failed to decompress ledger data")
 	}
 
 	// Unmarshal XDR to LedgerCloseMeta
-	unmarshalStart := time.Now()
+	// unmarshalStart := time.Now()
 	err = ledger.UnmarshalBinary(uncompressedData)
-	timing.UnmarshalTime = time.Since(unmarshalStart)
+	// timing.UnmarshalTime = time.Since(unmarshalStart)
 
 	if err != nil {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
+		// timing.TotalTime = time.Since(totalStart)
+		return ledger, errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
 	}
 
-	timing.TotalTime = time.Since(totalStart)
-	return ledger, timing, nil
+	// timing.TotalTime = time.Since(totalStart)
+	return ledger, nil
 }
 
 // showRocksDBTimingStats displays RocksDB timing statistics
