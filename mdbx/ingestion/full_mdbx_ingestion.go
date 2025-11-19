@@ -385,6 +385,7 @@ func main() {
 
 		// Periodic sync every N batches to ensure data durability
 		if currentBatch.BatchNum%uint32(config.SyncEveryNBatches) == 0 {
+			log.Printf("")
 			log.Printf("\n========================================")
 			log.Printf("🔄 Periodic sync at batch %d...", currentBatch.BatchNum)
 			syncStart := time.Now()
@@ -545,6 +546,7 @@ func main() {
 					eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
 				}
 
+				log.Printf("")
 				log.Printf("\n========================================")
 				log.Printf("PROGRESS: %d/%d ledgers (%d%%) | Ledger: %d",
 					processedLedgerCount, totalLedgers, currentPercent, chunkEnd)
@@ -648,6 +650,7 @@ func main() {
 					eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
 				}
 
+				log.Printf("")
 				log.Printf("\n========================================")
 				log.Printf("PROGRESS: %d/%d ledgers (%d%%) | Ledger: %d",
 					processedLedgerCount, totalLedgers, currentPercent, ledgerSeq)
@@ -672,6 +675,7 @@ func main() {
 	// ================================
 	// FINAL SYNC
 	// ================================
+	log.Printf("")
 	log.Printf("\n========================================")
 	log.Printf("Performing final sync to disk...")
 	log.Printf("========================================\n")
@@ -904,6 +908,7 @@ func (r *RocksDBReader) Close() {
 
 // showRocksDBTimingStats displays RocksDB timing statistics
 func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int) {
+	log.Printf("")
 	log.Printf("\nRocksDB Timing Statistics:")
 	log.Printf("  Total Read Time: %s", helpers.FormatDuration(timing.ReadTime))
 	log.Printf("  Total Decompress Time: %s", helpers.FormatDuration(timing.DecompressTime))
@@ -1240,6 +1245,7 @@ func getMDBXStats(db *MDBXDatabase) (MDBXStats, error) {
 
 // logMDBXStats logs MDBX statistics
 func logMDBXStats(name string, stats MDBXStats) {
+	log.Printf("")
 	log.Printf("[%s] MDBX Statistics:", name)
 	log.Printf("  Page size: %d bytes", stats.PageSize)
 	log.Printf("  Tree depth: %d", stats.Depth)
@@ -1342,12 +1348,13 @@ func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionC
 		log.Printf("\tAvg time per transaction: %s", helpers.FormatDuration(avgTimePerTx))
 	}
 
-	log.Printf("========================================\n")
+	log.Printf("========================================\n\n")
 }
 
 // showCompressionStats shows compression statistics
 func showCompressionStats(config IngestionConfig, stats CompressionStats) {
 	if config.EnableApplicationCompression && stats.UncompressedTx > 0 {
+		log.Printf("")
 		compressionRatio := 100 * (1 - float64(stats.CompressedTx)/float64(stats.UncompressedTx))
 		log.Printf("\nCompression Statistics:")
 		log.Printf("\tOriginal size: %s", helpers.FormatBytes(stats.UncompressedTx))
