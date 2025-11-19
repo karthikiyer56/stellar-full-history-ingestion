@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"log"
 	"os"
 	"time"
@@ -77,7 +78,7 @@ func main() {
 	db.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
 
 	elapsed := time.Since(startTime)
-	fmt.Printf("\nCompaction completed in %s\n\n", formatDuration(elapsed))
+	fmt.Printf("\nCompaction completed in %s\n\n", helpers.FormatDuration(elapsed))
 
 	// Show final state
 	fmt.Println("AFTER Compaction:")
@@ -106,33 +107,11 @@ func showStats(db *grocksdb.DB) {
 	fmt.Printf("  Total: %d files\n\n", totalFiles)
 
 	totalSSTSize := db.GetProperty("rocksdb.total-sst-files-size")
-	fmt.Printf("Total SST Size: %s bytes (%.2f GB)\n", totalSSTSize, bytesToGB(totalSSTSize))
+	fmt.Printf("Total SST Size: %s bytes (%.2f GB)\n", totalSSTSize, helpers.BytesToGB(totalSSTSize))
 
 	estimatedKeys := db.GetProperty("rocksdb.estimate-num-keys")
 	fmt.Printf("Estimated Keys: %s\n", estimatedKeys)
 
 	liveDataSize := db.GetProperty("rocksdb.estimate-live-data-size")
-	fmt.Printf("Live Data Size: %s bytes (%.2f GB)\n", liveDataSize, bytesToGB(liveDataSize))
-}
-
-func bytesToGB(bytesStr string) float64 {
-	var bytes float64
-	fmt.Sscanf(bytesStr, "%f", &bytes)
-	return bytes / (1024 * 1024 * 1024)
-}
-
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
+	fmt.Printf("Live Data Size: %s bytes (%.2f GB)\n", liveDataSize, helpers.BytesToGB(liveDataSize))
 }

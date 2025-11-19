@@ -6,12 +6,11 @@ package main
 
 import (
 	"encoding/base64"
-	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
@@ -33,7 +32,7 @@ func main() {
 	}
 
 	// Convert hex string to binary bytes
-	txHashBytes, err := hexStringToBytes(txHashHex)
+	txHashBytes, err := helpers.HexStringToBytes(txHashHex)
 	if err != nil {
 		log.Fatalf("Failed to convert tx hash to bytes: %v", err)
 	}
@@ -106,79 +105,20 @@ func main() {
 	fmt.Printf("Transaction index:    %d\n", txData.Index)
 	fmt.Printf("Closed at:            %v\n", txData.ClosedAt.AsTime())
 	fmt.Printf("\nData sizes:\n")
-	fmt.Printf("  Compressed:         %s\n", formatBytes(int64(len(data))))
-	fmt.Printf("  Uncompressed:       %s\n", formatBytes(int64(len(decompressedData))))
+	fmt.Printf("  Compressed:         %s\n", helpers.FormatBytes(int64(len(data))))
+	fmt.Printf("  Uncompressed:       %s\n", helpers.FormatBytes(int64(len(decompressedData))))
 	fmt.Printf("  Compression ratio:  %.2f%%\n", 100*(1-float64(len(data))/float64(len(decompressedData))))
 	fmt.Printf("\nComponent sizes:\n")
-	fmt.Printf("  Envelope:           %s\n", formatBytes(int64(len(txData.TxEnvelope))))
-	fmt.Printf("  Result:             %s\n", formatBytes(int64(len(txData.TxResult))))
-	fmt.Printf("  Meta:               %s\n", formatBytes(int64(len(txData.TxMeta))))
+	fmt.Printf("  Envelope:           %s\n", helpers.FormatBytes(int64(len(txData.TxEnvelope))))
+	fmt.Printf("  Result:             %s\n", helpers.FormatBytes(int64(len(txData.TxResult))))
+	fmt.Printf("  Meta:               %s\n", helpers.FormatBytes(int64(len(txData.TxMeta))))
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Transaction Data (Base64 Encoded)\n")
 	fmt.Printf("========================================\n")
-	fmt.Printf("\nTxEnvelope (base64):\n%s\n", wrapText(txEnvelopeBase64, 80))
-	fmt.Printf("\nTxResult (base64):\n%s\n", wrapText(txResultBase64, 80))
-	fmt.Printf("\nTxMeta (base64):\n%s\n", wrapText(txMetaBase64, 80))
+	fmt.Printf("\nTxEnvelope (base64):\n%s\n", helpers.WrapText(txEnvelopeBase64, 80))
+	fmt.Printf("\nTxResult (base64):\n%s\n", helpers.WrapText(txResultBase64, 80))
+	fmt.Printf("\nTxMeta (base64):\n%s\n", helpers.WrapText(txMetaBase64, 80))
 	fmt.Printf("========================================\n\n")
 
-	fmt.Println("Time Elapsed: ", formatDuration(elapsed))
-}
-
-// hexStringToBytes converts a hex string to bytes
-// hexStringToBytes converts a hex string to bytes
-func hexStringToBytes(hexStr string) ([]byte, error) {
-	hexStr = strings.TrimPrefix(hexStr, "0x")
-	return hex.DecodeString(hexStr)
-}
-
-// wrapText wraps text at the specified width
-func wrapText(text string, width int) string {
-	if len(text) <= width {
-		return text
-	}
-
-	result := ""
-	for i := 0; i < len(text); i += width {
-		end := i + width
-		if end > len(text) {
-			end = len(text)
-		}
-		result += text[i:end] + "\n"
-	}
-	return result
-}
-
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-// formatDuration formats a time.Duration into a human-readable string
-// supporting hours, minutes, seconds, and milliseconds.
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Millisecond)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	d -= s * time.Second
-	ms := d / time.Millisecond
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds %dms", h, m, s, ms)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds %dms", m, s, ms)
-	} else if s > 0 {
-		return fmt.Sprintf("%ds %dms", s, ms)
-	}
-	return fmt.Sprintf("%dms", ms)
+	fmt.Println("Time Elapsed: ", helpers.FormatDuration(elapsed))
 }

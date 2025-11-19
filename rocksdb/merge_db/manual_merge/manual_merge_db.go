@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"log"
 	"os"
 	"path/filepath"
@@ -111,12 +112,12 @@ func main() {
 		fmt.Sscanf(estimatedKeys, "%d", &keyCount)
 		stats.TotalKeysToMerge += keyCount
 
-		log.Printf("  [%d/%d] %s: ~%s keys", i+1, len(sources), srcPath, formatNumber(keyCount))
+		log.Printf("  [%d/%d] %s: ~%s keys", i+1, len(sources), srcPath, helpers.FormatNumber(keyCount))
 
 		srcDB.Close()
 	}
 
-	log.Printf("\nTotal keys to merge: ~%s\n", formatNumber(stats.TotalKeysToMerge))
+	log.Printf("\nTotal keys to merge: ~%s\n", helpers.FormatNumber(stats.TotalKeysToMerge))
 	log.Printf("Will show stats at each 1%% of progress\n")
 	fmt.Println()
 
@@ -140,17 +141,17 @@ func main() {
 	log.Printf("Performing final compaction...\n")
 	compactionStart := time.Now()
 	destDB.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
-	log.Printf("✓ Compaction complete in %s\n\n", formatDuration(time.Since(compactionStart)))
+	log.Printf("✓ Compaction complete in %s\n\n", helpers.FormatDuration(time.Since(compactionStart)))
 
 	// Show final statistics
 	elapsed := time.Since(stats.StartTime)
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("MERGE COMPLETE\n")
 	fmt.Printf("========================================\n")
-	fmt.Printf("Total keys merged:    %s\n", formatNumber(stats.TotalKeys))
-	fmt.Printf("Total data size:      %s\n", formatBytes(stats.TotalBytes))
+	fmt.Printf("Total keys merged:    %s\n", helpers.FormatNumber(stats.TotalKeys))
+	fmt.Printf("Total data size:      %s\n", helpers.FormatBytes(stats.TotalBytes))
 	fmt.Printf("Source databases:     %d\n", stats.SourceDBs)
-	fmt.Printf("Total time:           %s\n", formatDuration(elapsed))
+	fmt.Printf("Total time:           %s\n", helpers.FormatDuration(elapsed))
 	fmt.Printf("Average speed:        %.2f keys/sec\n", float64(stats.TotalKeys)/elapsed.Seconds())
 	fmt.Printf("========================================\n\n")
 
@@ -322,11 +323,11 @@ func mergeDatabase(destDB *grocksdb.DB, srcPath string, stats *MergeStats, batch
 	// Flush after each source DB
 	flushDB(destDB)
 
-	log.Printf("  Keys merged from this source: %s", formatNumber(keysInSource))
+	log.Printf("  Keys merged from this source: %s", helpers.FormatNumber(keysInSource))
 	log.Printf("  Performing interim compaction after %s...", srcPath)
 	compactStart := time.Now()
 	destDB.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
-	log.Printf("  ✓ Interim compaction done in %s\n", formatDuration(time.Since(compactStart)))
+	log.Printf("  ✓ Interim compaction done in %s\n", helpers.FormatDuration(time.Since(compactStart)))
 
 	return nil
 }
@@ -342,10 +343,10 @@ func reportProgress(stats *MergeStats, db *grocksdb.DB) {
 	l0Files := db.GetProperty("rocksdb.num-files-at-level0")
 
 	log.Printf("  Progress: %s keys | %.2f keys/sec (recent: %.2f) | %s | L0: %s files | Source: %s",
-		formatNumber(stats.TotalKeys),
+		helpers.FormatNumber(stats.TotalKeys),
 		keysPerSec,
 		recentKeysPerSec,
-		formatBytes(stats.TotalBytes),
+		helpers.FormatBytes(stats.TotalBytes),
 		l0Files,
 		stats.CurrentSource)
 
@@ -379,10 +380,10 @@ func checkPercentageMilestone(stats *MergeStats, db *grocksdb.DB) {
 		log.Printf("========================================")
 		log.Printf("PROGRESS: %d%% Complete", currentPercent)
 		log.Printf("========================================")
-		log.Printf("Keys merged: %s / %s", formatNumber(stats.TotalKeys), formatNumber(stats.TotalKeysToMerge))
+		log.Printf("Keys merged: %s / %s", helpers.FormatNumber(stats.TotalKeys), helpers.FormatNumber(stats.TotalKeysToMerge))
 		log.Printf("Speed: %.2f keys/sec", keysPerSec)
-		log.Printf("Elapsed: %s | ETA: %s", formatDuration(elapsed), formatDuration(eta))
-		log.Printf("Data size: %s", formatBytes(stats.TotalBytes))
+		log.Printf("Elapsed: %s | ETA: %s", helpers.FormatDuration(elapsed), helpers.FormatDuration(eta))
+		log.Printf("Data size: %s", helpers.FormatBytes(stats.TotalBytes))
 
 		// Show current database state
 		fmt.Println()
@@ -420,7 +421,7 @@ func checkPercentageMilestone(stats *MergeStats, db *grocksdb.DB) {
 
 		// Size stats
 		totalSSTSize := db.GetProperty("rocksdb.total-sst-files-size")
-		log.Printf("  Total SST Size: %s (%.2f GB)", totalSSTSize, bytesToGB(totalSSTSize))
+		log.Printf("  Total SST Size: %s (%.2f GB)", totalSSTSize, helpers.BytesToGB(totalSSTSize))
 
 		log.Printf("========================================\n")
 	}
@@ -463,57 +464,6 @@ func showStats(db *grocksdb.DB, label string) {
 	totalSSTSize := db.GetProperty("rocksdb.total-sst-files-size")
 
 	fmt.Printf("Estimated Keys: %s\n", estimatedKeys)
-	fmt.Printf("Total Size: %s (%.2f GB)\n", totalSSTSize, bytesToGB(totalSSTSize))
+	fmt.Printf("Total Size: %s (%.2f GB)\n", totalSSTSize, helpers.BytesToGB(totalSSTSize))
 	fmt.Println()
-}
-
-// Helper functions
-func formatNumber(n int64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-	s := fmt.Sprintf("%d", n)
-	result := ""
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			result += ","
-		}
-		result += string(c)
-	}
-	return result
-}
-
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func bytesToGB(bytesStr string) float64 {
-	var bytes float64
-	fmt.Sscanf(bytesStr, "%f", &bytes)
-	return bytes / (1024 * 1024 * 1024)
-}
-
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
 }

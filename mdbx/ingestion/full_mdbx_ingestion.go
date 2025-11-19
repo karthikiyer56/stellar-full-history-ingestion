@@ -2,16 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +43,7 @@ type IngestionConfig struct {
 	EnableApplicationCompression bool
 	RocksDBLCMPath               string
 	UseRocksDB                   bool
+	SyncEveryNBatches            int
 }
 
 // CompressionStats tracks compression metrics for a batch
@@ -74,13 +73,14 @@ type RocksDBTimingStats struct {
 
 // BatchInfo tracks information about the current batch
 type BatchInfo struct {
-	BatchNum           uint32
-	StartLedger        uint32
-	EndLedger          uint32
-	StartTime          time.Time
-	TxCount            int
-	GetLedgerTime      time.Duration
-	Db2CompressionTime time.Duration
+	BatchNum                uint32
+	StartLedger             uint32
+	EndLedger               uint32
+	StartTime               time.Time
+	TxCount                 int
+	BatchGetLedgerTime      time.Duration
+	BatchDb2CompressionTime time.Duration
+	BatchRocksDBTimingStats RocksDBTimingStats
 }
 
 // MDBXDatabase wraps an MDBX environment and DBI
@@ -112,9 +112,16 @@ type rawTxData struct {
 
 // RocksDBReader wraps RocksDB with a reusable zstd decoder
 type RocksDBReader struct {
-	db      *grocksdb.DB
-	decoder *zstd.Decoder
-	ro      *grocksdb.ReadOptions
+	db *grocksdb.DB
+	ro *grocksdb.ReadOptions
+}
+
+// LedgerResult holds the result of fetching a ledger
+type LedgerResult struct {
+	LedgerSeq uint32
+	Ledger    xdr.LedgerCloseMeta
+	Timing    RocksDBTimingStats
+	Err       error
 }
 
 func main() {
@@ -122,15 +129,16 @@ func main() {
 	var startLedger, endLedger uint
 	var dbPagesize uint
 	var batchSize int
+	var syncEveryNBatches int
 	var db2Path, db3Path string
 	var enableApplicationCompression bool
 	var rocksdbLcmPath string
 
-	flag.UintVar(&dbPagesize, "db-pagesize", 8192, "DB Page size for new dbs. Ignored if db exists")
-
+	flag.UintVar(&dbPagesize, "db-pagesize", 16384, "DB Page size for new dbs. Ignored if db exists")
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
-	flag.IntVar(&batchSize, "ledger-batch-size", 2000, "Ledger batch size for commit")
+	flag.IntVar(&batchSize, "ledger-batch-size", 5000, "Ledger batch size for commit")
+	flag.IntVar(&syncEveryNBatches, "sync-every-n-batches", 20, "Sync to disk every N batches")
 	flag.StringVar(&db2Path, "db2", "", "Path for DB2 (txHash -> compressed TxData)")
 	flag.StringVar(&db3Path, "db3", "", "Path for DB3 (txHash -> ledgerSeq)")
 	flag.BoolVar(&enableApplicationCompression, "app-compression", true, "Enable compression (default: true)")
@@ -169,6 +177,7 @@ func main() {
 		RocksDBLCMPath:               rocksdbLcmPath,
 		UseRocksDB:                   rocksdbLcmPath != "",
 		DbPageSize:                   dbPagesize,
+		SyncEveryNBatches:            syncEveryNBatches,
 	}
 
 	// Initialize MDBX databases
@@ -265,7 +274,7 @@ func main() {
 	log.Printf("Starting MDBX ledger processing")
 	log.Printf("========================================")
 	log.Printf("Ledger range: %d - %d (%s ledgers)",
-		ledgerRange.From(), ledgerRange.To(), formatNumber(int64(totalLedgers)))
+		ledgerRange.From(), ledgerRange.To(), helpers.FormatNumber(int64(totalLedgers)))
 	log.Printf("Ledger source: %s", func() string {
 		if config.UseRocksDB {
 			return "RocksDB (" + config.RocksDBLCMPath + ")"
@@ -275,6 +284,10 @@ func main() {
 	log.Printf("DB2 (TxData) storage: %v", config.EnableDB2)
 	log.Printf("DB3 (Hash->Seq) storage: %v", config.EnableDB3)
 	log.Printf("Application Compression: %v", config.EnableApplicationCompression)
+	log.Printf("Page Size: %d bytes", config.DbPageSize)
+	log.Printf("Batch Size: %d ledgers", config.BatchSize)
+	log.Printf("Sync every: %d batches", config.SyncEveryNBatches)
+	log.Printf("Mode: SafeNoSync (fast bulk ingestion)")
 	log.Printf("========================================\n")
 
 	// Set up metrics tracking
@@ -286,6 +299,7 @@ func main() {
 	var totalTimingStats DBTimingStats
 	var totalCompressionStats CompressionStats
 	var totalRocksDBTiming RocksDBTimingStats
+	var totalSyncTime time.Duration
 
 	// Batch data
 	var batchTransactions []rawTxData
@@ -297,19 +311,20 @@ func main() {
 		StartTime:   time.Now(),
 	}
 
-	// Helper function to process a batch
-	processBatch := func() {
+	// Helper function to process a batch worth of transactions
+	// This is where compresession of tx data fields happens and so on and they get added to the in memory maps
+	processTransactionsInCurrentBatch := func() {
 		if len(batchTransactions) == 0 {
 			return
 		}
 
-		// Process all transactions in parallel
-		compressionStart := time.Now()
-
 		txHashToTxData := make(map[string][]byte)
 		txHashToLedgerSeq := make(map[string]uint32)
 
-		stats, err := processTransactionBatch(
+		// Process all transactions in parallel
+		compressionStart := time.Now()
+
+		stats, err := compressTransactionsFromBatchInParallel(
 			batchTransactions,
 			txHashToTxData,
 			txHashToLedgerSeq,
@@ -319,9 +334,12 @@ func main() {
 			log.Fatalf("Failed to process batch: %v", err)
 		}
 
+		// This is only slightly misleading. this "compressionTime" also includes time for parallelism and for loops and what not
+		// But they are dwarfed in comparision to the time it takes to compress. I am ok with that negligible variance
 		compressionTime := time.Since(compressionStart)
+
 		totalTimingStats.DB2CompressionTime += compressionTime
-		currentBatch.Db2CompressionTime = compressionTime
+		currentBatch.BatchDb2CompressionTime = compressionTime
 
 		// Update stats
 		totalCompressionStats.UncompressedTx += stats.UncompressedTx
@@ -345,139 +363,259 @@ func main() {
 		// Log batch completion
 		logBatchCompletion(currentBatch, dbTiming, config)
 
+		// Periodic sync every N batches
+		if currentBatch.BatchNum%uint32(config.SyncEveryNBatches) == 0 {
+			log.Printf("\n========================================")
+			log.Printf("\n🔄 Periodic sync at batch %d...", currentBatch.BatchNum)
+			syncStart := time.Now()
+			if config.EnableDB2 && db2 != nil {
+				if err := db2.Env.Sync(true, false); err != nil {
+					log.Printf("Warning: Failed to sync DB2: %v", err)
+				}
+			}
+			if config.EnableDB3 && db3 != nil {
+				if err := db3.Env.Sync(true, false); err != nil {
+					log.Printf("Warning: Failed to sync DB3: %v", err)
+				}
+			}
+			syncDuration := time.Since(syncStart)
+			totalSyncTime += syncDuration
+			log.Printf("✅ Sync complete: %s (total sync time so far: %s)\n", helpers.FormatDuration(syncDuration), helpers.FormatDuration(totalSyncTime))
+			log.Printf("========================================\n")
+		}
+
 		// Clear batch
 		batchTransactions = nil
 
 		// Update for next batch
 		currentBatch.BatchNum++
 		currentBatch.StartTime = time.Now()
-		currentBatch.Db2CompressionTime = 0
-		currentBatch.GetLedgerTime = 0
+		currentBatch.BatchDb2CompressionTime = 0
+		currentBatch.BatchGetLedgerTime = 0
 	}
 
-	// Iterate through ledgers
-	for ledgerSeq := ledgerRange.From(); ledgerSeq <= ledgerRange.To(); ledgerSeq++ {
-		var ledger xdr.LedgerCloseMeta
-		var err error
-		var getLedgerTime time.Duration
+	// Process ledgers
+	if config.UseRocksDB {
+		// Parallel processing for RocksDB
+		numWorkers := runtime.NumCPU()
+		if numWorkers > 16 {
+			numWorkers = 16
+		}
 
-		if config.UseRocksDB {
-			// Get ledger from RocksDB
-			getLedgerStart := time.Now()
-			var timing RocksDBTimingStats
-			ledger, timing, err = rocksReader.GetLedger(ledgerSeq)
-			getLedgerTime = time.Since(getLedgerStart)
-
-			// Accumulate RocksDB timing stats
-			totalRocksDBTiming.ReadTime += timing.ReadTime
-			totalRocksDBTiming.DecompressTime += timing.DecompressTime
-			totalRocksDBTiming.UnmarshalTime += timing.UnmarshalTime
-			totalRocksDBTiming.TotalTime += timing.TotalTime
-
-			if err != nil {
-				log.Printf("===== Warning: Failed to get ledger %d from RocksDB: %v, skipping =====\n", ledgerSeq, err)
-				skippedLedgerCount++
-				continue
+		// Process in chunks for better memory management
+		chunkSize := config.BatchSize
+		for chunkStart := ledgerRange.From(); chunkStart < ledgerRange.To(); chunkStart += uint32(chunkSize) {
+			chunkEnd := chunkStart + uint32(chunkSize) - 1
+			if chunkEnd > ledgerRange.To() {
+				chunkEnd = ledgerRange.To()
 			}
-		} else {
-			// Get ledger from GCS
+
+			// Fetch ledgers in parallel
 			getLedgerStart := time.Now()
-			ledger, err = backend.GetLedger(ctx, ledgerSeq)
-			getLedgerTime = time.Since(getLedgerStart)
+			ledgerResults := fetchLedgersParallel(rocksReader, chunkStart, chunkEnd, numWorkers)
+			getLedgerTime := time.Since(getLedgerStart)
+
+			rocksdBTimingsForBatch := RocksDBTimingStats{}
+			// Process results in order
+			for _, result := range ledgerResults {
+				// Accumulate RocksDB timing stats from the batch to the total time
+				totalRocksDBTiming.ReadTime += result.Timing.ReadTime
+				totalRocksDBTiming.DecompressTime += result.Timing.DecompressTime
+				totalRocksDBTiming.UnmarshalTime += result.Timing.UnmarshalTime
+				totalRocksDBTiming.TotalTime += result.Timing.TotalTime
+
+				// Accumulate rocksdb timing stats for this batch to show at the end during batch stats reporting time
+				rocksdBTimingsForBatch.ReadTime += result.Timing.ReadTime
+				rocksdBTimingsForBatch.DecompressTime += result.Timing.DecompressTime
+				rocksdBTimingsForBatch.UnmarshalTime += result.Timing.UnmarshalTime
+				rocksdBTimingsForBatch.TotalTime += result.Timing.TotalTime
+
+				if result.Err != nil {
+					log.Printf("===== Warning: Failed to get ledger %d from RocksDB: %v, skipping =====\n", result.LedgerSeq, result.Err)
+					skippedLedgerCount++
+					continue
+				}
+
+				ledger := result.Ledger
+
+				// Read all transactions from this ledger
+				txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(network.PublicNetworkPassphrase, ledger)
+				if err != nil {
+					log.Fatalf("Failed to create tx reader for ledger %d: %v", result.LedgerSeq, err)
+				}
+
+				closedAt := ledger.ClosedAt()
+				for {
+					tx, err := txReader.Read()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						log.Fatalf("Error reading transaction in ledger %d: %v", result.LedgerSeq, err)
+					}
+					batchTransactions = append(batchTransactions, rawTxData{
+						tx:        tx,
+						ledgerSeq: ledger.LedgerSequence(),
+						closedAt:  closedAt,
+					})
+				}
+				txReader.Close()
+
+				processedLedgerCount++
+			}
+
+			totalTimingStats.GetLedgerTime += getLedgerTime
+			currentBatch.BatchGetLedgerTime += getLedgerTime
+			currentBatch.BatchRocksDBTimingStats = rocksdBTimingsForBatch
+
+			//---------- Process batch ---------
+			currentBatch.EndLedger = chunkEnd
+			processTransactionsInCurrentBatch()
+			currentBatch.StartLedger = chunkEnd + 1
+
+			// Report database stats every 10 batches
+			if currentBatch.BatchNum%10 == 0 {
+				st := time.Now()
+				log.Printf("\n========================================")
+				log.Printf("========= MDBX STATS at ledger %d =====", chunkEnd)
+				if config.EnableDB2 {
+					stats, err := getMDBXStats(db2)
+					if err == nil {
+						logMDBXStats("DB2", stats)
+					}
+				}
+				if config.EnableDB3 {
+					stats, err := getMDBXStats(db3)
+					if err == nil {
+						logMDBXStats("DB3", stats)
+					}
+				}
+				showCompressionStats(config, totalCompressionStats)
+				showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+				log.Printf("Time taken for MDBX stats: %s", helpers.FormatDuration(time.Since(st)))
+				log.Printf("========================================\n")
+			}
+
+			// Report progress every 1%
+			currentPercent := (processedLedgerCount * 100) / totalLedgers
+			if currentPercent > lastReportedPercent {
+				elapsed := time.Since(startTime)
+				ledgersPerSec := float64(processedLedgerCount) / elapsed.Seconds()
+				remaining := totalLedgers - processedLedgerCount
+				var eta time.Duration
+				if ledgersPerSec > 0 {
+					eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
+				}
+
+				log.Printf("\n========================================")
+				log.Printf("PROGRESS: %d/%d ledgers (%d%%) | Ledger: %d",
+					processedLedgerCount, totalLedgers, currentPercent, chunkEnd)
+				if skippedLedgerCount > 0 {
+					log.Printf("Skipped ledgers: %d", skippedLedgerCount)
+				}
+				log.Printf("Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s",
+					ledgersPerSec, helpers.FormatNumber(totalCompressionStats.TxCount), helpers.FormatDuration(eta))
+				log.Printf("========================================\n")
+				lastReportedPercent = currentPercent
+			}
+		}
+	} else {
+		// Sequential processing for GCS backend
+		for ledgerSeq := ledgerRange.From(); ledgerSeq < ledgerRange.To(); ledgerSeq++ {
+			getLedgerStart := time.Now()
+			ledger, err := backend.GetLedger(ctx, ledgerSeq)
+			getLedgerTime := time.Since(getLedgerStart)
 
 			if err != nil {
 				log.Fatalf("Failed to retrieve ledger %d: %v", ledgerSeq, err)
 			}
-		}
 
-		totalTimingStats.GetLedgerTime += getLedgerTime
-		currentBatch.GetLedgerTime += getLedgerTime
+			totalTimingStats.GetLedgerTime += getLedgerTime
+			currentBatch.BatchGetLedgerTime += getLedgerTime
 
-		// Read all transactions from this ledger
-		txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(network.PublicNetworkPassphrase, ledger)
-		if err != nil {
-			log.Fatalf("Failed to create tx reader for ledger %d: %v", ledgerSeq, err)
-		}
-
-		closedAt := ledger.ClosedAt()
-		for {
-			tx, err := txReader.Read()
-			if err == io.EOF {
-				break
-			}
+			// Read all transactions from this ledger
+			txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(network.PublicNetworkPassphrase, ledger)
 			if err != nil {
-				log.Fatalf("Error reading transaction in ledger %d: %v", ledgerSeq, err)
+				log.Fatalf("Failed to create tx reader for ledger %d: %v", ledgerSeq, err)
 			}
-			batchTransactions = append(batchTransactions, rawTxData{
-				tx:        tx,
-				ledgerSeq: ledger.LedgerSequence(),
-				closedAt:  closedAt,
-			})
-		}
-		txReader.Close()
 
-		processedLedgerCount++
-
-		// Process batch when we hit batch size
-		if processedLedgerCount%config.BatchSize == 0 {
-			currentBatch.EndLedger = ledgerSeq
-			processBatch()
-			currentBatch.StartLedger = ledgerSeq + 1
-		}
-
-		// Report database stats every 10 batches
-		if processedLedgerCount%(config.BatchSize*10) == 0 {
-			st := time.Now()
-			log.Printf("\n========================================")
-			log.Printf("========= MDBX STATS at ledger %d =====", ledgerSeq)
-			if config.EnableDB2 {
-				stats, err := getMDBXStats(db2)
-				if err == nil {
-					logMDBXStats("DB2", stats)
+			closedAt := ledger.ClosedAt()
+			for {
+				tx, err := txReader.Read()
+				if err == io.EOF {
+					break
 				}
-			}
-			if config.EnableDB3 {
-				stats, err := getMDBXStats(db3)
-				if err == nil {
-					logMDBXStats("DB3", stats)
+				if err != nil {
+					log.Fatalf("Error reading transaction in ledger %d: %v", ledgerSeq, err)
 				}
+				batchTransactions = append(batchTransactions, rawTxData{
+					tx:        tx,
+					ledgerSeq: ledger.LedgerSequence(),
+					closedAt:  closedAt,
+				})
 			}
-			showCompressionStats(config, totalCompressionStats)
-			if config.UseRocksDB {
-				showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+			txReader.Close()
+
+			processedLedgerCount++
+
+			// Process batch when we hit batch size
+			if processedLedgerCount%config.BatchSize == 0 {
+				currentBatch.EndLedger = ledgerSeq
+				processTransactionsInCurrentBatch()
+				currentBatch.StartLedger = ledgerSeq + 1
 			}
-			log.Printf("Time taken for MDBX stats: %s", formatDuration(time.Since(st)))
-			log.Printf("========================================\n")
+
+			// Report database stats every 10 batches
+			if processedLedgerCount%(config.BatchSize*10) == 0 {
+				st := time.Now()
+				log.Printf("\n========================================")
+				log.Printf("========= MDBX STATS at ledger %d =====", ledgerSeq)
+				if config.EnableDB2 {
+					stats, err := getMDBXStats(db2)
+					if err == nil {
+						logMDBXStats("DB2", stats)
+					}
+				}
+				if config.EnableDB3 {
+					stats, err := getMDBXStats(db3)
+					if err == nil {
+						logMDBXStats("DB3", stats)
+					}
+				}
+				showCompressionStats(config, totalCompressionStats)
+				log.Printf("Time taken for MDBX stats: %s", helpers.FormatDuration(time.Since(st)))
+				log.Printf("========================================\n")
+			}
+
+			// Report progress every 1%
+			currentPercent := (processedLedgerCount * 100) / totalLedgers
+			if currentPercent > lastReportedPercent {
+				elapsed := time.Since(startTime)
+				ledgersPerSec := float64(processedLedgerCount) / elapsed.Seconds()
+				remaining := totalLedgers - processedLedgerCount
+				var eta time.Duration
+				if ledgersPerSec > 0 {
+					eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
+				}
+
+				log.Printf("\n========================================")
+				log.Printf("PROGRESS: %d/%d ledgers (%d%%) | Ledger: %d",
+					processedLedgerCount, totalLedgers, currentPercent, ledgerSeq)
+				if skippedLedgerCount > 0 {
+					log.Printf("Skipped ledgers: %d", skippedLedgerCount)
+				}
+				log.Printf("Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s",
+					ledgersPerSec, helpers.FormatNumber(totalCompressionStats.TxCount), helpers.FormatDuration(eta))
+				log.Printf("========================================\n")
+				lastReportedPercent = currentPercent
+			}
 		}
 
-		// Report progress every 1%
-		currentPercent := (processedLedgerCount * 100) / totalLedgers
-		if currentPercent > lastReportedPercent {
-			elapsed := time.Since(startTime)
-			ledgersPerSec := float64(processedLedgerCount) / elapsed.Seconds()
-			remaining := totalLedgers - processedLedgerCount
-			var eta time.Duration
-			if ledgersPerSec > 0 {
-				eta = time.Duration(float64(remaining)/ledgersPerSec) * time.Second
-			}
-
-			log.Printf("\n========================================")
-			log.Printf("PROGRESS: %d/%d ledgers (%d%%) | Ledger: %d",
-				processedLedgerCount, totalLedgers, currentPercent, ledgerSeq)
-			if skippedLedgerCount > 0 {
-				log.Printf("Skipped ledgers: %d", skippedLedgerCount)
-			}
-			log.Printf("Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s",
-				ledgersPerSec, formatNumber(totalCompressionStats.TxCount), formatDuration(eta))
-			log.Printf("========================================\n")
-			lastReportedPercent = currentPercent
+		// Process remaining batch
+		if len(batchTransactions) > 0 {
+			currentBatch.EndLedger = ledgerRange.To()
+			processTransactionsInCurrentBatch()
 		}
-	}
-
-	// Process remaining batch (the last batch that may not be full)
-	if len(batchTransactions) > 0 {
-		currentBatch.EndLedger = ledgerRange.To()
-		processBatch()
 	}
 
 	// Final sync to ensure all data is durably written
@@ -490,7 +628,9 @@ func main() {
 		if err := db2.Env.Sync(true, false); err != nil {
 			log.Printf("Warning: Failed to sync DB2: %v", err)
 		}
-		log.Printf("DB2 final sync: %s", formatDuration(time.Since(syncStart)))
+		syncDuration := time.Since(syncStart)
+		totalSyncTime += syncDuration
+		log.Printf("DB2 final sync: %s", helpers.FormatDuration(syncDuration))
 	}
 
 	if config.EnableDB3 && db3 != nil {
@@ -498,7 +638,9 @@ func main() {
 		if err := db3.Env.Sync(true, false); err != nil {
 			log.Printf("Warning: Failed to sync DB3: %v", err)
 		}
-		log.Printf("DB3 final sync: %s", formatDuration(time.Since(syncStart)))
+		syncDuration := time.Since(syncStart)
+		totalSyncTime += syncDuration
+		log.Printf("DB3 final sync: %s", helpers.FormatDuration(syncDuration))
 	}
 
 	log.Printf("✅ Final sync complete\n")
@@ -508,41 +650,44 @@ func main() {
 	log.Printf("\n========================================")
 	log.Printf("INGESTION COMPLETE")
 	log.Printf("========================================")
-	log.Printf("Total ledgers processed: %s", formatNumber(int64(processedLedgerCount)))
+	log.Printf("Total ledgers processed: %s", helpers.FormatNumber(int64(processedLedgerCount)))
 	if skippedLedgerCount > 0 {
-		log.Printf("Total ledgers skipped: %s", formatNumber(int64(skippedLedgerCount)))
+		log.Printf("Total ledgers skipped: %s", helpers.FormatNumber(int64(skippedLedgerCount)))
 	}
-	log.Printf("Total transactions: %s", formatNumber(totalCompressionStats.TxCount))
-	log.Printf("Total time: %s", formatDuration(elapsed))
+	log.Printf("Total transactions: %s", helpers.FormatNumber(totalCompressionStats.TxCount))
+	log.Printf("Total time: %s", helpers.FormatDuration(elapsed))
 	log.Printf("Average speed: %.2f ledgers/sec", float64(processedLedgerCount)/elapsed.Seconds())
 	log.Printf("")
 	log.Printf("Time breakdown:")
-	log.Printf("  GetLedger: %s (%.1f%%)", formatDuration(totalTimingStats.GetLedgerTime),
+	log.Printf("  GetLedger: %s (%.1f%%)", helpers.FormatDuration(totalTimingStats.GetLedgerTime),
 		100*totalTimingStats.GetLedgerTime.Seconds()/elapsed.Seconds())
 
 	if config.UseRocksDB {
-		log.Printf("    RocksDB Read: %s", formatDuration(totalRocksDBTiming.ReadTime))
-		log.Printf("    Decompress: %s", formatDuration(totalRocksDBTiming.DecompressTime))
-		log.Printf("    Unmarshal: %s", formatDuration(totalRocksDBTiming.UnmarshalTime))
+		log.Printf("    RocksDB Read: %s", helpers.FormatDuration(totalRocksDBTiming.ReadTime))
+		log.Printf("    Decompress: %s", helpers.FormatDuration(totalRocksDBTiming.DecompressTime))
+		log.Printf("    Unmarshal: %s", helpers.FormatDuration(totalRocksDBTiming.UnmarshalTime))
 	}
 
-	log.Printf("  Compression: %s (%.1f%%)", formatDuration(totalTimingStats.DB2CompressionTime),
+	log.Printf("  Compression: %s (%.1f%%)", helpers.FormatDuration(totalTimingStats.DB2CompressionTime),
 		100*totalTimingStats.DB2CompressionTime.Seconds()/elapsed.Seconds())
 
 	if config.EnableDB2 {
 		db2Total := totalTimingStats.DB2WriteTime + totalTimingStats.DB2SyncTime
 		log.Printf("  DB2 I/O: %s (write: %s, sync: %s)",
-			formatDuration(db2Total),
-			formatDuration(totalTimingStats.DB2WriteTime),
-			formatDuration(totalTimingStats.DB2SyncTime))
+			helpers.FormatDuration(db2Total),
+			helpers.FormatDuration(totalTimingStats.DB2WriteTime),
+			helpers.FormatDuration(totalTimingStats.DB2SyncTime))
 	}
 	if config.EnableDB3 {
 		db3Total := totalTimingStats.DB3WriteTime + totalTimingStats.DB3SyncTime
 		log.Printf("  DB3 I/O: %s (write: %s, sync: %s)",
-			formatDuration(db3Total),
-			formatDuration(totalTimingStats.DB3WriteTime),
-			formatDuration(totalTimingStats.DB3SyncTime))
+			helpers.FormatDuration(db3Total),
+			helpers.FormatDuration(totalTimingStats.DB3WriteTime),
+			helpers.FormatDuration(totalTimingStats.DB3SyncTime))
 	}
+
+	log.Printf("  Total Sync Time: %s (%.1f%%)", helpers.FormatDuration(totalSyncTime),
+		100*totalSyncTime.Seconds()/elapsed.Seconds())
 
 	// Final database stats
 	log.Printf("\n========= FINAL MDBX STATS =====")
@@ -566,7 +711,109 @@ func main() {
 	log.Printf("========================================")
 }
 
-// openRocksDBReader opens a RocksDB database for reading with a reusable decoder
+// fetchLedgersParallel fetches a range of ledgers in parallel from RocksDB
+func fetchLedgersParallel(reader *RocksDBReader, startSeq, endSeq uint32, numWorkers int) []LedgerResult {
+	numLedgers := int(endSeq - startSeq + 1)
+	results := make([]LedgerResult, numLedgers)
+
+	// Create job channel
+	jobs := make(chan uint32, numLedgers)
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker gets its own decoder for thread safety
+			decoder, err := zstd.NewReader(nil)
+			if err != nil {
+				log.Printf("Failed to create decoder: %v", err)
+				return
+			}
+			defer decoder.Close()
+
+			for ledgerSeq := range jobs {
+				idx := int(ledgerSeq - startSeq)
+				results[idx] = fetchSingleLedger(reader, decoder, ledgerSeq)
+			}
+		}()
+	}
+
+	// Send jobs
+	for seq := startSeq; seq <= endSeq; seq++ {
+		jobs <- seq
+	}
+	close(jobs)
+
+	// Wait for completion
+	wg.Wait()
+
+	return results
+}
+
+// fetchSingleLedger fetches and unmarshals a single ledger
+func fetchSingleLedger(reader *RocksDBReader, decoder *zstd.Decoder, ledgerSeq uint32) LedgerResult {
+	result := LedgerResult{
+		LedgerSeq: ledgerSeq,
+	}
+
+	totalStart := time.Now()
+
+	// Convert ledger sequence to 4-byte big-endian key
+	key := helpers.Uint32ToBytes(ledgerSeq)
+
+	// Read from RocksDB
+	readStart := time.Now()
+	slice, err := reader.db.Get(reader.ro, key)
+	result.Timing.ReadTime = time.Since(readStart)
+
+	if err != nil {
+		result.Timing.TotalTime = time.Since(totalStart)
+		result.Err = errors.Wrap(err, "failed to read from RocksDB")
+		return result
+	}
+	defer slice.Free()
+
+	// Check if key exists
+	if !slice.Exists() {
+		result.Timing.TotalTime = time.Since(totalStart)
+		result.Err = fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
+		return result
+	}
+
+	// Copy data since slice will be freed
+	compressedData := make([]byte, len(slice.Data()))
+	copy(compressedData, slice.Data())
+
+	// Decompress zstd data
+	decompressStart := time.Now()
+	uncompressedData, err := decoder.DecodeAll(compressedData, nil)
+	result.Timing.DecompressTime = time.Since(decompressStart)
+
+	if err != nil {
+		result.Timing.TotalTime = time.Since(totalStart)
+		result.Err = errors.Wrap(err, "failed to decompress ledger data")
+		return result
+	}
+
+	// Unmarshal XDR to LedgerCloseMeta
+	unmarshalStart := time.Now()
+	err = result.Ledger.UnmarshalBinary(uncompressedData)
+	result.Timing.UnmarshalTime = time.Since(unmarshalStart)
+
+	if err != nil {
+		result.Timing.TotalTime = time.Since(totalStart)
+		result.Err = errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
+		return result
+	}
+
+	result.Timing.TotalTime = time.Since(totalStart)
+	return result
+}
+
+// openRocksDBReader opens a RocksDB database for reading
 func openRocksDBReader(path string) (*RocksDBReader, error) {
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(false)
@@ -577,28 +824,17 @@ func openRocksDBReader(path string) (*RocksDBReader, error) {
 		return nil, errors.Wrap(err, "failed to open RocksDB")
 	}
 
-	// Create reusable zstd decoder
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		db.Close()
-		return nil, errors.Wrap(err, "failed to create zstd decoder")
-	}
-
 	// Create reusable read options
 	ro := grocksdb.NewDefaultReadOptions()
 
 	return &RocksDBReader{
-		db:      db,
-		decoder: decoder,
-		ro:      ro,
+		db: db,
+		ro: ro,
 	}, nil
 }
 
 // Close closes the RocksDB reader and its resources
 func (r *RocksDBReader) Close() {
-	if r.decoder != nil {
-		r.decoder.Close()
-	}
 	if r.ro != nil {
 		r.ro.Destroy()
 	}
@@ -607,66 +843,13 @@ func (r *RocksDBReader) Close() {
 	}
 }
 
-// GetLedger retrieves and decompresses a ledger from RocksDB
-func (r *RocksDBReader) GetLedger(ledgerSeq uint32) (xdr.LedgerCloseMeta, RocksDBTimingStats, error) {
-	var ledger xdr.LedgerCloseMeta
-	var timing RocksDBTimingStats
-
-	totalStart := time.Now()
-
-	// Convert ledger sequence to 4-byte big-endian key
-	key := uint32ToBytes(ledgerSeq)
-
-	// Read from RocksDB
-	readStart := time.Now()
-	slice, err := r.db.Get(r.ro, key)
-	timing.ReadTime = time.Since(readStart)
-
-	if err != nil {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, errors.Wrap(err, "failed to read from RocksDB")
-	}
-	defer slice.Free()
-
-	// Check if key exists
-	if !slice.Exists() {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
-	}
-
-	compressedData := slice.Data()
-
-	// Decompress zstd data
-	decompressStart := time.Now()
-	uncompressedData, err := r.decoder.DecodeAll(compressedData, nil)
-	timing.DecompressTime = time.Since(decompressStart)
-
-	if err != nil {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, errors.Wrap(err, "failed to decompress ledger data")
-	}
-
-	// Unmarshal XDR to LedgerCloseMeta
-	unmarshalStart := time.Now()
-	err = ledger.UnmarshalBinary(uncompressedData)
-	timing.UnmarshalTime = time.Since(unmarshalStart)
-
-	if err != nil {
-		timing.TotalTime = time.Since(totalStart)
-		return ledger, timing, errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
-	}
-
-	timing.TotalTime = time.Since(totalStart)
-	return ledger, timing, nil
-}
-
 // showRocksDBTimingStats displays RocksDB timing statistics
 func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int) {
 	log.Printf("\nRocksDB Timing Statistics:")
-	log.Printf("  Total Read Time: %s", formatDuration(timing.ReadTime))
-	log.Printf("  Total Decompress Time: %s", formatDuration(timing.DecompressTime))
-	log.Printf("  Total Unmarshal Time: %s", formatDuration(timing.UnmarshalTime))
-	log.Printf("  Total Time: %s", formatDuration(timing.TotalTime))
+	log.Printf("  Total Read Time: %s", helpers.FormatDuration(timing.ReadTime))
+	log.Printf("  Total Decompress Time: %s", helpers.FormatDuration(timing.DecompressTime))
+	log.Printf("  Total Unmarshal Time: %s", helpers.FormatDuration(timing.UnmarshalTime))
+	log.Printf("  Total Time: %s", helpers.FormatDuration(timing.TotalTime))
 
 	if ledgerCount > 0 {
 		avgRead := timing.ReadTime / time.Duration(ledgerCount)
@@ -675,8 +858,8 @@ func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int) {
 		avgTotal := timing.TotalTime / time.Duration(ledgerCount)
 
 		log.Printf("  Avg per ledger - Read: %s, Decompress: %s, Unmarshal: %s, Total: %s",
-			formatDuration(avgRead), formatDuration(avgDecompress),
-			formatDuration(avgUnmarshal), formatDuration(avgTotal))
+			helpers.FormatDuration(avgRead), helpers.FormatDuration(avgDecompress),
+			helpers.FormatDuration(avgUnmarshal), helpers.FormatDuration(avgTotal))
 	}
 }
 
@@ -696,8 +879,8 @@ type jobData struct {
 	closedAt  time.Time
 }
 
-// processTransactionBatch processes all transactions in parallel
-func processTransactionBatch(
+// compressTransactionsFromBatchInParallel processes all transactions in parallel
+func compressTransactionsFromBatchInParallel(
 	transactions []rawTxData,
 	txHashToTxData map[string][]byte,
 	txHashToLedgerSeq map[string]uint32,
@@ -842,32 +1025,29 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 	}
 
 	// Set geometry (size limits)
-
 	err = env.SetGeometry(
 		200*GB,                 // size_lower: 200 GB initial
 		-1,                     // size_now: -1 = use default
 		2*TB,                   // size_upper: 2 TB maximum
 		200*GB,                 // growth_step: 200 GB per growth
 		-1,                     // shrink_threshold: -1 = disabled
-		int(config.DbPageSize), // pagesize: 4 KB
+		int(config.DbPageSize), // pagesize
 	)
 	if err != nil {
 		env.Close()
 		return nil, errors.Wrap(err, "failed to set geometry")
 	}
 
-	// SetMaxReaders removed in v0.38+ - it's auto-configured
-
 	// Set option for max DBs BEFORE opening
-	// In v0.38.2, use SetOption instead of SetMaxDBs
 	err = env.SetOption(mdbx.OptMaxDB, uint64(2))
 	if err != nil {
 		env.Close()
 		return nil, errors.Wrap(err, "failed to set max dbs")
 	}
 
-	// Open environment with optimized flags
-	err = env.Open(path, mdbx.NoSubdir|mdbx.Coalesce|mdbx.LifoReclaim|mdbx.WriteMap, 0644)
+	// Open environment with SafeNoSync for fast bulk ingestion
+	// SafeNoSync: Don't sync on commit, but keep database recoverable
+	err = env.Open(path, mdbx.NoSubdir|mdbx.WriteMap|mdbx.SafeNoSync, 0644)
 	if err != nil {
 		env.Close()
 		return nil, errors.Wrap(err, "failed to open database")
@@ -885,7 +1065,10 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 		return nil, errors.Wrap(err, "failed to open DBI")
 	}
 
-	log.Printf("✓ %s opened successfully at path %s. PageSize: %d\n", name, path, config.DbPageSize)
+	log.Printf("✓ %s opened successfully", name)
+	log.Printf("  Path: %s", path)
+	log.Printf("  Page size: %d bytes", config.DbPageSize)
+	log.Printf("  Mode: SafeNoSync (fast bulk ingestion)")
 
 	return &MDBXDatabase{
 		Env:  env,
@@ -902,8 +1085,6 @@ func (db *MDBXDatabase) Close() {
 }
 
 // writeBatchToDatabases writes batch data to MDBX databases
-// Replace the writeBatchToDatabases function with this optimized version:
-
 func writeBatchToDatabases(
 	db2, db3 *MDBXDatabase,
 	txHashToTxData map[string][]byte,
@@ -917,7 +1098,7 @@ func writeBatchToDatabases(
 		writeStart := time.Now()
 		err := db2.Env.Update(func(txn *mdbx.Txn) error {
 			for txHashHex, compressedTxData := range txHashToTxData {
-				txHashBytes, err := hexStringToBytes(txHashHex)
+				txHashBytes, err := helpers.HexStringToBytes(txHashHex)
 				if err != nil {
 					return fmt.Errorf("failed to convert tx hash %s: %w", txHashHex, err)
 				}
@@ -927,25 +1108,11 @@ func writeBatchToDatabases(
 				}
 			}
 			return nil
-			// ← Commits transaction (writes to mmap file in page cache)
-			// ← Does NOT fsync to disk
 		})
 		timing.DB2WriteTime = time.Since(writeStart)
 		if err != nil {
 			return timing, errors.Wrap(err, "failed to write to DB2")
 		}
-
-		// At this point:
-		// ✅ Data is "committed" (visible to readers)
-		// ✅ Data is in MDBX's memory-mapped file
-		// ⚠️  Data is in OS page cache (RAM)
-		// ❌ Data is NOT guaranteed on physical disk yet
-
-		// RECOMMENDATION:::::
-		// DON'T sync on every batch - just let MDBX handle it
-		// Transaction commit writes to memory-mapped file (OS page cache)
-		// OS will eventually flush to disk in background
-		// Explicit Sync() forces immediate flush to disk
 		timing.DB2SyncTime = 0
 	}
 
@@ -954,11 +1121,11 @@ func writeBatchToDatabases(
 		writeStart := time.Now()
 		err := db3.Env.Update(func(txn *mdbx.Txn) error {
 			for txHashHex, ledgerSeq := range txHashToLedgerSeq {
-				txHashBytes, err := hexStringToBytes(txHashHex)
+				txHashBytes, err := helpers.HexStringToBytes(txHashHex)
 				if err != nil {
 					return fmt.Errorf("failed to convert tx hash %s: %w", txHashHex, err)
 				}
-				value := uint32ToBytes(ledgerSeq)
+				value := helpers.Uint32ToBytes(ledgerSeq)
 				err = txn.Put(db3.DBI, txHashBytes, value, mdbx.Upsert)
 				if err != nil {
 					return fmt.Errorf("failed to put tx %s: %w", txHashHex, err)
@@ -970,7 +1137,6 @@ func writeBatchToDatabases(
 		if err != nil {
 			return timing, errors.Wrap(err, "failed to write to DB3")
 		}
-
 		timing.DB3SyncTime = 0
 	}
 
@@ -1001,7 +1167,7 @@ func getMDBXStats(db *MDBXDatabase) (MDBXStats, error) {
 		stats.OverflowPages = stat.OverflowPages
 		stats.Entries = stat.Entries
 		stats.MapSize = uint64(envInfo.MapSize)
-		stats.LastPageNum = envInfo.MiLastPgNo // Changed from LastPgNo to LastPNO
+		stats.LastPageNum = envInfo.MiLastPgNo
 		stats.RecentTxnID = uint64(envInfo.LastTxnID)
 
 		return nil
@@ -1015,18 +1181,18 @@ func logMDBXStats(name string, stats MDBXStats) {
 	log.Printf("[%s] MDBX Statistics:", name)
 	log.Printf("  Page size: %d bytes", stats.PageSize)
 	log.Printf("  Tree depth: %d", stats.Depth)
-	log.Printf("  Branch pages: %s", formatNumber(int64(stats.BranchPages)))
-	log.Printf("  Leaf pages: %s", formatNumber(int64(stats.LeafPages)))
-	log.Printf("  Overflow pages: %s", formatNumber(int64(stats.OverflowPages)))
-	log.Printf("  Total entries: %s", formatNumber(int64(stats.Entries)))
-	log.Printf("  Map size: %s", formatBytes(int64(stats.MapSize)))
-	log.Printf("  Last page: %s", formatNumber(int64(stats.LastPageNum)))
+	log.Printf("  Branch pages: %s", helpers.FormatNumber(int64(stats.BranchPages)))
+	log.Printf("  Leaf pages: %s", helpers.FormatNumber(int64(stats.LeafPages)))
+	log.Printf("  Overflow pages: %s", helpers.FormatNumber(int64(stats.OverflowPages)))
+	log.Printf("  Total entries: %s", helpers.FormatNumber(int64(stats.Entries)))
+	log.Printf("  Map size: %s", helpers.FormatBytes(int64(stats.MapSize)))
+	log.Printf("  Last page: %s", helpers.FormatNumber(int64(stats.LastPageNum)))
 	log.Printf("  Recent txn ID: %d", stats.RecentTxnID)
 
 	// Calculate storage efficiency
 	totalPages := stats.BranchPages + stats.LeafPages + stats.OverflowPages
 	usedSize := totalPages * uint64(stats.PageSize)
-	log.Printf("  Used size: %s", formatBytes(int64(usedSize)))
+	log.Printf("  Used size: %s", helpers.FormatBytes(int64(usedSize)))
 
 	if stats.Entries > 0 {
 		avgEntrySize := float64(usedSize) / float64(stats.Entries)
@@ -1037,39 +1203,33 @@ func logMDBXStats(name string, stats MDBXStats) {
 // logBatchCompletion logs batch completion information
 func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionConfig) {
 	totalBatchDuration := time.Since(batch.StartTime)
-	cpuTime := batch.GetLedgerTime + batch.Db2CompressionTime
+	cpuTime := batch.BatchGetLedgerTime + batch.BatchDb2CompressionTime
 	ioTime := timing.DB2WriteTime + timing.DB2SyncTime + timing.DB3WriteTime + timing.DB3SyncTime
 	computeTime := totalBatchDuration - cpuTime - ioTime
 
 	log.Printf("\n===== Batch #%d Complete [Ledger %d-%d] (%d transactions) =====",
 		batch.BatchNum, batch.StartLedger, batch.EndLedger, batch.TxCount)
-	log.Printf("Total batch time time: %s", formatDuration(totalBatchDuration))
-	log.Printf("\t GetLedger Time: %s", formatDuration(batch.GetLedgerTime))
-	log.Printf("\t Compute Time (?): %s", formatDuration(computeTime))
+	log.Printf("Total batch time: %s", helpers.FormatDuration(totalBatchDuration))
+	log.Printf("\t GetLedger Time: %s", helpers.FormatDuration(batch.BatchGetLedgerTime))
+	log.Printf("\t Compute Time: %s", helpers.FormatDuration(computeTime))
 
 	if config.EnableDB2 {
 		db2Total := timing.DB2WriteTime + timing.DB2SyncTime
 		log.Printf("\t DB2:: %s", config.DB2Path)
-		log.Printf("\t\t CompressionTime: %s", formatDuration(batch.Db2CompressionTime))
-		log.Printf("\t\t I/O time: %s (write: %s, sync: %s)",
-			formatDuration(db2Total),
-			formatDuration(timing.DB2WriteTime),
-			formatDuration(timing.DB2SyncTime))
+		log.Printf("\t\t CompressionTime: %s", helpers.FormatDuration(batch.BatchDb2CompressionTime))
+		log.Printf("\t\t I/O time: %s (write: %s)", helpers.FormatDuration(db2Total), helpers.FormatDuration(timing.DB2WriteTime))
 	}
 
 	if config.EnableDB3 {
 		db3Total := timing.DB3WriteTime + timing.DB3SyncTime
 		log.Printf("\t DB3:: %s", config.DB3Path)
-		log.Printf("\t\t I/O time: %s (write: %s, sync: %s)",
-			formatDuration(db3Total),
-			formatDuration(timing.DB3WriteTime),
-			formatDuration(timing.DB3SyncTime))
+		log.Printf("\t\t I/O time: %s (write: %s)", helpers.FormatDuration(db3Total), helpers.FormatDuration(timing.DB3WriteTime))
 	}
 
-	numLedgers := batch.EndLedger - batch.StartLedger // uint32
+	numLedgers := batch.EndLedger - batch.StartLedger
 	if numLedgers > 0 {
 		avgTimePerLedger := totalBatchDuration / time.Duration(numLedgers)
-		log.Printf("\nAvg time per ledger in batch: %s", formatDuration(avgTimePerLedger))
+		log.Printf("\nAvg time per ledger in batch: %s", helpers.FormatDuration(avgTimePerLedger))
 	}
 	log.Printf("========================================\n")
 }
@@ -1079,76 +1239,9 @@ func showCompressionStats(config IngestionConfig, stats CompressionStats) {
 	if config.EnableApplicationCompression && stats.UncompressedTx > 0 {
 		compressionRatio := 100 * (1 - float64(stats.CompressedTx)/float64(stats.UncompressedTx))
 		log.Printf("\nCompression Statistics:")
-		log.Printf("  Original size: %s", formatBytes(stats.UncompressedTx))
-		log.Printf("  Compressed size: %s", formatBytes(stats.CompressedTx))
+		log.Printf("  Original size: %s", helpers.FormatBytes(stats.UncompressedTx))
+		log.Printf("  Compressed size: %s", helpers.FormatBytes(stats.CompressedTx))
 		log.Printf("  Compression ratio: %.2f%% reduction", compressionRatio)
-		log.Printf("  Space saved: %s", formatBytes(stats.UncompressedTx-stats.CompressedTx))
+		log.Printf("  Space saved: %s", helpers.FormatBytes(stats.UncompressedTx-stats.CompressedTx))
 	}
-}
-
-// Helper functions
-
-func uint32ToBytes(n uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, n)
-	return b
-}
-
-func hexStringToBytes(hexStr string) ([]byte, error) {
-	hexStr = strings.TrimPrefix(hexStr, "0x")
-	return hex.DecodeString(hexStr)
-}
-
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func formatNumber(n int64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-	s := fmt.Sprintf("%d", n)
-	result := ""
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			result += ","
-		}
-		result += string(c)
-	}
-	return result
-}
-
-func formatDuration(d time.Duration) string {
-	if d < time.Millisecond {
-		return fmt.Sprintf("%dµs", d.Microseconds())
-	}
-	if d < time.Second {
-		return fmt.Sprintf("%dms", d.Milliseconds())
-	}
-	if d < time.Minute {
-		return fmt.Sprintf("%.3fs", d.Seconds())
-	}
-
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
 }

@@ -15,7 +15,6 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"github.com/erigontech/mdbx-go/mdbx"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/protobuf/proto"
@@ -115,10 +115,10 @@ func main() {
 
 	// Print initialization once
 	fmt.Printf("\n=== MDBX Initialization ===\n")
-	fmt.Printf("SetOption:    %s\n", formatDuration(setOptTime))
-	fmt.Printf("env.Open:     %s\n", formatDuration(envOpenTime))
-	fmt.Printf("DBI open:     %s\n", formatDuration(dbiOpenTime))
-	fmt.Printf("Total open:   %s\n\n", formatDuration(totalOpen))
+	fmt.Printf("SetOption:    %s\n", helpers.FormatDuration(setOptTime))
+	fmt.Printf("env.Open:     %s\n", helpers.FormatDuration(envOpenTime))
+	fmt.Printf("DBI open:     %s\n", helpers.FormatDuration(dbiOpenTime))
+	fmt.Printf("Total open:   %s\n\n", helpers.FormatDuration(totalOpen))
 
 	// ------------------------------------------------------------
 	// ONGOING MODE
@@ -161,7 +161,7 @@ func runQuery(
 	quiet bool,
 ) {
 	// Parse key
-	keyBytes, err := hexStringToBytes(txHashHex)
+	keyBytes, err := helpers.HexStringToBytes(txHashHex)
 	if err != nil {
 		fmt.Printf("Invalid hex: %s\n", txHashHex)
 		return
@@ -236,19 +236,19 @@ func runQuery(
 	// ----------------------------------
 	if quiet {
 		fmt.Printf("TX: %s\n", txHashHex)
-		fmt.Printf("Compressed:         %s\n", formatBytes(int64(len(data))))
-		fmt.Printf("Uncompressed:       %s\n", formatBytes(int64(len(decompressed))))
+		fmt.Printf("Compressed:         %s\n", helpers.FormatBytes(int64(len(data))))
+		fmt.Printf("Uncompressed:       %s\n", helpers.FormatBytes(int64(len(decompressed))))
 		fmt.Printf("Compression Ratio:  %.2f%%\n\n", 100*(1-float64(len(data))/float64(len(decompressed))))
 
-		fmt.Printf("Query:              %s\n", formatDuration(queryTime))
-		fmt.Printf("Decompress:         %s\n", formatDuration(decTime))
-		fmt.Printf("Unmarshal:          %s\n", formatDuration(unmarshalTime))
-		fmt.Printf("Total:              %s\n\n", formatDuration(queryTime+decTime+unmarshalTime))
+		fmt.Printf("Query:              %s\n", helpers.FormatDuration(queryTime))
+		fmt.Printf("Decompress:         %s\n", helpers.FormatDuration(decTime))
+		fmt.Printf("Unmarshal:          %s\n", helpers.FormatDuration(unmarshalTime))
+		fmt.Printf("Total:              %s\n\n", helpers.FormatDuration(queryTime+decTime+unmarshalTime))
 
 		fmt.Printf("TreeDepth:          %d\n", statsBefore.Depth)
 		fmt.Printf("OverflowPages:      %d\n", overflowPages)
 		fmt.Printf("PagesRead:          %d\n", pagesRead)
-		fmt.Printf("BytesRead:          %s\n\n", formatBytes(bytesRead))
+		fmt.Printf("BytesRead:          %s\n\n", helpers.FormatBytes(bytesRead))
 		return
 	}
 
@@ -274,121 +274,44 @@ func runQuery(
 	fmt.Printf("  Closed at:          %v\n", txData.ClosedAt.AsTime())
 
 	fmt.Printf("\nData Sizes:\n")
-	fmt.Printf("  Compressed:         %s\n", formatBytes(int64(len(data))))
-	fmt.Printf("  Uncompressed:       %s\n", formatBytes(int64(len(decompressed))))
+	fmt.Printf("  Compressed:         %s\n", helpers.FormatBytes(int64(len(data))))
+	fmt.Printf("  Uncompressed:       %s\n", helpers.FormatBytes(int64(len(decompressed))))
 	fmt.Printf("  Compression ratio:  %.2f%%\n", 100*(1-float64(len(data))/float64(len(decompressed))))
 
 	fmt.Printf("\nComponent Sizes:\n")
-	fmt.Printf("  Envelope:           %s\n", formatBytes(int64(len(txData.TxEnvelope))))
-	fmt.Printf("  Result:             %s\n", formatBytes(int64(len(txData.TxResult))))
-	fmt.Printf("  Meta:               %s\n", formatBytes(int64(len(txData.TxMeta))))
+	fmt.Printf("  Envelope:           %s\n", helpers.FormatBytes(int64(len(txData.TxEnvelope))))
+	fmt.Printf("  Result:             %s\n", helpers.FormatBytes(int64(len(txData.TxResult))))
+	fmt.Printf("  Meta:               %s\n", helpers.FormatBytes(int64(len(txData.TxMeta))))
 
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("MDBX Database Statistics\n")
 	fmt.Printf("========================================\n")
 	fmt.Printf("  Page size:          %d bytes\n", statsBefore.PSize)
 	fmt.Printf("  Tree depth:         %d\n", statsBefore.Depth)
-	fmt.Printf("  Branch pages:       %s\n", formatNumber(int64(statsBefore.BranchPages)))
-	fmt.Printf("  Leaf pages:         %s\n", formatNumber(int64(statsBefore.LeafPages)))
-	fmt.Printf("  Overflow pages:     %s\n", formatNumber(int64(statsBefore.OverflowPages)))
-	fmt.Printf("  Total entries:      %s\n", formatNumber(int64(statsBefore.Entries)))
-	fmt.Printf("  Map size:           %s\n", formatBytes(int64(envInfoBefore.MapSize)))
+	fmt.Printf("  Branch pages:       %s\n", helpers.FormatNumber(int64(statsBefore.BranchPages)))
+	fmt.Printf("  Leaf pages:         %s\n", helpers.FormatNumber(int64(statsBefore.LeafPages)))
+	fmt.Printf("  Overflow pages:     %s\n", helpers.FormatNumber(int64(statsBefore.OverflowPages)))
+	fmt.Printf("  Total entries:      %s\n", helpers.FormatNumber(int64(statsBefore.Entries)))
+	fmt.Printf("  Map size:           %s\n", helpers.FormatBytes(int64(envInfoBefore.MapSize)))
 
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Query Performance Metrics\n")
 	fmt.Printf("========================================\n")
-	fmt.Printf("  Query time:         %s\n", formatDuration(queryTime))
-	fmt.Printf("  Decompress time:    %s\n", formatDuration(decTime))
-	fmt.Printf("  Unmarshal time:     %s\n", formatDuration(unmarshalTime))
-	fmt.Printf("  Total time:         %s\n", formatDuration(totalTime))
+	fmt.Printf("  Query time:         %s\n", helpers.FormatDuration(queryTime))
+	fmt.Printf("  Decompress time:    %s\n", helpers.FormatDuration(decTime))
+	fmt.Printf("  Unmarshal time:     %s\n", helpers.FormatDuration(unmarshalTime))
+	fmt.Printf("  Total time:         %s\n", helpers.FormatDuration(totalTime))
 	fmt.Printf("\nI/O Metrics:\n")
 	fmt.Printf("  Tree depth:         %d\n", statsBefore.Depth)
 	fmt.Printf("  Overflow pages:     %d\n", overflowPages)
 	fmt.Printf("  Pages read:         %d\n", pagesRead)
-	fmt.Printf("  Bytes read:         %s\n", formatBytes(bytesRead))
+	fmt.Printf("  Bytes read:         %s\n", helpers.FormatBytes(bytesRead))
 
 	fmt.Printf("\n========================================\n")
 	fmt.Printf("Transaction Data (Base64 Encoded)\n")
 	fmt.Printf("========================================\n")
-	fmt.Printf("\nTxEnvelope (base64):\n%s\n", wrapText(txEnvelopeBase64, 80))
-	fmt.Printf("\nTxResult (base64):\n%s\n", wrapText(txResultBase64, 80))
-	fmt.Printf("\nTxMeta (base64):\n%s\n", wrapText(txMetaBase64, 80))
+	fmt.Printf("\nTxEnvelope (base64):\n%s\n", helpers.WrapText(txEnvelopeBase64, 80))
+	fmt.Printf("\nTxResult (base64):\n%s\n", helpers.WrapText(txResultBase64, 80))
+	fmt.Printf("\nTxMeta (base64):\n%s\n", helpers.WrapText(txMetaBase64, 80))
 	fmt.Printf("========================================\n\n")
-}
-
-///////////////////////////////////////////////////////////////////////////
-// Helpers
-///////////////////////////////////////////////////////////////////////////
-
-func hexStringToBytes(hexStr string) ([]byte, error) {
-	hexStr = strings.TrimPrefix(hexStr, "0x")
-	return hex.DecodeString(hexStr)
-}
-
-func wrapText(text string, width int) string {
-	if len(text) <= width {
-		return text
-	}
-	result := ""
-	for i := 0; i < len(text); i += width {
-		end := i + width
-		if end > len(text) {
-			end = len(text)
-		}
-		result += text[i:end] + "\n"
-	}
-	return result
-}
-
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func formatNumber(n int64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-	s := fmt.Sprintf("%d", n)
-	result := ""
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			result += ","
-		}
-		result += string(c)
-	}
-	return result
-}
-
-func formatDuration(d time.Duration) string {
-	if d < time.Millisecond {
-		return fmt.Sprintf("%dµs", d.Microseconds())
-	}
-	if d < time.Second {
-		return fmt.Sprintf("%.2fms", float64(d.Microseconds())/1000)
-	}
-	d = d.Round(time.Millisecond)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	d -= s * time.Second
-	ms := d / time.Millisecond
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds %dms", h, m, s, ms)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds %dms", m, s, ms)
-	} else if s > 0 {
-		return fmt.Sprintf("%ds %dms", s, ms)
-	}
-	return fmt.Sprintf("%dms", ms)
 }

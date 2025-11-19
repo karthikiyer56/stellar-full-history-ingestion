@@ -2,15 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
@@ -279,7 +277,7 @@ func main() {
 	log.Printf("Starting ledger processing")
 	log.Printf("========================================")
 	log.Printf("Ledger range: %d - %d (%s ledgers)",
-		ledgerRange.From(), ledgerRange.To(), formatNumber(int64(totalLedgers)))
+		ledgerRange.From(), ledgerRange.To(), helpers.FormatNumber(int64(totalLedgers)))
 	log.Printf("DB1 (LCM) storage: %v", config.EnableDB1)
 	log.Printf("DB2 (TxData) storage: %v", config.EnableDB2)
 	log.Printf("DB3 (Hash->Seq) storage: %v", config.EnableDB3)
@@ -427,37 +425,37 @@ func main() {
 				currentBatchInfo.BatchNum,
 				currentBatchInfo.StartLedger, currentBatchInfo.EndLedger, ledgerSeq, lcmCount, txCount)
 
-			log.Printf("Batch Total Time: %s...", formatDuration(currentBatchInfo.BatchTotalTimeTaken))
-			log.Printf("\tBatch GetLedger Time: %s...", formatDuration(currentBatchInfo.GetLegerTimeTaken))
-			log.Printf("\tBatch Total Compression Time: %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken+currentBatchInfo.Db2CompressionTimeTaken))
-			log.Printf("\tBatch IO Time: %s...", formatDuration(currentBatchDbProcessingTotalTime))
-			log.Printf("\tBatch Compute Time (?): %s...", formatDuration(computeTime))
+			log.Printf("Batch Total Time: %s...", helpers.FormatDuration(currentBatchInfo.BatchTotalTimeTaken))
+			log.Printf("\tBatch GetLedger Time: %s...", helpers.FormatDuration(currentBatchInfo.GetLegerTimeTaken))
+			log.Printf("\tBatch Total Compression Time: %s...", helpers.FormatDuration(currentBatchInfo.Db1CompressionTimeTaken+currentBatchInfo.Db2CompressionTimeTaken))
+			log.Printf("\tBatch IO Time: %s...", helpers.FormatDuration(currentBatchDbProcessingTotalTime))
+			log.Printf("\tBatch Compute Time (?): %s...", helpers.FormatDuration(computeTime))
 			log.Printf("")
 
 			if config.EnableDB1 {
 				db1Total := writeTiming.DB1Write + flushTiming.DB1Flush + compactTiming.DB1Compact
 				log.Printf("\tDB1: %s", config.DB1Path)
-				log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
+				log.Printf("\t\tCompressionTime (app level zstd): %s...", helpers.FormatDuration(currentBatchInfo.Db1CompressionTimeTaken))
 				log.Printf("\t\tI/O time: %s (write: %s, flush: %s, compact: %s)",
-					formatDuration(db1Total),
-					formatDuration(writeTiming.DB1Write), formatDuration(flushTiming.DB1Flush), formatDuration(compactTiming.DB1Compact))
+					helpers.FormatDuration(db1Total),
+					helpers.FormatDuration(writeTiming.DB1Write), helpers.FormatDuration(flushTiming.DB1Flush), helpers.FormatDuration(compactTiming.DB1Compact))
 				log.Printf("")
 			}
 			if config.EnableDB2 {
 				db2Total := writeTiming.DB2Write + flushTiming.DB2Flush + compactTiming.DB2Compact
 				log.Printf("\tDB2: %s", config.DB2Path)
-				log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
+				log.Printf("\t\tCompressionTime (app level zstd): %s...", helpers.FormatDuration(currentBatchInfo.Db2CompressionTimeTaken))
 				log.Printf("\t\tI/O time: %s (write: %s, flush: %s, compact: %s)",
-					formatDuration(db2Total),
-					formatDuration(writeTiming.DB2Write), formatDuration(flushTiming.DB2Flush), formatDuration(compactTiming.DB2Compact))
+					helpers.FormatDuration(db2Total),
+					helpers.FormatDuration(writeTiming.DB2Write), helpers.FormatDuration(flushTiming.DB2Flush), helpers.FormatDuration(compactTiming.DB2Compact))
 				log.Printf("")
 			}
 			if config.EnableDB3 {
 				db3Total := writeTiming.DB3Write + flushTiming.DB3Flush + compactTiming.DB3Compact
 				log.Printf("\tDB3: %s", config.DB3Path)
 				log.Printf("\t\tI/O time: %s (write: %s, flush: %s, compact: %s)",
-					formatDuration(db3Total),
-					formatDuration(writeTiming.DB3Write), formatDuration(flushTiming.DB3Flush), formatDuration(compactTiming.DB3Compact))
+					helpers.FormatDuration(db3Total),
+					helpers.FormatDuration(writeTiming.DB3Write), helpers.FormatDuration(flushTiming.DB3Flush), helpers.FormatDuration(compactTiming.DB3Compact))
 				log.Printf("")
 			}
 
@@ -516,7 +514,7 @@ func main() {
 			log.Printf("========== PROGRESS TIMELINE: %d/%d ledgers (%d%%) (current: %d, startLedger:%d, endLedger:%d) ==========", processedLedgerCount, totalLedgers, currentPercent,
 				ledgerSeq, startLedger, endLedger)
 			log.Printf("========== Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s ==========",
-				ledgersPerSec, formatNumber(totalCompressionStats.TxCount), formatDuration(eta))
+				ledgersPerSec, helpers.FormatNumber(totalCompressionStats.TxCount), helpers.FormatDuration(eta))
 			log.Printf("========================================")
 			lastReportedPercent = currentPercent
 		}
@@ -568,37 +566,37 @@ func main() {
 			currentBatchInfo.BatchNum,
 			currentBatchInfo.StartLedger, currentBatchInfo.EndLedger, lcmCount, txCount)
 
-		log.Printf("Batch Total Time: %s...", formatDuration(currentBatchInfo.BatchTotalTimeTaken))
-		log.Printf("\tBatch GetLedger Time: %s...", formatDuration(currentBatchInfo.GetLegerTimeTaken))
-		log.Printf("\tBatch Total Compression Time: %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken+currentBatchInfo.Db2CompressionTimeTaken))
-		log.Printf("\tBatch IO Time: %s...", formatDuration(currentBatchDbProcessingTotalTime))
-		log.Printf("\tBatch Compute Time (?): %s...", formatDuration(computeTime))
+		log.Printf("Batch Total Time: %s...", helpers.FormatDuration(currentBatchInfo.BatchTotalTimeTaken))
+		log.Printf("\tBatch GetLedger Time: %s...", helpers.FormatDuration(currentBatchInfo.GetLegerTimeTaken))
+		log.Printf("\tBatch Total Compression Time: %s...", helpers.FormatDuration(currentBatchInfo.Db1CompressionTimeTaken+currentBatchInfo.Db2CompressionTimeTaken))
+		log.Printf("\tBatch IO Time: %s...", helpers.FormatDuration(currentBatchDbProcessingTotalTime))
+		log.Printf("\tBatch Compute Time (?): %s...", helpers.FormatDuration(computeTime))
 		log.Printf("")
 
 		if config.EnableDB1 {
 			db1Total := writeTiming.DB1Write + flushTiming.DB1Flush
 			log.Printf("\tDB1: %s", config.DB1Path)
-			log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db1CompressionTimeTaken))
+			log.Printf("\t\tCompressionTime (app level zstd): %s...", helpers.FormatDuration(currentBatchInfo.Db1CompressionTimeTaken))
 			log.Printf("\t\tI/O time: %s (write: %s, flush: %s)",
-				formatDuration(db1Total),
-				formatDuration(writeTiming.DB1Write), formatDuration(flushTiming.DB1Flush))
+				helpers.FormatDuration(db1Total),
+				helpers.FormatDuration(writeTiming.DB1Write), helpers.FormatDuration(flushTiming.DB1Flush))
 			log.Printf("")
 		}
 		if config.EnableDB2 {
 			db2Total := writeTiming.DB2Write + flushTiming.DB2Flush
 			log.Printf("\tDB2: %s", config.DB2Path)
-			log.Printf("\t\tCompressionTime (app level zstd): %s...", formatDuration(currentBatchInfo.Db2CompressionTimeTaken))
+			log.Printf("\t\tCompressionTime (app level zstd): %s...", helpers.FormatDuration(currentBatchInfo.Db2CompressionTimeTaken))
 			log.Printf("\t\tI/O time: %s (write: %s, flush: %s)",
-				formatDuration(db2Total),
-				formatDuration(writeTiming.DB2Write), formatDuration(flushTiming.DB2Flush))
+				helpers.FormatDuration(db2Total),
+				helpers.FormatDuration(writeTiming.DB2Write), helpers.FormatDuration(flushTiming.DB2Flush))
 			log.Printf("")
 		}
 		if config.EnableDB3 {
 			db3Total := writeTiming.DB3Write + flushTiming.DB3Flush
 			log.Printf("\tDB3: %s", config.DB3Path)
 			log.Printf("\t\tI/O time: %s (write: %s, flush: %s)",
-				formatDuration(db3Total),
-				formatDuration(writeTiming.DB3Write), formatDuration(flushTiming.DB3Flush))
+				helpers.FormatDuration(db3Total),
+				helpers.FormatDuration(writeTiming.DB3Write), helpers.FormatDuration(flushTiming.DB3Flush))
 			log.Printf("")
 		}
 	}
@@ -621,16 +619,16 @@ func main() {
 	log.Printf("COMPACTION SUMMARY")
 	log.Printf("========================================")
 	if config.EnableDB1 {
-		log.Printf("DB1: %s", formatDuration(compactionTiming.DB1Compact))
+		log.Printf("DB1: %s", helpers.FormatDuration(compactionTiming.DB1Compact))
 	}
 	if config.EnableDB2 {
-		log.Printf("DB2: %s", formatDuration(compactionTiming.DB2Compact))
+		log.Printf("DB2: %s", helpers.FormatDuration(compactionTiming.DB2Compact))
 	}
 	if config.EnableDB3 {
-		log.Printf("DB3: %s", formatDuration(compactionTiming.DB3Compact))
+		log.Printf("DB3: %s", helpers.FormatDuration(compactionTiming.DB3Compact))
 	}
 	totalCompactionTime := compactionTiming.DB1Compact + compactionTiming.DB2Compact + compactionTiming.DB3Compact
-	log.Printf("Total: %s", formatDuration(totalCompactionTime))
+	log.Printf("Total: %s", helpers.FormatDuration(totalCompactionTime))
 
 	log.Printf("\n========================================")
 
@@ -659,47 +657,47 @@ func main() {
 	log.Printf("INGESTION COMPLETE")
 	log.Printf("========================================")
 	log.Printf("Paths:::: DB1: '%s', DB2: '%s', DB3: '%s'", config.DB1Path, config.DB2Path, config.DB3Path)
-	log.Printf("Total ledgers processed:  %s", formatNumber(int64(processedLedgerCount)))
-	log.Printf("Total transactions:       %s", formatNumber(totalCompressionStats.TxCount))
-	log.Printf("Total time:               %s", formatDuration(elapsed))
+	log.Printf("Total ledgers processed:  %s", helpers.FormatNumber(int64(processedLedgerCount)))
+	log.Printf("Total transactions:       %s", helpers.FormatNumber(totalCompressionStats.TxCount))
+	log.Printf("Total time:               %s", helpers.FormatDuration(elapsed))
 	log.Printf("Average speed:            %.2f ledgers/sec", float64(processedLedgerCount)/elapsed.Seconds())
 	log.Printf("")
 	log.Printf("Time breakdown:")
 
-	log.Printf("\tDisk I/O (total):			%s (%.1f%%)", formatDuration(totalIOTime),
+	log.Printf("\tDisk I/O (total):			%s (%.1f%%)", helpers.FormatDuration(totalIOTime),
 		100*totalIOTime.Seconds()/elapsed.Seconds())
 
-	log.Printf("\tGetLedgerTime (total):		%s (%.1f%%)", formatDuration(totalTimingStats.GetLedgerTime),
+	log.Printf("\tGetLedgerTime (total):		%s (%.1f%%)", helpers.FormatDuration(totalTimingStats.GetLedgerTime),
 		100*totalTimingStats.GetLedgerTime.Seconds()/elapsed.Seconds())
 
 	compressionTimingStats := totalTimingStats.DB1CompressionTime + totalTimingStats.DB2CompressionTime
-	log.Printf("\tCompression Time (total):	%s (%.1f%%)", formatDuration(compressionTimingStats),
+	log.Printf("\tCompression Time (total):	%s (%.1f%%)", helpers.FormatDuration(compressionTimingStats),
 		100*compressionTimingStats.Seconds()/elapsed.Seconds())
 
 	if config.EnableDB1 {
 		db1Total := totalTimingStats.DB1Write + totalTimingStats.DB1Flush + totalTimingStats.DB1Compact
 		log.Printf("\tDB1:::")
 		log.Printf("\t\tCompression Time: %s",
-			formatDuration(totalTimingStats.DB1CompressionTime))
+			helpers.FormatDuration(totalTimingStats.DB1CompressionTime))
 		log.Printf("\t\tTotal I/O time: %s (write: %s, flush: %s, compact: %s)",
-			formatDuration(db1Total), formatDuration(totalTimingStats.DB1Write),
-			formatDuration(totalTimingStats.DB1Flush), formatDuration(totalTimingStats.DB1Compact))
+			helpers.FormatDuration(db1Total), helpers.FormatDuration(totalTimingStats.DB1Write),
+			helpers.FormatDuration(totalTimingStats.DB1Flush), helpers.FormatDuration(totalTimingStats.DB1Compact))
 	}
 	if config.EnableDB2 {
 		db2Total := totalTimingStats.DB2Write + totalTimingStats.DB2Flush + totalTimingStats.DB2Compact
 		log.Printf("\tDB2:::")
 		log.Printf("\t\tCompression Time: %s",
-			formatDuration(totalTimingStats.DB2CompressionTime))
+			helpers.FormatDuration(totalTimingStats.DB2CompressionTime))
 		log.Printf("\t\tTotal I/O time: %s (write: %s, flush: %s, compact: %s)",
-			formatDuration(db2Total), formatDuration(totalTimingStats.DB2Write),
-			formatDuration(totalTimingStats.DB2Flush), formatDuration(totalTimingStats.DB2Compact))
+			helpers.FormatDuration(db2Total), helpers.FormatDuration(totalTimingStats.DB2Write),
+			helpers.FormatDuration(totalTimingStats.DB2Flush), helpers.FormatDuration(totalTimingStats.DB2Compact))
 	}
 	if config.EnableDB3 {
 		log.Printf("\tDB1:::")
 		db3Total := totalTimingStats.DB3Write + totalTimingStats.DB3Flush + totalTimingStats.DB3Compact
 		log.Printf("\t\tTotal I/O time: %s (write: %s, flush: %s, compact: %s)",
-			formatDuration(db3Total), formatDuration(totalTimingStats.DB3Write),
-			formatDuration(totalTimingStats.DB3Flush), formatDuration(totalTimingStats.DB3Compact))
+			helpers.FormatDuration(db3Total), helpers.FormatDuration(totalTimingStats.DB3Write),
+			helpers.FormatDuration(totalTimingStats.DB3Flush), helpers.FormatDuration(totalTimingStats.DB3Compact))
 	}
 
 	log.Printf("")
@@ -715,20 +713,20 @@ func showCompressionStats(config IngestionConfig, stats CompressionStats) {
 		if config.EnableDB1 && stats.UncompressedLCM > 0 {
 			compressionRatio := 100 * (1 - float64(stats.CompressedLCM)/float64(stats.UncompressedLCM))
 			log.Printf("LCM Compression:")
-			log.Printf("  Original size:          %s", formatBytes(stats.UncompressedLCM))
-			log.Printf("  Compressed size:        %s", formatBytes(stats.CompressedLCM))
+			log.Printf("  Original size:          %s", helpers.FormatBytes(stats.UncompressedLCM))
+			log.Printf("  Compressed size:        %s", helpers.FormatBytes(stats.CompressedLCM))
 			log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
-			log.Printf("  Space saved:            %s", formatBytes(stats.UncompressedLCM-stats.CompressedLCM))
+			log.Printf("  Space saved:            %s", helpers.FormatBytes(stats.UncompressedLCM-stats.CompressedLCM))
 		}
 
 		if config.EnableDB2 && stats.UncompressedTx > 0 {
 			compressionRatio := 100 * (1 - float64(stats.CompressedTx)/float64(stats.UncompressedTx))
 			log.Printf("")
 			log.Printf("TxData Compression:")
-			log.Printf("  Original size:          %s", formatBytes(stats.UncompressedTx))
-			log.Printf("  Compressed size:        %s", formatBytes(stats.CompressedTx))
+			log.Printf("  Original size:          %s", helpers.FormatBytes(stats.UncompressedTx))
+			log.Printf("  Compressed size:        %s", helpers.FormatBytes(stats.CompressedTx))
 			log.Printf("  Compression ratio:      %.2f%% reduction", compressionRatio)
-			log.Printf("  Space saved:            %s", formatBytes(stats.UncompressedTx-stats.CompressedTx))
+			log.Printf("  Space saved:            %s", helpers.FormatBytes(stats.UncompressedTx-stats.CompressedTx))
 		}
 		log.Printf("\n========================================\n")
 	}
@@ -871,7 +869,7 @@ func writeBatchToDBWithTiming(
 	if config.EnableDB1 && db1 != nil {
 		start := time.Now()
 		for ledgerSeq, compressedLcm := range ledgerSeqToLcm {
-			key := uint32ToBytes(ledgerSeq)
+			key := helpers.Uint32ToBytes(ledgerSeq)
 			if err := db1.Put(wo, key, compressedLcm); err != nil {
 				return timing, errors.Wrap(err, "failed to write to DB1")
 			}
@@ -883,7 +881,7 @@ func writeBatchToDBWithTiming(
 	if config.EnableDB2 && db2 != nil {
 		start := time.Now()
 		for txHashHex, compressedTxData := range txHashToTxData {
-			txHashBytes, err := hexStringToBytes(txHashHex)
+			txHashBytes, err := helpers.HexStringToBytes(txHashHex)
 			if err != nil {
 				return timing, errors.Wrapf(err, "failed to convert tx hash to bytes: %s", txHashHex)
 			}
@@ -898,11 +896,11 @@ func writeBatchToDBWithTiming(
 	if config.EnableDB3 && db3 != nil {
 		start := time.Now()
 		for txHashHex, ledgerSeq := range txHashToLedgerSeq {
-			txHashBytes, err := hexStringToBytes(txHashHex)
+			txHashBytes, err := helpers.HexStringToBytes(txHashHex)
 			if err != nil {
 				return timing, errors.Wrapf(err, "failed to convert tx hash to bytes: %s", txHashHex)
 			}
-			value := uint32ToBytes(ledgerSeq)
+			value := helpers.Uint32ToBytes(ledgerSeq)
 			if err := db3.Put(wo, txHashBytes, value); err != nil {
 				return timing, errors.Wrap(err, "failed to write to DB3")
 			}
@@ -954,8 +952,8 @@ func compactAllDBsWithRange(db1, db2, db3 *grocksdb.DB, config IngestionConfig, 
 
 	if config.EnableDB1 && db1 != nil {
 		start := time.Now()
-		startKey := uint32ToBytes(minLedger)
-		endKey := uint32ToBytes(maxLedger + 1)
+		startKey := helpers.Uint32ToBytes(minLedger)
+		endKey := helpers.Uint32ToBytes(maxLedger + 1)
 		db1.CompactRange(grocksdb.Range{Start: startKey, Limit: endKey})
 		timing.DB1Compact = time.Since(start)
 	}
@@ -973,80 +971,6 @@ func compactAllDBsWithRange(db1, db2, db3 *grocksdb.DB, config IngestionConfig, 
 	}
 
 	return timing
-}
-
-// uint32ToBytes converts a uint32 to big-endian bytes
-func uint32ToBytes(n uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, n)
-	return b
-}
-
-// hexStringToBytes converts a hex string to bytes
-func hexStringToBytes(hexStr string) ([]byte, error) {
-	hexStr = strings.TrimPrefix(hexStr, "0x")
-	return hex.DecodeString(hexStr)
-}
-
-// formatBytes formats bytes into human-readable format
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-// formatNumber formats large numbers with commas
-func formatNumber(n int64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-	s := fmt.Sprintf("%d", n)
-	result := ""
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			result += ","
-		}
-		result += string(c)
-	}
-	return result
-}
-
-// formatDuration formats a duration in a human-readable way
-func formatDuration(d time.Duration) string {
-	// For very short durations, show microseconds or milliseconds
-	if d < time.Millisecond {
-		return fmt.Sprintf("%dµs", d.Microseconds())
-	}
-	if d < time.Second {
-		return fmt.Sprintf("%dms", d.Milliseconds())
-	}
-
-	// For durations under a minute, show seconds with decimal precision
-	if d < time.Minute {
-		return fmt.Sprintf("%.3fs", d.Seconds())
-	}
-
-	// For longer durations, show traditional format
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
 }
 
 // openRocksDBForBulkLoad opens or creates a RocksDB database with settings optimized
@@ -1165,7 +1089,7 @@ func monitorRocksDBStats(db *grocksdb.DB, title string) {
 	log.Printf("  L5 Files: %s", l5Files)
 	log.Printf("  L6 Files: %s", l6Files)
 
-	log.Printf("  Estimated Keys: %s", formatNumber(int64(AtoiIgnoreError(estimatedKeys))))
+	log.Printf("  Estimated Keys: %s", helpers.FormatNumber(int64(AtoiIgnoreError(estimatedKeys))))
 
 	estimatedKeysInt := int64(AtoiIgnoreError(estimatedKeys))
 	totalSSTSizeInt := int64(AtoiIgnoreError(totalSSTSize))
@@ -1175,7 +1099,7 @@ func monitorRocksDBStats(db *grocksdb.DB, title string) {
 		log.Printf("  Avg Key+Value Size: %.2f bytes", avgKeySize)
 	}
 
-	log.Printf("  Total SST Size: %s", formatBytes(totalSSTSizeInt))
-	log.Printf("  Memtable Usage: %s", formatBytes(int64(AtoiIgnoreError(curMemtable))))
+	log.Printf("  Total SST Size: %s", helpers.FormatBytes(totalSSTSizeInt))
+	log.Printf("  Memtable Usage: %s", helpers.FormatBytes(int64(AtoiIgnoreError(curMemtable))))
 	log.Printf("  Compaction Pending: %s", compactionPending)
 }

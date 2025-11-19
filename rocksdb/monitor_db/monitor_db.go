@@ -3,9 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"log"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -60,15 +60,15 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 	totalSSTSize := getPropertyInt(db, "rocksdb.total-sst-files-size")
 	liveSSTSize := getPropertyInt(db, "rocksdb.estimate-live-data-size")
 
-	fmt.Printf("Total SST Size:          %s\n", formatBytes(totalSSTSize))
-	fmt.Printf("Live Data Size:          %s\n", formatBytes(liveSSTSize))
+	fmt.Printf("Total SST Size:          %s\n", helpers.FormatBytes(totalSSTSize))
+	fmt.Printf("Live Data Size:          %s\n", helpers.FormatBytes(liveSSTSize))
 	if totalSSTSize > 0 && liveSSTSize > 0 {
 		obsoleteRatio := float64(totalSSTSize-liveSSTSize) / float64(totalSSTSize) * 100
-		fmt.Printf("Obsolete Data:           %s (%.1f%%)\n", formatBytes(totalSSTSize-liveSSTSize), obsoleteRatio)
+		fmt.Printf("Obsolete Data:           %s (%.1f%%)\n", helpers.FormatBytes(totalSSTSize-liveSSTSize), obsoleteRatio)
 	}
 
 	estimatedKeys := getPropertyInt(db, "rocksdb.estimate-num-keys")
-	fmt.Printf("Estimated Keys:          %s\n", formatNumber(estimatedKeys))
+	fmt.Printf("Estimated Keys:          %s\n", helpers.FormatNumber(estimatedKeys))
 
 	if estimatedKeys > 0 && totalSSTSize > 0 {
 		avgKeySize := float64(totalSSTSize) / float64(estimatedKeys)
@@ -111,9 +111,9 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 
 		fmt.Printf("L%-7d %-12s %-15s %-15s %-12s\n",
 			i,
-			formatNumber(numFiles),
-			formatBytes(levelSize),
-			formatBytes(avgFileSize),
+			helpers.FormatNumber(numFiles),
+			helpers.FormatBytes(levelSize),
+			helpers.FormatBytes(avgFileSize),
 			compRatio)
 
 		totalFiles += numFiles
@@ -121,7 +121,7 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 	}
 
 	fmt.Println("────────────────────────────────────────────────────────────────")
-	fmt.Printf("%-8s %-12s %-15s\n", "TOTAL", formatNumber(totalFiles), formatBytes(totalLevelSize))
+	fmt.Printf("%-8s %-12s %-15s\n", "TOTAL", helpers.FormatNumber(totalFiles), helpers.FormatBytes(totalLevelSize))
 	fmt.Println()
 
 	// Memory usage
@@ -129,16 +129,16 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	memtableSize := getPropertyInt(db, "rocksdb.cur-size-all-mem-tables")
-	fmt.Printf("Memtable Size:           %s\n", formatBytes(memtableSize))
+	fmt.Printf("Memtable Size:           %s\n", helpers.FormatBytes(memtableSize))
 
 	blockCacheUsage := getPropertyInt(db, "rocksdb.block-cache-usage")
 	if blockCacheUsage > 0 {
-		fmt.Printf("Block Cache Usage:       %s\n", formatBytes(blockCacheUsage))
+		fmt.Printf("Block Cache Usage:       %s\n", helpers.FormatBytes(blockCacheUsage))
 	}
 
 	blockCacheCapacity := getPropertyInt(db, "rocksdb.block-cache-capacity")
 	if blockCacheCapacity > 0 {
-		fmt.Printf("Block Cache Capacity:    %s\n", formatBytes(blockCacheCapacity))
+		fmt.Printf("Block Cache Capacity:    %s\n", helpers.FormatBytes(blockCacheCapacity))
 		if blockCacheUsage > 0 {
 			cacheUtilization := float64(blockCacheUsage) / float64(blockCacheCapacity) * 100
 			fmt.Printf("Cache Utilization:       %.1f%%\n", cacheUtilization)
@@ -147,17 +147,17 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 
 	tableReadersMem := getPropertyInt(db, "rocksdb.estimate-table-readers-mem")
 	if tableReadersMem > 0 {
-		fmt.Printf("Table Readers Memory:    %s\n", formatBytes(tableReadersMem))
+		fmt.Printf("Table Readers Memory:    %s\n", helpers.FormatBytes(tableReadersMem))
 	}
 
 	pinnedMem := getPropertyInt(db, "rocksdb.block-cache-pinned-usage")
 	if pinnedMem > 0 {
-		fmt.Printf("Pinned Memory:           %s\n", formatBytes(pinnedMem))
+		fmt.Printf("Pinned Memory:           %s\n", helpers.FormatBytes(pinnedMem))
 	}
 
 	totalMemUsage := memtableSize + blockCacheUsage + tableReadersMem
 	fmt.Printf("─────────────────────────────────────────\n")
-	fmt.Printf("Total Memory Usage:      %s\n", formatBytes(totalMemUsage))
+	fmt.Printf("Total Memory Usage:      %s\n", helpers.FormatBytes(totalMemUsage))
 	fmt.Println()
 
 	// Compaction status
@@ -192,8 +192,8 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 	compactionBytesWritten := getPropertyInt(db, "rocksdb.compact-write-bytes")
 
 	if bytesWritten > 0 {
-		fmt.Printf("Total Bytes Written:     %s\n", formatBytes(bytesWritten))
-		fmt.Printf("Compaction Bytes:        %s\n", formatBytes(compactionBytesWritten))
+		fmt.Printf("Total Bytes Written:     %s\n", helpers.FormatBytes(bytesWritten))
+		fmt.Printf("Compaction Bytes:        %s\n", helpers.FormatBytes(compactionBytesWritten))
 
 		if bytesWritten > 0 {
 			writeAmp := float64(bytesWritten+compactionBytesWritten) / float64(bytesWritten)
@@ -231,7 +231,7 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 				// Try to format as bytes if it's a size metric
 				if strings.Contains(prop, "bytes") {
 					if val, err := strconv.ParseInt(value, 10, 64); err == nil {
-						fmt.Printf("%-35s %s\n", label+":", formatBytes(val))
+						fmt.Printf("%-35s %s\n", label+":", helpers.FormatBytes(val))
 						continue
 					}
 				}
@@ -249,9 +249,9 @@ func monitorRocksDBStats(db *grocksdb.DB, detailed bool) {
 			liveBlobSize := getPropertyInt(db, "rocksdb.live-blob-file-size")
 			numBlobFiles := getPropertyInt(db, "rocksdb.num-blob-files")
 
-			fmt.Printf("Total Blob Size:         %s\n", formatBytes(totalBlobSize))
-			fmt.Printf("Live Blob Size:          %s\n", formatBytes(liveBlobSize))
-			fmt.Printf("Number of Blob Files:    %s\n", formatNumber(numBlobFiles))
+			fmt.Printf("Total Blob Size:         %s\n", helpers.FormatBytes(totalBlobSize))
+			fmt.Printf("Live Blob Size:          %s\n", helpers.FormatBytes(liveBlobSize))
+			fmt.Printf("Number of Blob Files:    %s\n", helpers.FormatNumber(numBlobFiles))
 			fmt.Println()
 		}
 	}
@@ -309,14 +309,14 @@ func analyzeAndRecommend(db *grocksdb.DB) {
 	memtableSize := getPropertyInt(db, "rocksdb.cur-size-all-mem-tables")
 	if memtableSize > 2*1024*1024*1024 { // > 2GB
 		recommendations = append(recommendations,
-			fmt.Sprintf("⚡ LARGE MEMTABLE SIZE (%s): This is normal during bulk ingestion", formatBytes(memtableSize)))
+			fmt.Sprintf("⚡ LARGE MEMTABLE SIZE (%s): This is normal during bulk ingestion", helpers.FormatBytes(memtableSize)))
 	}
 
 	// Check compaction pending
 	pendingCompactionBytes := getPropertyInt(db, "rocksdb.estimate-pending-compaction-bytes")
 	if pendingCompactionBytes > 10*1024*1024*1024 { // > 10GB
 		recommendations = append(recommendations,
-			fmt.Sprintf("⚠️  LARGE PENDING COMPACTION (%s): May cause write stalls", formatBytes(pendingCompactionBytes)))
+			fmt.Sprintf("⚠️  LARGE PENDING COMPACTION (%s): May cause write stalls", helpers.FormatBytes(pendingCompactionBytes)))
 	}
 
 	// Check if write stopped
@@ -340,7 +340,7 @@ func analyzeAndRecommend(db *grocksdb.DB) {
 	}
 	if totalFiles > 1000 {
 		recommendations = append(recommendations,
-			fmt.Sprintf("⚡ HIGH TOTAL FILE COUNT (%s files): Consider increasing target_file_size_base", formatNumber(totalFiles)))
+			fmt.Sprintf("⚡ HIGH TOTAL FILE COUNT (%s files): Consider increasing target_file_size_base", helpers.FormatNumber(totalFiles)))
 	}
 
 	// Print recommendations
@@ -371,61 +371,4 @@ func getPropertyInt(db *grocksdb.DB, property string) int64 {
 		return 0
 	}
 	return val
-}
-
-func formatBytes(bytes int64) string {
-	if bytes < 0 {
-		return "0 B"
-	}
-
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-
-	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func formatNumber(n int64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-
-	in := strconv.FormatInt(n, 10)
-	numOfDigits := len(in)
-	if numOfDigits <= 3 {
-		return in
-	}
-
-	out := make([]byte, numOfDigits+(numOfDigits-1)/3)
-	for i, j, k := numOfDigits-1, len(out)-1, 0; ; i, j = i-1, j-1 {
-		out[j] = in[i]
-		if i == 0 {
-			return string(out)
-		}
-		if k++; k == 3 {
-			j, k = j-1, 0
-			out[j] = ','
-		}
-	}
-}
-
-func getDirSize(path string) int64 {
-	var size int64
-	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size
 }
