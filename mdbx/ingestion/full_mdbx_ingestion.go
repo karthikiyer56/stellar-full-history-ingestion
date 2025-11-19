@@ -126,7 +126,7 @@ func main() {
 	var enableApplicationCompression bool
 	var rocksdbLcmPath string
 
-	flag.UintVar(&startLedger, "db-pagesize", 8192, "DB Page size for new dbs. Ignored if db exists")
+	flag.UintVar(&dbPagesize, "db-pagesize", 8192, "DB Page size for new dbs. Ignored if db exists")
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
