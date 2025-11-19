@@ -532,7 +532,7 @@ func main() {
 					}
 				}
 				showCompressionStats(config, totalCompressionStats)
-				showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+				showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount, config)
 				log.Printf("Time taken for MDBX stats: %s", helpers.FormatDuration(time.Since(st)))
 				log.Printf("========================================\n")
 			}
@@ -767,7 +767,7 @@ func main() {
 
 	showCompressionStats(config, totalCompressionStats)
 	if config.UseRocksDB {
-		showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+		showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount, config)
 	}
 	log.Printf("========================================")
 }
@@ -909,13 +909,15 @@ func (r *RocksDBReader) Close() {
 }
 
 // showRocksDBTimingStats displays RocksDB timing statistics
-func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int) {
+func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int, config IngestionConfig) {
+	numWorkers := config.NumWorkers
+
 	log.Printf("")
-	log.Printf("\nRocksDB Timing Statistics:")
-	log.Printf("  Total Read Time: %s", helpers.FormatDuration(timing.ReadTime))
-	log.Printf("  Total Decompress Time: %s", helpers.FormatDuration(timing.DecompressTime))
-	log.Printf("  Total Unmarshal Time: %s", helpers.FormatDuration(timing.UnmarshalTime))
-	log.Printf("  Total Time: %s", helpers.FormatDuration(timing.TotalTime))
+	log.Printf("RocksDB Timing Statistics (wall-clock estimates) so far:")
+	log.Printf("\tTotal Read Time: %s", helpers.FormatDuration(timing.ReadTime/time.Duration(numWorkers)))
+	log.Printf("\tTotal Decompress Time: %s", helpers.FormatDuration(timing.DecompressTime/time.Duration(numWorkers)))
+	log.Printf("\tTotal Unmarshal Time: %s", helpers.FormatDuration(timing.UnmarshalTime/time.Duration(numWorkers)))
+	log.Printf("\tTotal Time: %s", helpers.FormatDuration(timing.TotalTime/time.Duration(numWorkers)))
 
 	if ledgerCount > 0 {
 		avgRead := timing.ReadTime / time.Duration(ledgerCount)
@@ -923,7 +925,7 @@ func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int) {
 		avgUnmarshal := timing.UnmarshalTime / time.Duration(ledgerCount)
 		avgTotal := timing.TotalTime / time.Duration(ledgerCount)
 
-		log.Printf("  Avg per ledger - Read: %s, Decompress: %s, Unmarshal: %s, Total: %s",
+		log.Printf("\tAvg per ledger - Read: %s, Decompress: %s, Unmarshal: %s, Total: %s",
 			helpers.FormatDuration(avgRead), helpers.FormatDuration(avgDecompress),
 			helpers.FormatDuration(avgUnmarshal), helpers.FormatDuration(avgTotal))
 	}
