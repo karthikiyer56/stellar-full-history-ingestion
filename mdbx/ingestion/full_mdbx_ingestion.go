@@ -44,6 +44,7 @@ type IngestionConfig struct {
 	RocksDBLCMPath               string
 	UseRocksDB                   bool
 	SyncEveryNBatches            int
+	NumWorkers                   int
 }
 
 // CompressionStats tracks compression metrics for a batch
@@ -429,6 +430,7 @@ func main() {
 		if numWorkers > 16 {
 			numWorkers = 16
 		}
+		config.NumWorkers = numWorkers
 
 		// Process ledgers in chunks equal to batch size
 		chunkSize := config.BatchSize
@@ -1292,16 +1294,14 @@ func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionC
 	// Show RocksDB breakdown if we have timing data
 	if batch.BatchRocksDBTimingStats.TotalTime > 0 && batch.LedgerCount > 0 {
 		rocksStats := batch.BatchRocksDBTimingStats
-		log.Printf("\t\t:::RocksDB Timings:::")
-		log.Printf("\t\tRocksDB Read:    %s (avg: %s/ledger)",
-			helpers.FormatDuration(rocksStats.ReadTime),
-			helpers.FormatDuration(rocksStats.ReadTime/time.Duration(batch.LedgerCount)))
-		log.Printf("\t\tDecompress:      %s (avg: %s/ledger)",
-			helpers.FormatDuration(rocksStats.DecompressTime),
-			helpers.FormatDuration(rocksStats.DecompressTime/time.Duration(batch.LedgerCount)))
-		log.Printf("\t\tUnmarshal:       %s (avg: %s/ledger)",
-			helpers.FormatDuration(rocksStats.UnmarshalTime),
-			helpers.FormatDuration(rocksStats.UnmarshalTime/time.Duration(batch.LedgerCount)))
+
+		log.Printf("\t\t:::RocksDB Breakdown for Batch (not per ledger) (wall-clock estimate):::")
+		log.Printf("\t\t\tRead:       %s",
+			helpers.FormatDuration(rocksStats.ReadTime/time.Duration(config.NumWorkers)))
+		log.Printf("\t\t\tDecompress: %s",
+			helpers.FormatDuration(rocksStats.DecompressTime/time.Duration(config.NumWorkers)))
+		log.Printf("\t\t\tUnmarshal:  %s",
+			helpers.FormatDuration(rocksStats.UnmarshalTime/time.Duration(config.NumWorkers)))
 	}
 	if batch.LedgerCount > 0 {
 		// show average in both cases - GCS and RocksDB fetch
