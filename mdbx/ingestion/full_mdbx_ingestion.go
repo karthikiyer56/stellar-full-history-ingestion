@@ -6,8 +6,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"github.com/stellar/go/ingest/ledgerbackend"
-	"github.com/stellar/go/support/datastore"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,15 +15,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/erigontech/mdbx-go/mdbx" // ✅ Correct import for v0.38+
+	"github.com/erigontech/mdbx-go/mdbx"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
 	"github.com/klauspost/compress/zstd"
+	"github.com/linxGnu/grocksdb"
 	"github.com/pkg/errors"
 	"github.com/stellar/go/ingest"
+	"github.com/stellar/go/ingest/ledgerbackend"
 	"github.com/stellar/go/network"
+	"github.com/stellar/go/support/datastore"
+	"github.com/stellar/go/xdr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"io"
 )
 
 const GB = 1024 * 1024 * 1024
@@ -40,6 +42,8 @@ type IngestionConfig struct {
 	EnableDB2                    bool
 	EnableDB3                    bool
 	EnableApplicationCompression bool
+	RocksDBLCMPath               string
+	UseRocksDB                   bool
 }
 
 // CompressionStats tracks compression metrics for a batch
@@ -57,6 +61,14 @@ type DBTimingStats struct {
 	DB2SyncTime        time.Duration
 	DB3WriteTime       time.Duration
 	DB3SyncTime        time.Duration
+}
+
+// RocksDBTimingStats tracks timing for RocksDB operations
+type RocksDBTimingStats struct {
+	ReadTime       time.Duration
+	DecompressTime time.Duration
+	UnmarshalTime  time.Duration
+	TotalTime      time.Duration
 }
 
 // BatchInfo tracks information about the current batch
@@ -97,12 +109,20 @@ type rawTxData struct {
 	closedAt  time.Time
 }
 
+// RocksDBReader wraps RocksDB with a reusable zstd decoder
+type RocksDBReader struct {
+	db      *grocksdb.DB
+	decoder *zstd.Decoder
+	ro      *grocksdb.ReadOptions
+}
+
 func main() {
 	// Command-line flags
 	var startLedger, endLedger uint
 	var batchSize int
 	var db2Path, db3Path string
 	var enableApplicationCompression bool
+	var rocksdbLcmPath string
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
@@ -110,6 +130,7 @@ func main() {
 	flag.StringVar(&db2Path, "db2", "", "Path for DB2 (txHash -> compressed TxData)")
 	flag.StringVar(&db3Path, "db3", "", "Path for DB3 (txHash -> ledgerSeq)")
 	flag.BoolVar(&enableApplicationCompression, "app-compression", true, "Enable compression (default: true)")
+	flag.StringVar(&rocksdbLcmPath, "rocksdb-lcm-store", "", "Path to RocksDB store containing compressed LedgerCloseMeta")
 	flag.Parse()
 
 	// Validate required arguments
@@ -137,6 +158,8 @@ func main() {
 		EnableDB2:                    enableDB2,
 		EnableDB3:                    enableDB3,
 		EnableApplicationCompression: enableApplicationCompression,
+		RocksDBLCMPath:               rocksdbLcmPath,
+		UseRocksDB:                   rocksdbLcmPath != "",
 	}
 
 	// Initialize MDBX databases
@@ -172,54 +195,74 @@ func main() {
 
 	ctx := context.Background()
 
-	// Configure the datastore
-	datastoreConfig := datastore.DataStoreConfig{
-		Type: "GCS",
-		Params: map[string]string{
-			"destination_bucket_path": "sdf-ledger-close-meta/v1/ledgers/pubnet",
-		},
-	}
+	// Initialize RocksDB reader or GCS backend
+	var rocksReader *RocksDBReader
+	var backend *ledgerbackend.BufferedStorageBackend
 
-	dataStoreSchema := datastore.DataStoreSchema{
-		LedgersPerFile:    1,
-		FilesPerPartition: 64000,
-	}
+	if config.UseRocksDB {
+		rocksReader, err = openRocksDBReader(config.RocksDBLCMPath)
+		if err != nil {
+			log.Fatalf("Failed to open RocksDB LCM store: %v", err)
+		}
+		defer rocksReader.Close()
+		log.Printf("✓ RocksDB LCM store opened at: %s", config.RocksDBLCMPath)
+	} else {
+		// Configure the datastore
+		datastoreConfig := datastore.DataStoreConfig{
+			Type: "GCS",
+			Params: map[string]string{
+				"destination_bucket_path": "sdf-ledger-close-meta/v1/ledgers/pubnet",
+			},
+		}
 
-	// Initialize the datastore
-	dataStore, err := datastore.NewDataStore(ctx, datastoreConfig)
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "failed to create datastore"))
-	}
-	defer dataStore.Close()
+		dataStoreSchema := datastore.DataStoreSchema{
+			LedgersPerFile:    1,
+			FilesPerPartition: 64000,
+		}
 
-	// Configure the BufferedStorageBackend
-	backendConfig := ledgerbackend.BufferedStorageBackendConfig{
-		BufferSize: 10000,
-		NumWorkers: 200,
-		RetryLimit: 3,
-		RetryWait:  5 * time.Second,
-	}
+		// Initialize the datastore
+		dataStore, err := datastore.NewDataStore(ctx, datastoreConfig)
+		if err != nil {
+			log.Fatal(errors.Wrap(err, "failed to create datastore"))
+		}
+		defer dataStore.Close()
 
-	// Initialize the backend
-	backend, err := ledgerbackend.NewBufferedStorageBackend(backendConfig, dataStore, dataStoreSchema)
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "failed to create buffered storage backend"))
+		// Configure the BufferedStorageBackend
+		backendConfig := ledgerbackend.BufferedStorageBackendConfig{
+			BufferSize: 10000,
+			NumWorkers: 200,
+			RetryLimit: 3,
+			RetryWait:  5 * time.Second,
+		}
+
+		// Initialize the backend
+		backend, err = ledgerbackend.NewBufferedStorageBackend(backendConfig, dataStore, dataStoreSchema)
+		if err != nil {
+			log.Fatal(errors.Wrap(err, "failed to create buffered storage backend"))
+		}
+		defer backend.Close()
+
+		ledgerRange := ledgerbackend.BoundedRange(config.StartLedger, config.EndLedger)
+		err = backend.PrepareRange(ctx, ledgerRange)
+		if err != nil {
+			log.Fatal(errors.Wrapf(err, "failed to prepare range: %v", ledgerRange))
+		}
 	}
-	defer backend.Close()
 
 	ledgerRange := ledgerbackend.BoundedRange(config.StartLedger, config.EndLedger)
 	totalLedgers := int(ledgerRange.To() - ledgerRange.From() + 1)
-
-	err = backend.PrepareRange(ctx, ledgerRange)
-	if err != nil {
-		log.Fatal(errors.Wrapf(err, "failed to prepare range: %v", ledgerRange))
-	}
 
 	log.Printf("\n========================================")
 	log.Printf("Starting MDBX ledger processing")
 	log.Printf("========================================")
 	log.Printf("Ledger range: %d - %d (%s ledgers)",
 		ledgerRange.From(), ledgerRange.To(), formatNumber(int64(totalLedgers)))
+	log.Printf("Ledger source: %s", func() string {
+		if config.UseRocksDB {
+			return "RocksDB (" + config.RocksDBLCMPath + ")"
+		}
+		return "GCS (BufferedStorageBackend)"
+	}())
 	log.Printf("DB2 (TxData) storage: %v", config.EnableDB2)
 	log.Printf("DB3 (Hash->Seq) storage: %v", config.EnableDB3)
 	log.Printf("Application Compression: %v", config.EnableApplicationCompression)
@@ -228,10 +271,12 @@ func main() {
 	// Set up metrics tracking
 	startTime := time.Now()
 	processedLedgerCount := 0
+	skippedLedgerCount := 0
 	lastReportedPercent := -1
 
 	var totalTimingStats DBTimingStats
 	var totalCompressionStats CompressionStats
+	var totalRocksDBTiming RocksDBTimingStats
 
 	// Batch data
 	var batchTransactions []rawTxData
@@ -302,14 +347,39 @@ func main() {
 	}
 
 	// Iterate through ledgers
-	for ledgerSeq := ledgerRange.From(); ledgerSeq < ledgerRange.To(); ledgerSeq++ {
-		// Get ledger
-		getLedgerStart := time.Now()
-		ledger, err := backend.GetLedger(ctx, ledgerSeq)
-		if err != nil {
-			log.Fatalf("Failed to retrieve ledger %d: %v", ledgerSeq, err)
+	for ledgerSeq := ledgerRange.From(); ledgerSeq <= ledgerRange.To(); ledgerSeq++ {
+		var ledger xdr.LedgerCloseMeta
+		var err error
+		var getLedgerTime time.Duration
+
+		if config.UseRocksDB {
+			// Get ledger from RocksDB
+			getLedgerStart := time.Now()
+			var timing RocksDBTimingStats
+			ledger, timing, err = rocksReader.GetLedger(ledgerSeq)
+			getLedgerTime = time.Since(getLedgerStart)
+
+			// Accumulate RocksDB timing stats
+			totalRocksDBTiming.ReadTime += timing.ReadTime
+			totalRocksDBTiming.DecompressTime += timing.DecompressTime
+			totalRocksDBTiming.UnmarshalTime += timing.UnmarshalTime
+			totalRocksDBTiming.TotalTime += timing.TotalTime
+
+			if err != nil {
+				log.Printf("===== Warning: Failed to get ledger %d from RocksDB: %v, skipping =====\n", ledgerSeq, err)
+				skippedLedgerCount++
+				continue
+			}
+		} else {
+			// Get ledger from GCS
+			getLedgerStart := time.Now()
+			ledger, err = backend.GetLedger(ctx, ledgerSeq)
+			getLedgerTime = time.Since(getLedgerStart)
+
+			if err != nil {
+				log.Fatalf("Failed to retrieve ledger %d: %v", ledgerSeq, err)
+			}
 		}
-		getLedgerTime := time.Since(getLedgerStart)
 
 		totalTimingStats.GetLedgerTime += getLedgerTime
 		currentBatch.GetLedgerTime += getLedgerTime
@@ -364,6 +434,9 @@ func main() {
 				}
 			}
 			showCompressionStats(config, totalCompressionStats)
+			if config.UseRocksDB {
+				showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+			}
 			log.Printf("Time taken for MDBX stats: %s", formatDuration(time.Since(st)))
 			log.Printf("========================================\n")
 		}
@@ -382,6 +455,9 @@ func main() {
 			log.Printf("\n========================================")
 			log.Printf("PROGRESS: %d/%d ledgers (%d%%) | Ledger: %d",
 				processedLedgerCount, totalLedgers, currentPercent, ledgerSeq)
+			if skippedLedgerCount > 0 {
+				log.Printf("Skipped ledgers: %d", skippedLedgerCount)
+			}
 			log.Printf("Speed: %.2f ledgers/sec | Transactions: %s | ETA: %s",
 				ledgersPerSec, formatNumber(totalCompressionStats.TxCount), formatDuration(eta))
 			log.Printf("========================================\n")
@@ -424,6 +500,9 @@ func main() {
 	log.Printf("INGESTION COMPLETE")
 	log.Printf("========================================")
 	log.Printf("Total ledgers processed: %s", formatNumber(int64(processedLedgerCount)))
+	if skippedLedgerCount > 0 {
+		log.Printf("Total ledgers skipped: %s", formatNumber(int64(skippedLedgerCount)))
+	}
 	log.Printf("Total transactions: %s", formatNumber(totalCompressionStats.TxCount))
 	log.Printf("Total time: %s", formatDuration(elapsed))
 	log.Printf("Average speed: %.2f ledgers/sec", float64(processedLedgerCount)/elapsed.Seconds())
@@ -431,6 +510,13 @@ func main() {
 	log.Printf("Time breakdown:")
 	log.Printf("  GetLedger: %s (%.1f%%)", formatDuration(totalTimingStats.GetLedgerTime),
 		100*totalTimingStats.GetLedgerTime.Seconds()/elapsed.Seconds())
+
+	if config.UseRocksDB {
+		log.Printf("    RocksDB Read: %s", formatDuration(totalRocksDBTiming.ReadTime))
+		log.Printf("    Decompress: %s", formatDuration(totalRocksDBTiming.DecompressTime))
+		log.Printf("    Unmarshal: %s", formatDuration(totalRocksDBTiming.UnmarshalTime))
+	}
+
 	log.Printf("  Compression: %s (%.1f%%)", formatDuration(totalTimingStats.DB2CompressionTime),
 		100*totalTimingStats.DB2CompressionTime.Seconds()/elapsed.Seconds())
 
@@ -465,7 +551,124 @@ func main() {
 	}
 
 	showCompressionStats(config, totalCompressionStats)
+	if config.UseRocksDB {
+		showRocksDBTimingStats(totalRocksDBTiming, processedLedgerCount)
+	}
 	log.Printf("========================================")
+}
+
+// openRocksDBReader opens a RocksDB database for reading with a reusable decoder
+func openRocksDBReader(path string) (*RocksDBReader, error) {
+	opts := grocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(false)
+
+	// Open in read-only mode
+	db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to open RocksDB")
+	}
+
+	// Create reusable zstd decoder
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		db.Close()
+		return nil, errors.Wrap(err, "failed to create zstd decoder")
+	}
+
+	// Create reusable read options
+	ro := grocksdb.NewDefaultReadOptions()
+
+	return &RocksDBReader{
+		db:      db,
+		decoder: decoder,
+		ro:      ro,
+	}, nil
+}
+
+// Close closes the RocksDB reader and its resources
+func (r *RocksDBReader) Close() {
+	if r.decoder != nil {
+		r.decoder.Close()
+	}
+	if r.ro != nil {
+		r.ro.Destroy()
+	}
+	if r.db != nil {
+		r.db.Close()
+	}
+}
+
+// GetLedger retrieves and decompresses a ledger from RocksDB
+func (r *RocksDBReader) GetLedger(ledgerSeq uint32) (xdr.LedgerCloseMeta, RocksDBTimingStats, error) {
+	var ledger xdr.LedgerCloseMeta
+	var timing RocksDBTimingStats
+
+	totalStart := time.Now()
+
+	// Convert ledger sequence to 4-byte big-endian key
+	key := uint32ToBytes(ledgerSeq)
+
+	// Read from RocksDB
+	readStart := time.Now()
+	slice, err := r.db.Get(r.ro, key)
+	timing.ReadTime = time.Since(readStart)
+
+	if err != nil {
+		timing.TotalTime = time.Since(totalStart)
+		return ledger, timing, errors.Wrap(err, "failed to read from RocksDB")
+	}
+	defer slice.Free()
+
+	// Check if key exists
+	if !slice.Exists() {
+		timing.TotalTime = time.Since(totalStart)
+		return ledger, timing, fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
+	}
+
+	compressedData := slice.Data()
+
+	// Decompress zstd data
+	decompressStart := time.Now()
+	uncompressedData, err := r.decoder.DecodeAll(compressedData, nil)
+	timing.DecompressTime = time.Since(decompressStart)
+
+	if err != nil {
+		timing.TotalTime = time.Since(totalStart)
+		return ledger, timing, errors.Wrap(err, "failed to decompress ledger data")
+	}
+
+	// Unmarshal XDR to LedgerCloseMeta
+	unmarshalStart := time.Now()
+	err = ledger.UnmarshalBinary(uncompressedData)
+	timing.UnmarshalTime = time.Since(unmarshalStart)
+
+	if err != nil {
+		timing.TotalTime = time.Since(totalStart)
+		return ledger, timing, errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
+	}
+
+	timing.TotalTime = time.Since(totalStart)
+	return ledger, timing, nil
+}
+
+// showRocksDBTimingStats displays RocksDB timing statistics
+func showRocksDBTimingStats(timing RocksDBTimingStats, ledgerCount int) {
+	log.Printf("\nRocksDB Timing Statistics:")
+	log.Printf("  Total Read Time: %s", formatDuration(timing.ReadTime))
+	log.Printf("  Total Decompress Time: %s", formatDuration(timing.DecompressTime))
+	log.Printf("  Total Unmarshal Time: %s", formatDuration(timing.UnmarshalTime))
+	log.Printf("  Total Time: %s", formatDuration(timing.TotalTime))
+
+	if ledgerCount > 0 {
+		avgRead := timing.ReadTime / time.Duration(ledgerCount)
+		avgDecompress := timing.DecompressTime / time.Duration(ledgerCount)
+		avgUnmarshal := timing.UnmarshalTime / time.Duration(ledgerCount)
+		avgTotal := timing.TotalTime / time.Duration(ledgerCount)
+
+		log.Printf("  Avg per ledger - Read: %s, Decompress: %s, Unmarshal: %s, Total: %s",
+			formatDuration(avgRead), formatDuration(avgDecompress),
+			formatDuration(avgUnmarshal), formatDuration(avgTotal))
+	}
 }
 
 type result struct {
