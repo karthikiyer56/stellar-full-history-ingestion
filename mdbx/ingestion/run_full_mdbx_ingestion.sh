@@ -11,7 +11,7 @@ DB3_PATH=""
 BATCH_SIZE=2000
 ENABLE_APP_COMPRESSION=true
 ROCKSDB_LCM_STORE=""
-
+DB_PAGESIZE=8192
 # -----------------------------
 # Usage/help function
 # -----------------------------
@@ -29,6 +29,7 @@ Optional:
   --ledger-batch-size  Ledger batch size for commit (default: 2000)
   --app-compression    true/false (default: true)
   --rocksdb-lcm-store  Path to RocksDB store containing compressed LedgerCloseMeta
+  --db-pagesize        Pagesize for new DB.
   --help               Show this help message and exit
 EOF
 }
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --ledger-batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --app-compression) ENABLE_APP_COMPRESSION="$2"; shift 2 ;;
     --rocksdb-lcm-store) ROCKSDB_LCM_STORE="$2"; shift 2 ;;
+    --db-pagesize) DB_PAGESIZE="$2"; shift 2 ;;
     --help) usage; exit 0 ;;
     *)
       echo "❌ Unknown argument: $1" >&2
@@ -83,6 +85,7 @@ echo "  DB3_PATH=$DB3_PATH"
 echo "  BATCH_SIZE=$BATCH_SIZE"
 echo "  ENABLE_APP_COMPRESSION=$ENABLE_APP_COMPRESSION"
 echo "  ROCKSDB_LCM_STORE=$ROCKSDB_LCM_STORE"
+echo "  DB_PAGESIZE=$DB_PAGESIZE"
 echo "----------------------------------"
 
 cleanup() {
@@ -140,6 +143,7 @@ set -x
   ${DB2_PATH:+--db2 "$DB2_PATH"} \
   ${DB3_PATH:+--db3 "$DB3_PATH"} \
   ${ROCKSDB_LCM_STORE:+--rocksdb-lcm-store "$ROCKSDB_LCM_STORE"} \
+  ${DB_PAGESIZE:+--db-pagesize "$DB_PAGESIZE"} \
   --app-compression="$ENABLE_APP_COMPRESSION"
 
 set +x

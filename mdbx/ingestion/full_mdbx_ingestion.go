@@ -37,6 +37,7 @@ type IngestionConfig struct {
 	StartLedger                  uint32
 	EndLedger                    uint32
 	BatchSize                    int
+	DbPageSize                   uint
 	DB2Path                      string
 	DB3Path                      string
 	EnableDB2                    bool
@@ -119,10 +120,13 @@ type RocksDBReader struct {
 func main() {
 	// Command-line flags
 	var startLedger, endLedger uint
+	var dbPagesize uint
 	var batchSize int
 	var db2Path, db3Path string
 	var enableApplicationCompression bool
 	var rocksdbLcmPath string
+
+	flag.UintVar(&startLedger, "db-pagesize", 8192, "DB Page size for new dbs. Ignored if db exists")
 
 	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
 	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
@@ -148,6 +152,10 @@ func main() {
 		log.Fatal("At least one database (db2 or db3) must be specified")
 	}
 
+	if dbPagesize%(4*1024) != 0 {
+		log.Fatal("db-pagesize must be a multiple of 4kb")
+	}
+
 	// Create config
 	config := IngestionConfig{
 		StartLedger:                  uint32(startLedger),
@@ -160,6 +168,7 @@ func main() {
 		EnableApplicationCompression: enableApplicationCompression,
 		RocksDBLCMPath:               rocksdbLcmPath,
 		UseRocksDB:                   rocksdbLcmPath != "",
+		DbPageSize:                   dbPagesize,
 	}
 
 	// Initialize MDBX databases
@@ -835,12 +844,12 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 	// Set geometry (size limits)
 
 	err = env.SetGeometry(
-		200*GB, // size_lower: 200 GB initial
-		-1,     // size_now: -1 = use default
-		2*TB,   // size_upper: 2 TB maximum
-		200*GB, // growth_step: 200 GB per growth
-		-1,     // shrink_threshold: -1 = disabled
-		8192,   // pagesize: 4 KB
+		200*GB,                 // size_lower: 200 GB initial
+		-1,                     // size_now: -1 = use default
+		2*TB,                   // size_upper: 2 TB maximum
+		200*GB,                 // growth_step: 200 GB per growth
+		-1,                     // shrink_threshold: -1 = disabled
+		int(config.DbPageSize), // pagesize: 4 KB
 	)
 	if err != nil {
 		env.Close()
@@ -876,12 +885,7 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 		return nil, errors.Wrap(err, "failed to open DBI")
 	}
 
-	log.Printf("✓ %s opened successfully", name)
-	log.Printf("  Path: %s", path)
-	log.Printf("  Initial size: 200 GB")
-	log.Printf("  Growth step: 200 GB")
-	log.Printf("  Maximum size: 6 TB")
-	log.Printf("  Page size: 4096 bytes")
+	log.Printf("✓ %s opened successfully at path %s. PageSize: %d\n", name, path, config.DbPageSize)
 
 	return &MDBXDatabase{
 		Env:  env,
