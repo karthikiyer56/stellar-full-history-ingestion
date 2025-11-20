@@ -142,12 +142,13 @@ type DbOpenSettings struct {
 }
 
 func (s DbOpenSettings) String() string {
-	return fmt.Sprintf("DbOpenSettings{SizeLower: %s, SizeNow: %d, SizeUpper: %s, GrowthStep: %s, PageSize: %d}",
+	return fmt.Sprintf("DbOpenSettings{SizeLower: %s, SizeNow: %d, SizeUpper: %s, GrowthStep: %s, PageSize: %d, SyncType: %s}",
 		helpers.FormatBytes(int64(s.SizeLower)),
 		s.SizeNow,
 		helpers.FormatBytes(int64(s.SizeUpper)),
 		helpers.FormatBytes(int64(s.GrowthStep)),
-		s.PageSize)
+		s.PageSize,
+		s.SyncType)
 }
 
 // Just coz....
