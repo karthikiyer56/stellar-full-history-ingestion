@@ -139,6 +139,15 @@ type DbOpenSettings struct {
 	PageSize   int
 }
 
+func (s DbOpenSettings) String() string {
+	return fmt.Sprintf("DbOpenSettings{SizeLower: %s, SizeNow: %d, SizeUpper: %s, GrowthStep: %s, PageSize: %d}",
+		helpers.FormatBytes(int64(s.SizeLower)),
+		s.SizeNow,
+		helpers.FormatBytes(int64(s.SizeUpper)),
+		helpers.FormatBytes(int64(s.GrowthStep)),
+		s.PageSize)
+}
+
 // Just coz....
 var startTime time.Time
 
@@ -237,11 +246,11 @@ func main() {
 	}
 
 	if config.EnableDB3 {
-		db2Settings = DbOpenSettings{
-			SizeLower:  10 * GB,
+		db3Settings = DbOpenSettings{
+			SizeLower:  20 * GB,
 			SizeNow:    -1,
 			SizeUpper:  200 * GB,
-			GrowthStep: 10 * GB,
+			GrowthStep: 20 * GB,
 			PageSize:   int(config.DbPageSize),
 		}
 		db3Path, err = filepath.Abs(config.DB3Path)
@@ -1168,6 +1177,7 @@ func openMDBXDatabase(path string, name string, config IngestionConfig, settings
 	}
 
 	log.Printf("✓ %s opened successfully", name)
+	log.Printf("DB open settings: %s", settings)
 	log.Printf("  Path: %s", path)
 	log.Printf("  Page size: %d bytes", config.DbPageSize)
 	log.Printf("  Mode: UtterlyNoSync (maximum speed bulk ingestion)")
