@@ -131,6 +131,14 @@ type LedgerResult struct {
 	Err       error
 }
 
+type DbOpenSettings struct {
+	SizeLower  int
+	SizeNow    int
+	SizeUpper  int
+	GrowthStep int
+	PageSize   int
+}
+
 // Just coz....
 var startTime time.Time
 
@@ -205,12 +213,22 @@ func main() {
 	var db3 *MDBXDatabase
 	var err error
 
+	var db2Settings DbOpenSettings
+	var db3Settings DbOpenSettings
+
 	if config.EnableDB2 {
 		db2Path, err = filepath.Abs(config.DB2Path)
 		if err != nil {
 			log.Fatalf("Failed to get absolute path for db2: %v", err)
 		}
-		db2, err = openMDBXDatabase(db2Path, "DB2 (txHash->TxData)", config)
+		db2Settings = DbOpenSettings{
+			SizeLower:  200 * GB,
+			SizeNow:    -1,
+			SizeUpper:  2 * TB,
+			GrowthStep: 200 * GB,
+			PageSize:   int(config.DbPageSize),
+		}
+		db2, err = openMDBXDatabase(db2Path, "DB2 (txHash->TxData)", config, db2Settings)
 		if err != nil {
 			log.Fatalf("Failed to open DB2: %v", err)
 		}
@@ -219,11 +237,18 @@ func main() {
 	}
 
 	if config.EnableDB3 {
+		db2Settings = DbOpenSettings{
+			SizeLower:  10 * GB,
+			SizeNow:    -1,
+			SizeUpper:  200 * GB,
+			GrowthStep: 10 * GB,
+			PageSize:   int(config.DbPageSize),
+		}
 		db3Path, err = filepath.Abs(config.DB3Path)
 		if err != nil {
 			log.Fatalf("Failed to get absolute path for db3: %v", err)
 		}
-		db3, err = openMDBXDatabase(db3Path, "DB3 (txHash->LedgerSeq)", config)
+		db3, err = openMDBXDatabase(db3Path, "DB3 (txHash->LedgerSeq)", config, db3Settings)
 		if err != nil {
 			log.Fatalf("Failed to open DB3: %v", err)
 		}
@@ -1088,7 +1113,7 @@ func compressTransactionsFromBatchInParallel(
 }
 
 // openMDBXDatabase opens or creates an MDBX database
-func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDatabase, error) {
+func openMDBXDatabase(path string, name string, config IngestionConfig, settings DbOpenSettings) (*MDBXDatabase, error) {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -1103,12 +1128,12 @@ func openMDBXDatabase(path string, name string, config IngestionConfig) (*MDBXDa
 
 	// Set geometry (size limits)
 	err = env.SetGeometry(
-		200*GB,                 // size_lower: 200 GB initial
-		-1,                     // size_now: -1 = use default
-		2*TB,                   // size_upper: 2 TB maximum
-		200*GB,                 // growth_step: 200 GB per growth
-		-1,                     // shrink_threshold: -1 = disabled
-		int(config.DbPageSize), // pagesize
+		settings.SizeLower,  // size_lower: 200 GB initial
+		-1,                  // size_now: -1 = use default
+		settings.SizeUpper,  // size_upper: 2 TB maximum
+		settings.GrowthStep, // growth_step: 200 GB per growth
+		-1,                  // shrink_threshold: -1 = disabled
+		settings.PageSize,   // pagesize
 	)
 	if err != nil {
 		env.Close()
