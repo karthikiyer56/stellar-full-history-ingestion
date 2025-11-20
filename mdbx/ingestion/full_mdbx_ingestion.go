@@ -131,7 +131,12 @@ type LedgerResult struct {
 	Err       error
 }
 
+// Just coz....
+var startTime time.Time
+
 func main() {
+	startTime = time.Now()
+
 	// ================================
 	// COMMAND LINE FLAGS
 	// ================================
@@ -312,7 +317,6 @@ func main() {
 	// ================================
 	// INITIALIZE METRICS TRACKING
 	// ================================
-	startTime := time.Now()
 	processedLedgerCount := 0
 	skippedLedgerCount := 0
 	lastReportedPercent := -1
@@ -1290,57 +1294,62 @@ func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionC
 		config.BatchSize, batch.LedgerCount, batch.TxCount)
 	log.Printf("Total Batch Time: %s", helpers.FormatDuration(totalBatchDuration))
 
-	// GetLedger breakdown
-	log.Printf("\n\tGetLedger Time: %s", helpers.FormatDuration(batch.BatchGetLedgerTime))
+	// Compute time
+	log.Printf("")
+	log.Printf("\tCompute Time: %s", helpers.FormatDuration(computeTime))
 
+	// GetLedger breakdown
+	log.Printf("")
+	log.Printf("===== Ledger Fetching Times for batch =====")
+	log.Printf("\tTotal GetLedger Time for batch: %s", helpers.FormatDuration(batch.BatchGetLedgerTime))
 	// Show RocksDB breakdown if we have timing data
 	if batch.BatchRocksDBTimingStats.TotalTime > 0 && batch.LedgerCount > 0 {
 		rocksStats := batch.BatchRocksDBTimingStats
-
-		log.Printf("\t\t:::RocksDB Breakdown for Batch (not per ledger) (wall-clock estimate):::")
-		log.Printf("\t\t\tRead:       %s",
+		log.Printf("\tRocksDB Breakdown for Batch (not per ledger) (wall-clock estimate)")
+		log.Printf("\t\tRead:       %s",
 			helpers.FormatDuration(rocksStats.ReadTime/time.Duration(config.NumWorkers)))
-		log.Printf("\t\t\tDecompress: %s",
+		log.Printf("\t\tDecompress: %s",
 			helpers.FormatDuration(rocksStats.DecompressTime/time.Duration(config.NumWorkers)))
-		log.Printf("\t\t\tUnmarshal:  %s",
+		log.Printf("\t\tUnmarshal:  %s",
 			helpers.FormatDuration(rocksStats.UnmarshalTime/time.Duration(config.NumWorkers)))
 	}
+
 	if batch.LedgerCount > 0 {
 		// show average in both cases - GCS and RocksDB fetch
-		log.Printf("\t\tAvg per ledger: %s",
+		log.Printf("\tAvg GetLedgerTime per ledger for this batch: %s",
 			helpers.FormatDuration(batch.BatchGetLedgerTime/time.Duration(batch.LedgerCount)))
 	}
 
-	// Compute time
-	log.Printf("\n\tCompute Time: %s", helpers.FormatDuration(computeTime))
-
 	// DB2 breakdown
+	log.Printf("")
 	if config.EnableDB2 {
-		log.Printf("\n\tDB2: %s", config.DB2Path)
+		log.Printf("===== Metrics for DB2: %s =====", config.DB2Path)
 		log.Printf("\t\tCompression: %s", helpers.FormatDuration(batch.BatchDb2CompressionTime))
 		if batch.TxCount > 0 {
-			log.Printf("\t\t\tAvg per tx: %s",
+			log.Printf("\t\t\tAvg compression time per tx in for this batch: %s",
 				helpers.FormatDuration(batch.BatchDb2CompressionTime/time.Duration(batch.TxCount)))
 		}
 		log.Printf("\t\tI/O Write:   %s", helpers.FormatDuration(timing.DB2WriteTime))
 		if batch.TxCount > 0 {
-			log.Printf("\t\t\tAvg per tx: %s",
+			log.Printf("\t\t\tAvg write time per tx for this batch: %s",
 				helpers.FormatDuration(timing.DB2WriteTime/time.Duration(batch.TxCount)))
 		}
 	}
 
 	// DB3 breakdown
+	log.Printf("")
 	if config.EnableDB3 {
-		log.Printf("\n\tDB3: %s", config.DB3Path)
+		log.Printf("===== Metrics for DB3: %s =====", config.DB3Path)
 		log.Printf("\t\tI/O Write: %s", helpers.FormatDuration(timing.DB3WriteTime))
 		if batch.TxCount > 0 {
-			log.Printf("\t\t\tAvg per tx: %s",
+			log.Printf("\t\t\tAvg write time per tx for this batch: %s",
 				helpers.FormatDuration(timing.DB3WriteTime/time.Duration(batch.TxCount)))
 		}
 	}
 
+	log.Printf("")
 	// Overall averages
-	log.Printf("\n\t=== AVERAGES ===")
+	log.Printf("=== AVERAGES FOR THIS BATCH ===")
 	if batch.LedgerCount > 0 {
 		avgTimePerLedger := totalBatchDuration / time.Duration(batch.LedgerCount)
 		log.Printf("\tAvg time per ledger: %s", helpers.FormatDuration(avgTimePerLedger))
@@ -1350,6 +1359,8 @@ func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionC
 		log.Printf("\tAvg time per transaction: %s", helpers.FormatDuration(avgTimePerTx))
 	}
 
+	log.Printf("")
+	log.Printf("Total time elapsed so far from start: %s", helpers.FormatDuration(time.Since(startTime)))
 	log.Printf("========================================\n\n")
 }
 
