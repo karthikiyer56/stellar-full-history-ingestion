@@ -386,26 +386,36 @@ func main() {
 
 		// Compress all transactions in parallel
 		compressionStart := time.Now()
-		stats, err := compressTransactionsFromBatchInParallel(
-			batchTransactions,
-			txHashToTxData,
-			txHashToLedgerSeq,
-			config,
-		)
-		if err != nil {
-			log.Fatalf("Failed to process batch: %v", err)
+
+		if config.EnableDB3 {
+			for _, tx := range batchTransactions {
+				hash := tx.tx.Hash.HexString()
+				txHashToLedgerSeq[hash] = tx.ledgerSeq
+			}
 		}
-		compressionTime := time.Since(compressionStart)
 
-		// Update timing stats
-		totalTimingStats.DB2CompressionTime += compressionTime
-		currentBatch.BatchDb2CompressionTime = compressionTime
+		if config.EnableDB2 {
+			stats, err := compressTransactionsFromBatchInParallel(
+				batchTransactions,
+				txHashToTxData,
+				config,
+			)
+			if err != nil {
+				log.Fatalf("Failed to process batch: %v", err)
+			}
+			compressionTime := time.Since(compressionStart)
 
-		// Update compression stats
-		totalCompressionStats.UncompressedTx += stats.UncompressedTx
-		totalCompressionStats.CompressedTx += stats.CompressedTx
-		totalCompressionStats.TxCount += stats.TxCount
-		currentBatch.TxCount = int(stats.TxCount)
+			totalTimingStats.DB2CompressionTime += compressionTime
+			currentBatch.BatchDb2CompressionTime = compressionTime
+
+			// Update compression stats
+			totalCompressionStats.UncompressedTx += stats.UncompressedTx
+			totalCompressionStats.CompressedTx += stats.CompressedTx
+			totalCompressionStats.TxCount += stats.TxCount
+		}
+
+		// ignore stats.txCount here. just use raw length of batched transactions
+		currentBatch.TxCount = len(batchTransactions)
 
 		// Write batch to MDBX databases
 		dbTiming, err := writeBatchToDatabases(db2, db3, txHashToTxData, txHashToLedgerSeq, config)
@@ -991,7 +1001,6 @@ type jobData struct {
 func compressTransactionsFromBatchInParallel(
 	transactions []rawTxData,
 	txHashToTxData map[string][]byte,
-	txHashToLedgerSeq map[string]uint32,
 	config IngestionConfig,
 ) (*CompressionStats, error) {
 	stats := &CompressionStats{}
@@ -1000,7 +1009,7 @@ func compressTransactionsFromBatchInParallel(
 		return stats, nil
 	}
 
-	// Use up to 16 workers for parallel compression
+	// DB2 is enabled - do full compression work
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 16 {
 		numWorkers = 16
@@ -1009,14 +1018,12 @@ func compressTransactionsFromBatchInParallel(
 	jobs := make(chan jobData, len(transactions))
 	results := make(chan result, len(transactions))
 
-	// Start worker pool
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			// Each worker gets its own encoder for thread safety
 			var localEncoder *zstd.Encoder
 			if config.EnableApplicationCompression {
 				localEncoder, _ = zstd.NewWriter(nil)
@@ -1029,7 +1036,6 @@ func compressTransactionsFromBatchInParallel(
 					ledgerSeq: job.ledgerSeq,
 				}
 
-				// Marshal transaction components to binary
 				txEnvelopeBytes, err := job.tx.Envelope.MarshalBinary()
 				if err != nil {
 					res.err = fmt.Errorf("error marshalling tx envelope: %w", err)
@@ -1051,7 +1057,6 @@ func compressTransactionsFromBatchInParallel(
 					continue
 				}
 
-				// Create protobuf message
 				txDataProto := tx_data.TxData{
 					LedgerSequence: job.ledgerSeq,
 					ClosedAt:       timestamppb.New(job.closedAt),
@@ -1070,7 +1075,6 @@ func compressTransactionsFromBatchInParallel(
 
 				res.uncompressedSize = int64(len(txDataBytes))
 
-				// Compress if enabled
 				if config.EnableApplicationCompression {
 					res.compressedData = localEncoder.EncodeAll(txDataBytes, make([]byte, 0, len(txDataBytes)))
 					res.compressedSize = int64(len(res.compressedData))
@@ -1084,7 +1088,6 @@ func compressTransactionsFromBatchInParallel(
 		}()
 	}
 
-	// Send all jobs
 	for _, tx := range transactions {
 		jobs <- jobData{
 			tx:        tx.tx,
@@ -1094,13 +1097,11 @@ func compressTransactionsFromBatchInParallel(
 	}
 	close(jobs)
 
-	// Collect results in background
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Process results
 	for res := range results {
 		if res.err != nil {
 			return stats, res.err
@@ -1110,12 +1111,7 @@ func compressTransactionsFromBatchInParallel(
 		stats.CompressedTx += res.compressedSize
 		stats.TxCount++
 
-		if config.EnableDB2 {
-			txHashToTxData[res.hash] = res.compressedData
-		}
-		if config.EnableDB3 {
-			txHashToLedgerSeq[res.hash] = res.ledgerSeq
-		}
+		txHashToTxData[res.hash] = res.compressedData
 	}
 
 	return stats, nil
