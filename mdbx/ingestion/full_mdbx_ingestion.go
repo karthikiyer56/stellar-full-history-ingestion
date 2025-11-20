@@ -1397,6 +1397,11 @@ func logBatchCompletion(batch BatchInfo, timing DBTimingStats, config IngestionC
 
 // showCompressionStats shows compression statistics
 func showCompressionStats(config IngestionConfig, stats CompressionStats) {
+	if !config.EnableDB2 {
+		log.Printf("")
+		return
+	}
+
 	if config.EnableApplicationCompression && stats.UncompressedTx > 0 {
 		log.Printf("")
 		compressionRatio := 100 * (1 - float64(stats.CompressedTx)/float64(stats.UncompressedTx))
