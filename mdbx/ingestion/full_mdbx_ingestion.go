@@ -35,7 +35,8 @@ type IngestionConfig struct {
 	StartLedger                  uint32
 	EndLedger                    uint32
 	BatchSize                    int
-	DbPageSize                   uint
+	Db2PageSize                  uint
+	Db3PageSize                  uint
 	DB2Path                      string
 	DB3Path                      string
 	EnableDB2                    bool
@@ -137,6 +138,7 @@ type DbOpenSettings struct {
 	SizeUpper  int
 	GrowthStep int
 	PageSize   int
+	SyncType   DbSyncType
 }
 
 func (s DbOpenSettings) String() string {
@@ -151,6 +153,57 @@ func (s DbOpenSettings) String() string {
 // Just coz....
 var startTime time.Time
 
+type DbSyncType int
+
+const (
+	Default DbSyncType = iota
+	SafeNoSync
+	UtterlyNoSync
+)
+
+type dbSyncTypeFlag struct {
+	value *DbSyncType
+}
+
+func (t DbSyncType) String() string {
+	switch t {
+	case SafeNoSync:
+		return "SafeNoSync"
+	case UtterlyNoSync:
+		return "UtterlyNoSync"
+	default:
+		return "Default"
+	}
+}
+
+func (f *dbSyncTypeFlag) String() string {
+	if f == nil || f.value == nil {
+		return "default"
+	}
+	switch *f.value {
+	case SafeNoSync:
+		return "safe"
+	case UtterlyNoSync:
+		return "utterly"
+	default:
+		return "default"
+	}
+}
+
+func (f *dbSyncTypeFlag) Set(s string) error {
+	switch s {
+	case "default":
+		*f.value = Default
+	case "safe":
+		*f.value = SafeNoSync
+	case "utterly":
+		*f.value = UtterlyNoSync
+	default:
+		return fmt.Errorf("invalid sync type: %q (valid: default|safe|utterly)", s)
+	}
+	return nil
+}
+
 func main() {
 	startTime = time.Now()
 
@@ -158,22 +211,46 @@ func main() {
 	// COMMAND LINE FLAGS
 	// ================================
 	var startLedger, endLedger uint
-	var dbPagesize uint
+	var db2Pagesize, db3Pagesize uint
 	var batchSize int
 	var syncEveryNBatches int
 	var db2Path, db3Path string
 	var enableApplicationCompression bool
 	var rocksdbLcmPath string
+	var dbSyncType DbSyncType = Default
 
-	flag.UintVar(&dbPagesize, "db-pagesize", 16384, "DB Page size for new dbs. Ignored if db exists")
-	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence number")
-	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence number")
-	flag.IntVar(&batchSize, "ledger-batch-size", 5000, "Ledger batch size for commit")
-	flag.IntVar(&syncEveryNBatches, "sync-every-n-batches", 50, "Sync to disk every N batches")
-	flag.StringVar(&db2Path, "db2", "", "Path for DB2 (txHash -> compressed TxData)")
-	flag.StringVar(&db3Path, "db3", "", "Path for DB3 (txHash -> ledgerSeq)")
-	flag.BoolVar(&enableApplicationCompression, "app-compression", true, "Enable compression (default: true)")
-	flag.StringVar(&rocksdbLcmPath, "rocksdb-lcm-store", "", "Path to RocksDB store containing compressed LedgerCloseMeta")
+	flag.UintVar(&db2Pagesize, "db2-pagesize", 16384,
+		"DB Page size for DB2 ((txHash -> compressed TxData). Ignored if db exists")
+
+	flag.UintVar(&db3Pagesize, "db3-pagesize", 4096,
+		"DB Page size for DB3 ((txHash -> ledgerSequence). Ignored if db exists")
+
+	flag.UintVar(&startLedger, "start-ledger", 0,
+		"Starting ledger sequence number")
+
+	flag.UintVar(&endLedger, "end-ledger", 0,
+		"Ending ledger sequence number")
+	flag.IntVar(&batchSize, "ledger-batch-size", 5000,
+		"Ledger batch size for commit")
+
+	flag.IntVar(&syncEveryNBatches, "sync-every-n-batches", 0,
+		"Sync to disk every N batches Useful only when SafeNoSync or UtterlyNoSync are enabled")
+
+	flag.StringVar(&db2Path, "db2", "",
+		"Path for DB2 (txHash -> compressed TxData)")
+
+	flag.StringVar(&db3Path, "db3", "",
+		"Path for DB3 (txHash -> ledgerSeq)")
+
+	flag.BoolVar(&enableApplicationCompression, "app-compression", true,
+		"Enable compression (default: true)")
+
+	flag.StringVar(&rocksdbLcmPath, "rocksdb-lcm-store", "",
+		"Path to RocksDB store containing compressed LedgerCloseMeta")
+
+	flag.Var(&dbSyncTypeFlag{value: &dbSyncType}, "db-sync",
+		"Sync type for databases (default|safe|utterly)")
+
 	flag.Parse()
 
 	// ================================
@@ -193,8 +270,16 @@ func main() {
 		log.Fatal("At least one database (db2 or db3) must be specified")
 	}
 
-	if dbPagesize%(4*1024) != 0 {
-		log.Fatal("db-pagesize must be a multiple of 4kb")
+	if db2Pagesize%(4*1024) != 0 {
+		log.Fatal("db2-pagesize must be a multiple of 4kb")
+	}
+
+	if db3Pagesize%(4*1024) != 0 {
+		log.Fatal("db3-pagesize must be a multiple of 4kb")
+	}
+
+	if (dbSyncType == UtterlyNoSync || dbSyncType == SafeNoSync) && syncEveryNBatches == 0 {
+		log.Fatal("sync-every-n-batches must be specified when db Sync type is safe or utterly")
 	}
 
 	// ================================
@@ -211,7 +296,8 @@ func main() {
 		EnableApplicationCompression: enableApplicationCompression,
 		RocksDBLCMPath:               rocksdbLcmPath,
 		UseRocksDB:                   rocksdbLcmPath != "",
-		DbPageSize:                   dbPagesize,
+		Db2PageSize:                  db2Pagesize,
+		Db3PageSize:                  db3Pagesize,
 		SyncEveryNBatches:            syncEveryNBatches,
 	}
 
@@ -235,9 +321,10 @@ func main() {
 			SizeNow:    -1,
 			SizeUpper:  2 * TB,
 			GrowthStep: 200 * GB,
-			PageSize:   int(config.DbPageSize),
+			PageSize:   int(config.Db2PageSize),
+			SyncType:   dbSyncType,
 		}
-		db2, err = openMDBXDatabase(db2Path, "DB2 (txHash->TxData)", config, db2Settings)
+		db2, err = openMDBXDatabase(db2Path, "DB2 (txHash->TxData)", db2Settings)
 		if err != nil {
 			log.Fatalf("Failed to open DB2: %v", err)
 		}
@@ -251,13 +338,14 @@ func main() {
 			SizeNow:    -1,
 			SizeUpper:  200 * GB,
 			GrowthStep: 20 * GB,
-			PageSize:   int(config.DbPageSize),
+			PageSize:   int(config.Db3PageSize),
+			SyncType:   dbSyncType,
 		}
 		db3Path, err = filepath.Abs(config.DB3Path)
 		if err != nil {
 			log.Fatalf("Failed to get absolute path for db3: %v", err)
 		}
-		db3, err = openMDBXDatabase(db3Path, "DB3 (txHash->LedgerSeq)", config, db3Settings)
+		db3, err = openMDBXDatabase(db3Path, "DB3 (txHash->LedgerSeq)", db3Settings)
 		if err != nil {
 			log.Fatalf("Failed to open DB3: %v", err)
 		}
@@ -342,10 +430,13 @@ func main() {
 	log.Printf("DB2 (TxData) storage: %v", config.EnableDB2)
 	log.Printf("DB3 (Hash->Seq) storage: %v", config.EnableDB3)
 	log.Printf("Application Compression: %v", config.EnableApplicationCompression)
-	log.Printf("Page Size: %d bytes", config.DbPageSize)
+	log.Printf("Page Size for DB2: %d bytes", config.Db2PageSize)
+	log.Printf("Page Size for DB3: %d bytes", config.Db3PageSize)
 	log.Printf("Batch Size: %d ledgers", config.BatchSize)
-	log.Printf("Sync every: %d batches", config.SyncEveryNBatches)
-	log.Printf("Mode: UtterlyNoSync (maximum speed bulk ingestion)")
+	log.Printf("Sync Mode: %s", dbSyncType.String())
+	if config.SyncEveryNBatches > 0 {
+		log.Printf("Sync every: %d batches", config.SyncEveryNBatches)
+	}
 	log.Printf("========================================\n")
 
 	// ================================
@@ -433,7 +524,7 @@ func main() {
 		logBatchCompletion(currentBatch, dbTiming, config)
 
 		// Periodic sync every N batches to ensure data durability
-		if currentBatch.BatchNum%uint32(config.SyncEveryNBatches) == 0 {
+		if config.SyncEveryNBatches > 0 && currentBatch.BatchNum%uint32(config.SyncEveryNBatches) == 0 {
 			log.Printf("")
 			log.Printf("\n========================================")
 			log.Printf("🔄 Periodic sync at batch %d...", currentBatch.BatchNum)
@@ -1118,7 +1209,7 @@ func compressTransactionsFromBatchInParallel(
 }
 
 // openMDBXDatabase opens or creates an MDBX database
-func openMDBXDatabase(path string, name string, config IngestionConfig, settings DbOpenSettings) (*MDBXDatabase, error) {
+func openMDBXDatabase(path string, name string, settings DbOpenSettings) (*MDBXDatabase, error) {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -1152,9 +1243,18 @@ func openMDBXDatabase(path string, name string, config IngestionConfig, settings
 		return nil, errors.Wrap(err, "failed to set max dbs")
 	}
 
-	// Open environment with UtterlyNoSync for maximum bulk ingestion speed
-	// WARNING: Database may be corrupted on crash - only use for bulk loads
-	err = env.Open(path, mdbx.NoSubdir|mdbx.WriteMap|mdbx.UtterlyNoSync, 0644)
+	// Build flags based on sync type
+	var flags uint = mdbx.NoSubdir | mdbx.WriteMap
+	switch settings.SyncType {
+	case SafeNoSync:
+		flags |= mdbx.SafeNoSync
+	case UtterlyNoSync:
+		flags |= mdbx.UtterlyNoSync
+	case Default:
+		// No additional flags - use default sync behavior
+	}
+
+	err = env.Open(path, flags, 0644)
 	if err != nil {
 		env.Close()
 		return nil, errors.Wrap(err, "failed to open database")
@@ -1175,8 +1275,8 @@ func openMDBXDatabase(path string, name string, config IngestionConfig, settings
 	log.Printf("✓ %s opened successfully", name)
 	log.Printf("DB open settings: %s", settings)
 	log.Printf("  Path: %s", path)
-	log.Printf("  Page size: %d bytes", config.DbPageSize)
-	log.Printf("  Mode: UtterlyNoSync (maximum speed bulk ingestion)")
+	log.Printf("  Page size: %d bytes", settings.PageSize)
+	log.Printf("  Sync mode: %s", settings.SyncType.String())
 
 	return &MDBXDatabase{
 		Env:  env,

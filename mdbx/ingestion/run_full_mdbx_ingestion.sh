@@ -8,11 +8,13 @@ START_TIME="2025-10-01T00:00:00+00:00"
 END_TIME="2025-10-02T00:00:00+00:00"
 DB2_PATH=""
 DB3_PATH=""
-BATCH_SIZE=5000
+BATCH_SIZE=200
 ENABLE_APP_COMPRESSION=true
 ROCKSDB_LCM_STORE=""
-DB_PAGESIZE=16384
-SYNC_EVERY_N_BATCHES=50
+DB2_PAGESIZE=16384
+DB3_PAGESIZE=4096
+SYNC_EVERY_N_BATCHES=0
+DB_SYNC_TYPE="default"
 
 # -----------------------------
 # Usage/help function
@@ -31,11 +33,13 @@ Optional:
   --ledger-batch-size       Ledger batch size for commit (default: 5000)
   --app-compression         true/false (default: true)
   --rocksdb-lcm-store       Path to RocksDB store containing compressed LedgerCloseMeta
-  --db-pagesize             Pagesize for new DB (default: 16384)
-  --sync-every-n-batches    Sync to disk every N batches (default: 50)
+  --db2-pagesize            Page size for DB2 in bytes (default: 16384)
+  --db3-pagesize            Page size for DB3 in bytes (default: 4096)
+  --sync-every-n-batches    Sync to disk every N batches (required if db-sync is safe/utterly, default: 0)
+  --db-sync                 Sync type: default|safe|utterly (default: default)
   --help                    Show this help message and exit
 
-Example with all settings:
+Example with all settings (default sync mode):
   $0 \\
     --start-time "2024-10-01T00:00:00+00:00" \\
     --end-time "2024-12-31T23:59:59+00:00" \\
@@ -43,9 +47,19 @@ Example with all settings:
     --db3 "/mnt/data/mdbx/txhash_to_ledgerseq.mdbx" \\
     --rocksdb-lcm-store "/mnt/data/rocksdb/ledger_close_meta" \\
     --ledger-batch-size 5000 \\
-    --db-pagesize 16384 \\
-    --sync-every-n-batches 50 \\
-    --app-compression true
+    --db2-pagesize 16384 \\
+    --db3-pagesize 4096 \\
+    --app-compression true \\
+    --db-sync default
+
+Example with SafeNoSync mode:
+  $0 \\
+    --start-time "2024-10-01T00:00:00+00:00" \\
+    --end-time "2024-12-31T23:59:59+00:00" \\
+    --db2 "/mnt/data/mdbx/db2.mdbx" \\
+    --rocksdb-lcm-store "/mnt/data/rocksdb/lcm" \\
+    --db-sync safe \\
+    --sync-every-n-batches 20
 EOF
 }
 
@@ -61,8 +75,10 @@ while [[ $# -gt 0 ]]; do
     --ledger-batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --app-compression) ENABLE_APP_COMPRESSION="$2"; shift 2 ;;
     --rocksdb-lcm-store) ROCKSDB_LCM_STORE="$2"; shift 2 ;;
-    --db-pagesize) DB_PAGESIZE="$2"; shift 2 ;;
+    --db2-pagesize) DB2_PAGESIZE="$2"; shift 2 ;;
+    --db3-pagesize) DB3_PAGESIZE="$2"; shift 2 ;;
     --sync-every-n-batches) SYNC_EVERY_N_BATCHES="$2"; shift 2 ;;
+    --db-sync) DB_SYNC_TYPE="$2"; shift 2 ;;
     --help) usage; exit 0 ;;
     *)
       echo "❌ Unknown argument: $1" >&2
@@ -87,6 +103,18 @@ if [[ -z "$DB2_PATH" && -z "$DB3_PATH" ]]; then
   exit 1
 fi
 
+# Validate db-sync value
+if [[ "$DB_SYNC_TYPE" != "default" && "$DB_SYNC_TYPE" != "safe" && "$DB_SYNC_TYPE" != "utterly" ]]; then
+  echo "❌ Invalid --db-sync value: $DB_SYNC_TYPE (must be: default|safe|utterly)" >&2
+  exit 1
+fi
+
+# Validate sync-every-n-batches is set when using safe/utterly
+if [[ ("$DB_SYNC_TYPE" == "safe" || "$DB_SYNC_TYPE" == "utterly") && "$SYNC_EVERY_N_BATCHES" -eq 0 ]]; then
+  echo "❌ --sync-every-n-batches must be specified when using --db-sync safe or utterly" >&2
+  exit 1
+fi
+
 # -----------------------------
 # Temporary output file
 # -----------------------------
@@ -101,8 +129,10 @@ echo "  DB3_PATH=$DB3_PATH"
 echo "  BATCH_SIZE=$BATCH_SIZE"
 echo "  ENABLE_APP_COMPRESSION=$ENABLE_APP_COMPRESSION"
 echo "  ROCKSDB_LCM_STORE=$ROCKSDB_LCM_STORE"
-echo "  DB_PAGESIZE=$DB_PAGESIZE"
+echo "  DB2_PAGESIZE=$DB2_PAGESIZE"
+echo "  DB3_PAGESIZE=$DB3_PAGESIZE"
 echo "  SYNC_EVERY_N_BATCHES=$SYNC_EVERY_N_BATCHES"
+echo "  DB_SYNC_TYPE=$DB_SYNC_TYPE"
 echo "----------------------------------"
 
 cleanup() {
@@ -157,11 +187,13 @@ set -x
   --start-ledger "$START_LEDGER" \
   --end-ledger "$END_LEDGER" \
   --ledger-batch-size "$BATCH_SIZE" \
-  --sync-every-n-batches "$SYNC_EVERY_N_BATCHES" \
   ${DB2_PATH:+--db2 "$DB2_PATH"} \
   ${DB3_PATH:+--db3 "$DB3_PATH"} \
   ${ROCKSDB_LCM_STORE:+--rocksdb-lcm-store "$ROCKSDB_LCM_STORE"} \
-  --db-pagesize "$DB_PAGESIZE" \
+  --db2-pagesize "$DB2_PAGESIZE" \
+  --db3-pagesize "$DB3_PAGESIZE" \
+  --db-sync "$DB_SYNC_TYPE" \
+  ${SYNC_EVERY_N_BATCHES:+--sync-every-n-batches "$SYNC_EVERY_N_BATCHES"} \
   --app-compression="$ENABLE_APP_COMPRESSION"
 
 set +x
