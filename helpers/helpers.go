@@ -28,7 +28,7 @@ func FormatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dµs", d.Microseconds())
 	}
 	if d < time.Second {
-		return fmt.Sprintf("%dms", d.Milliseconds())
+		return fmt.Sprintf("%.2fms", float64(d.Microseconds())/1000.0)
 	}
 	if d < time.Minute {
 		return fmt.Sprintf("%.3fs", d.Seconds())
