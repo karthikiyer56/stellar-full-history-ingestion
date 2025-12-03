@@ -564,8 +564,8 @@ func printQueryResult(timing QueryTiming, result *QueryResult, quiet bool) {
 	if quiet {
 		// Compact output for benchmarking
 		fmt.Printf("TX: %s\n", result.TxHash)
-		fmt.Printf("Ledger: %d | TxIndex: %d | TxScanned: %d\n",
-			result.LedgerSeq, result.TxIndex, timing.TxCount)
+		fmt.Printf("Ledger: %d | ClosedAt: %v | TxIndex: %d | TxScanned: %d\n",
+			result.LedgerSeq, result.ClosedAt, result.TxIndex, timing.TxCount)
 		fmt.Printf("LCM Size: %s compressed -> %s uncompressed (%.1f%% ratio)\n",
 			helpers.FormatBytes(int64(result.CompressedLCMSize)),
 			helpers.FormatBytes(int64(result.UncompressedLCMSize)),
