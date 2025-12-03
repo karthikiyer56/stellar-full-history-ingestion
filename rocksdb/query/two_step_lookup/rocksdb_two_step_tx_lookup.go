@@ -255,6 +255,7 @@ func main() {
 	// Print DB stats
 	printDBStats(db1.DB, "DB1")
 	printDBStats(db3.DB, "DB3")
+
 	fmt.Printf("\n")
 
 	// =========================================================================
@@ -422,6 +423,7 @@ func runQuery(db1, db3 *DBHandle, decoder *zstd.Decoder, txHashHex string) (Quer
 
 	if !slice3.Exists() {
 		timing.Total = time.Since(totalStart)
+		fmt.Printf("NOT FOUND in DB3 - Query took: %s\n", helpers.FormatDuration(timing.DB3Query))
 		return timing, nil, fmt.Errorf("txHash not found in DB3: %s", txHashHex)
 	}
 
@@ -444,6 +446,7 @@ func runQuery(db1, db3 *DBHandle, decoder *zstd.Decoder, txHashHex string) (Quer
 
 	if !slice1.Exists() {
 		timing.Total = time.Since(totalStart)
+		fmt.Printf("NOT FOUND in DB1 - Query took: %s\n", helpers.FormatDuration(timing.DB1Query))
 		return timing, nil, fmt.Errorf("ledger %d not found in DB1", ledgerSeq)
 	}
 
@@ -694,4 +697,19 @@ func printFinalStats(stats RunningStats) {
 	avgTxScanned := float64(stats.TotalTxScanned) / float64(stats.QueryCount)
 	fmt.Printf("Average Transactions Scanned: %.1f\n", avgTxScanned)
 	fmt.Printf("================================================================================\n\n")
+}
+
+func printCacheStats(cache *grocksdb.Cache, dbs map[string]*grocksdb.DB) {
+	fmt.Printf("\n=== Block Cache Stats ===\n")
+	fmt.Printf("Capacity:     %s\n", helpers.FormatBytes(int64(cache.GetCapacity())))
+	fmt.Printf("Usage:        %s\n", helpers.FormatBytes(int64(cache.GetUsage())))
+	fmt.Printf("Pinned:       %s\n", helpers.FormatBytes(int64(cache.GetPinnedUsage())))
+	fmt.Printf("Fill %%:       %.1f%%\n", 100*float64(cache.GetUsage())/float64(cache.GetCapacity()))
+
+	fmt.Printf("\nPer-DB Filter Memory Estimate:\n")
+	for name, db := range dbs {
+		filterMem := db.GetProperty("rocksdb.estimate-table-readers-mem")
+		fmt.Printf("  %s: %s\n", name, formatBytes(filterMem))
+	}
+	fmt.Printf("===========================\n\n")
 }
