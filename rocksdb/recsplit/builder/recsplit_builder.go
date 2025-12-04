@@ -1,250 +1,141 @@
 package main
 
-// =============================================================================
-// recsplit_builder.go
-// =============================================================================
+// Filename: recsplit_builder.go
 //
-// PURPOSE:
-//   Builds a RecSplit Minimal Perfect Hash Function (MPHF) from an existing
-//   RocksDB DB3 database that maps txHash -> ledgerSeq.
+// Builds a RecSplit Minimal Perfect Hash Function from an existing RocksDB DB3
+// (txHash -> ledgerSeq) using Erigon's production-ready RecSplit library.
 //
-// WHAT IS RECSPLIT:
-//   RecSplit is a state-of-the-art algorithm for constructing minimal perfect
-//   hash functions. A perfect hash function maps N keys to N unique integers
-//   [0, N-1] with no collisions. "Minimal" means there are no gaps.
+// RecSplit advantages:
+//   - Native []byte key support (no truncation to uint64!)
+//   - ~1.8-2 bits per key (vs BBHash's 3-4 bits)
+//   - Production-tested in Ethereum's Erigon client
+//   - Handles large datasets that don't fit in RAM (spills to disk)
 //
-//   RecSplit achieves ~1.8-2 bits per key for the hash function itself,
-//   which is very close to the theoretical minimum of 1.44 bits/key.
+// Output: A single .idx file containing the perfect hash function
+// Values are stored in a separate .values file (simple binary array)
 //
-// HOW THIS WORKS:
-//   1. We iterate through all txHash->ledgerSeq pairs in RocksDB
-//   2. For each txHash, we call rs.AddKey(txHash, ledgerSeq)
-//      - The txHash is the key (32 bytes)
-//      - The ledgerSeq is stored as the "offset" value
-//   3. RecSplit builds a perfect hash function over the keys
-//   4. The ledgerSeq values are stored in an Elias-Fano encoded structure
-//   5. On lookup: hash(txHash) -> index -> ledgerSeq
+// For 1.5B keys:
+//   - RecSplit index: ~375 MB (1.5B × 2 bits)
+//   - Values array: ~6 GB (1.5B × 4 bytes)
+//   - Total: ~6.4 GB
 //
-// IMPORTANT: ENUMS VS OFFSETS
-//   RecSplit has two modes controlled by the `Enums` flag:
+// Usage:
+//   go run recsplit_builder.go \
+//     --db3 /path/to/rocksdb/db3 \
+//     --output /path/to/output/dir \
+//     --bucket-size 2000
 //
-//   Enums=false (default):
-//     - Offsets can be unsorted/duplicated
-//     - Each key stores its own offset value
-//     - More flexible but larger index
-//
-//   Enums=true:
-//     - Offsets MUST be monotonically increasing (sorted)
-//     - Uses enumeration: hash(key) -> enum -> offset
-//     - More compact for sorted data
-//
-//   For our use case, ledgerSeq values are NOT sorted (txHashes are sorted
-//   lexicographically in RocksDB, but their ledgerSeqs are scattered).
-//   Therefore we use Enums=false.
-//
-// EXPECTED SIZE:
-//   For 1.5B keys (1 year of Stellar transactions):
-//   - MPHF structure: ~375 MB (2 bits × 1.5B / 8)
-//   - Elias-Fano offsets: ~750 MB - 1.5 GB (depends on value distribution)
-//   - Total: ~1-2 GB
-//
-// LIBRARY:
-//   We use github.com/ledgerwatch/erigon-lib/recsplit
-//   (Note: The library has moved to github.com/erigontech/erigon/erigon-lib/recsplit
-//   but the ledgerwatch import path still works for now)
-//
-// USAGE:
-//   go build -o recsplit_builder .
-//   ./recsplit_builder --db3 /path/to/db3 --output /path/to/output
-//
-// =============================================================================
+// Example:
+//   ./recsplit_builder --db3 /data/db3/2024 --output /data/recsplit/2024
 
 import (
 	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"github.com/cespare/xxhash/v2"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"time"
 
-	// Erigon's recsplit library - the production implementation
-	// Note: erigon-lib has been merged into the main erigon repo at erigontech
-	// but the ledgerwatch import path is still published to pkg.go.dev
-	//
-	// For the latest code, see: github.com/erigontech/erigon/erigon-lib/recsplit
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/ledgerwatch/erigon-lib/recsplit"
 	newLog "github.com/ledgerwatch/log/v3"
-
-	// RocksDB Go bindings
 	"github.com/linxGnu/grocksdb"
-
-	// Your helpers package (adjust import path as needed)
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 )
-
-// =============================================================================
-// Configuration Constants
-// =============================================================================
-
-const (
-	// DefaultBucketSize controls the trade-off between index size and build time.
-	// Larger bucket = smaller index but slower construction and lookup.
-	// Typical values: 100-2000
-	// Erigon uses 2000 for their production indices.
-	DefaultBucketSize = 2000
-
-	// DefaultLeafSize is the maximum number of keys in a leaf bucket.
-	// Smaller = faster lookup but larger index.
-	// Typical values: 8-24
-	DefaultLeafSize = 8
-
-	// ProgressReportInterval is how often to print progress during iteration.
-	ProgressReportInterval = 10_000_000
-
-	// VerificationSampleSize is how many keys to verify after building.
-	VerificationSampleSize = 10000
-)
-
-// =============================================================================
-// Main Entry Point
-// =============================================================================
 
 func main() {
-	// -------------------------------------------------------------------------
-	// Parse command-line flags
-	// -------------------------------------------------------------------------
-	var (
-		db3Path    string // Path to RocksDB DB3 (txHash -> ledgerSeq)
-		outputDir  string // Output directory for the .idx file
-		tmpDir     string // Temp directory for RecSplit (can use lots of space)
-		bucketSize int    // RecSplit bucket size parameter
-		leafSize   int    // RecSplit leaf size parameter
-		noVerify   bool   // Skip verification step
-	)
+	// =========================================================================
+	// Parse flags
+	// =========================================================================
+	var db3Path, outputDir, tmpDir string
+	var bucketSize int
 
 	flag.StringVar(&db3Path, "db3", "", "Path to RocksDB DB3 (txHash -> ledgerSeq)")
-	flag.StringVar(&outputDir, "output", "", "Output directory for .idx file")
-	flag.StringVar(&tmpDir, "tmp", "", "Temp directory for RecSplit (defaults to output dir)")
-	flag.IntVar(&bucketSize, "bucket-size", DefaultBucketSize, "RecSplit bucket size (100-2000)")
-	flag.IntVar(&leafSize, "leaf-size", DefaultLeafSize, "RecSplit leaf size (8-24)")
-	flag.BoolVar(&noVerify, "no-verify", false, "Skip verification step")
+	flag.StringVar(&outputDir, "output", "", "Output directory for .idx and .values files")
+	flag.StringVar(&tmpDir, "tmp", "", "Temporary directory for RecSplit (defaults to output dir)")
+	flag.IntVar(&bucketSize, "bucket-size", 200, "RecSplit bucket size (100-2000, larger = smaller index but slower)")
 
 	flag.Parse()
 
-	// Validate required flags
 	if db3Path == "" || outputDir == "" {
-		fmt.Println("Usage: recsplit_builder --db3 <path> --output <path> [options]")
-		fmt.Println()
-		flag.PrintDefaults()
-		os.Exit(1)
+		log.Fatalf("Both --db3 and --output are required")
 	}
 
-	// Default temp directory to output directory
 	if tmpDir == "" {
 		tmpDir = outputDir
 	}
 
-	// Create output directories
+	// Create directories
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		log.Fatalf("Failed to create temp directory: %v", err)
+		log.Fatalf("Failed to create tmp directory: %v", err)
 	}
 
-	// -------------------------------------------------------------------------
+	// =========================================================================
 	// Step 1: Count keys in RocksDB
-	// -------------------------------------------------------------------------
-	// We need an exact key count for RecSplit initialization.
-	// RecSplit pre-allocates data structures based on this count.
+	// =========================================================================
 	fmt.Println("================================================================================")
-	fmt.Println("STEP 1: Counting keys in RocksDB")
+	fmt.Println("Step 1: Counting keys in RocksDB")
 	fmt.Println("================================================================================")
-	fmt.Printf("DB3 path: %s\n", db3Path)
-	fmt.Println()
 
-	keyCount, err := countKeysInRocksDB(db3Path)
+	keyCount, err := countKeys(db3Path)
 	if err != nil {
 		log.Fatalf("Failed to count keys: %v", err)
 	}
-
-	fmt.Printf("Exact key count: %s\n", helpers.FormatNumber(int64(keyCount)))
+	fmt.Printf("Key count: %s\n", helpers.FormatNumber(int64(keyCount)))
 	fmt.Println()
 
-	// -------------------------------------------------------------------------
-	// Step 2: Build RecSplit index
-	// -------------------------------------------------------------------------
+	// =========================================================================
+	// Step 2: Build RecSplit index and collect values
+	// =========================================================================
 	fmt.Println("================================================================================")
-	fmt.Println("STEP 2: Building RecSplit index")
+	fmt.Println("Step 2: Building RecSplit index")
 	fmt.Println("================================================================================")
 	fmt.Printf("Bucket size: %d\n", bucketSize)
-	fmt.Printf("Leaf size:   %d\n", leafSize)
-	fmt.Printf("Temp dir:    %s\n", tmpDir)
-	fmt.Println()
-
-	idxPath := filepath.Join(outputDir, "txhash.idx")
-	fmt.Printf("Output file: %s\n", idxPath)
-	fmt.Println()
+	fmt.Printf("Index file: %s\n", filepath.Join(outputDir, "txhash.idx"))
 
 	startBuild := time.Now()
 
-	// Initialize RecSplit with configuration
-	//
-	// RecSplitArgs explanation:
-	// - KeyCount: Number of keys (must be exact)
-	// - BucketSize: Keys per bucket during construction (affects size/speed)
-	// - IndexFile: Output file path
-	// - TmpDir: Temp directory for spilling to disk
-	// - LeafSize: Max keys in a leaf (affects lookup speed)
-	// - Enums: If true, offsets must be sorted (we use false)
-	// - Salt: Random seed for hash function (for security against DOS)
-	// - StartSeed: Seeds for each recursion level
-	//
+	// Create RecSplit
 	logger := newLog.New()
 	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
 		KeyCount:   keyCount,
 		BucketSize: bucketSize,
-		IndexFile:  idxPath,
+		IndexFile:  filepath.Join(outputDir, "txhash.idx"),
 		TmpDir:     tmpDir,
-		LeafSize:   uint16(leafSize),
-		Enums:      false, // IMPORTANT: false because ledgerSeqs are NOT sorted
-		// Salt and StartSeed left as defaults - RecSplit generates random values
+		LeafSize:   8,
+		Enums:      true, // We store offsets directly, not enumerations
 	}, logger)
 	if err != nil {
 		log.Fatalf("Failed to create RecSplit: %v", err)
 	}
 
-	// Iterate through RocksDB and add each key-value pair
-	//
-	// IMPORTANT: We store ledgerSeq directly as the "offset" value.
-	// RecSplit will compress these using Elias-Fano encoding.
-	// Since ledgerSeqs cluster by time, this compresses well.
-	fmt.Println("Adding keys from RocksDB...")
-	fmt.Println()
+	// Collect values while adding keys
+	values := make([]uint32, 0, keyCount)
 
-	keysAdded := 0
-	err = iterateRocksDB(db3Path, func(txHash []byte, ledgerSeq uint32) error {
-		// Add key to RecSplit
-		// - txHash: the 32-byte transaction hash (the key)
-		// - ledgerSeq: the ledger sequence number (stored as offset)
-		//
-		// RecSplit internally:
-		// 1. Hashes txHash to determine its bucket
-		// 2. During Build(), creates a perfect hash function
-		// 3. Stores ledgerSeq in an Elias-Fano structure indexed by the hash
-		if err := rs.AddKey(txHash, uint64(ledgerSeq)); err != nil {
-			return fmt.Errorf("failed to add key %d: %v", keysAdded, err)
+	err = iterateRocksDB(db3Path, func(txHash []byte, ledgerSeq uint32, index int) error {
+		// Add key to RecSplit with index as the "offset"
+		// The index will be used to look up the value in our values array
+
+		// Hash the key for proper entropy and bucket uniformity
+		h := xxhash.Sum64(txHash)
+		var keyBytes [8]byte
+		binary.BigEndian.PutUint64(keyBytes[:], h)
+		if err := rs.AddKey(txHash, uint64(index)); err != nil {
+			return fmt.Errorf("failed to add key %d: %v", index, err)
 		}
 
-		keysAdded++
+		// Collect value
+		values = append(values, ledgerSeq)
 
-		// Progress reporting
-		if keysAdded%ProgressReportInterval == 0 {
-			fmt.Printf("  Added %s keys...\n", helpers.FormatNumber(int64(keysAdded)))
-			printMemoryStats()
+		if index > 0 && index%10_000_000 == 0 {
+			fmt.Printf("  Added %s keys...\n", helpers.FormatNumber(int64(index)))
+			printMemStats()
 		}
 
 		return nil
@@ -253,92 +144,126 @@ func main() {
 		log.Fatalf("Failed to iterate RocksDB: %v", err)
 	}
 
-	fmt.Printf("Added all %s keys\n", helpers.FormatNumber(int64(keysAdded)))
-	printMemoryStats()
-	fmt.Println()
+	fmt.Printf("Added all %s keys\n", helpers.FormatNumber(int64(len(values))))
+	printMemStats()
 
-	// Build the perfect hash function
-	//
-	// This is the expensive step. RecSplit:
-	// 1. Sorts keys into buckets
-	// 2. For each bucket, recursively splits until leaves are small
-	// 3. Finds hash seeds that create perfect bijection at each level
-	// 4. Encodes the seeds using Golomb-Rice coding
-	// 5. Encodes offsets using Elias-Fano
-	fmt.Println("Building perfect hash function (this may take a while)...")
-
+	// Build the index
+	fmt.Println("Building perfect hash function...")
 	ctx := context.Background()
 	if err := rs.Build(ctx); err != nil {
 		log.Fatalf("Failed to build RecSplit: %v", err)
 	}
 
-	// Check for hash collisions during key->uint64 mapping
-	//
-	// RecSplit internally hashes []byte keys to uint64 for processing.
-	// With 1.5B keys, collision probability is low but not zero.
-	// If collision detected, try different salt.
+	// Check for collisions
 	if rs.Collision() {
-		log.Fatalf("Collision detected! Keys hash to same uint64. Try different salt.")
+		log.Fatalf("Collision detected! Try increasing bucket size or using different salt")
 	}
 
 	buildDuration := time.Since(startBuild)
+	fmt.Printf("RecSplit build completed in %s\n", helpers.FormatDuration(buildDuration))
 
-	// Get index file statistics
-	idxInfo, err := os.Stat(idxPath)
+	// Get index file size
+	idxInfo, _ := os.Stat(filepath.Join(outputDir, "txhash.idx"))
+	fmt.Printf("Index file size: %s\n", helpers.FormatBytes(idxInfo.Size()))
+	fmt.Printf("Bits per key: %.2f\n", float64(idxInfo.Size()*8)/float64(keyCount))
+	fmt.Println()
+
+	// =========================================================================
+	// Step 3: Write values array
+	// =========================================================================
+	fmt.Println("================================================================================")
+	fmt.Println("Step 3: Writing values array")
+	fmt.Println("================================================================================")
+
+	valuesPath := filepath.Join(outputDir, "values.bin")
+	startWriteValues := time.Now()
+
+	valuesFile, err := os.Create(valuesPath)
 	if err != nil {
-		log.Fatalf("Failed to stat index file: %v", err)
+		log.Fatalf("Failed to create values file: %v", err)
 	}
 
-	bitsPerKey := float64(idxInfo.Size()*8) / float64(keyCount)
+	// Write header: number of entries (8 bytes)
+	header := make([]byte, 8)
+	binary.LittleEndian.PutUint64(header, uint64(len(values)))
+	if _, err := valuesFile.Write(header); err != nil {
+		valuesFile.Close()
+		log.Fatalf("Failed to write header: %v", err)
+	}
 
-	fmt.Println()
-	fmt.Printf("RecSplit build completed!\n")
-	fmt.Printf("  Build time:    %s\n", helpers.FormatDuration(buildDuration))
-	fmt.Printf("  Index size:    %s\n", helpers.FormatBytes(idxInfo.Size()))
-	fmt.Printf("  Bits per key:  %.2f\n", bitsPerKey)
-	fmt.Println()
+	// Write values as binary (4 bytes each, little-endian)
+	buf := make([]byte, 4*1024*1024) // 4 MB buffer
+	bufIdx := 0
 
-	// -------------------------------------------------------------------------
-	// Step 3: Verification
-	// -------------------------------------------------------------------------
-	if !noVerify {
-		fmt.Println("================================================================================")
-		fmt.Println("STEP 3: Verification")
-		fmt.Println("================================================================================")
+	for _, v := range values {
+		binary.LittleEndian.PutUint32(buf[bufIdx:], v)
+		bufIdx += 4
 
-		verified, failed := verifyRecSplitIndex(idxPath, db3Path, VerificationSampleSize)
-
-		fmt.Printf("Verified: %d / %d\n", verified, verified+failed)
-		if failed > 0 {
-			log.Printf("WARNING: %d verifications failed!", failed)
+		if bufIdx >= len(buf) {
+			if _, err := valuesFile.Write(buf); err != nil {
+				valuesFile.Close()
+				log.Fatalf("Failed to write values: %v", err)
+			}
+			bufIdx = 0
 		}
-		fmt.Println()
 	}
 
-	// -------------------------------------------------------------------------
+	// Write remaining
+	if bufIdx > 0 {
+		if _, err := valuesFile.Write(buf[:bufIdx]); err != nil {
+			valuesFile.Close()
+			log.Fatalf("Failed to write remaining values: %v", err)
+		}
+	}
+	valuesFile.Close()
+
+	valuesInfo, _ := os.Stat(valuesPath)
+	writeValuesDuration := time.Since(startWriteValues)
+
+	fmt.Printf("Wrote values to %s\n", valuesPath)
+	fmt.Printf("Values file size: %s\n", helpers.FormatBytes(valuesInfo.Size()))
+	fmt.Printf("Write time: %s\n", helpers.FormatDuration(writeValuesDuration))
+	fmt.Println()
+
+	// Free values memory
+	values = nil
+	runtime.GC()
+
+	// =========================================================================
+	// Step 4: Verification
+	// =========================================================================
+	fmt.Println("================================================================================")
+	fmt.Println("Step 4: Verification")
+	fmt.Println("================================================================================")
+
+	verified, failed := verifyRecSplit(outputDir, db3Path, 10000)
+	fmt.Printf("Verified: %d, Failed: %d\n", verified, failed)
+
+	if failed > 0 {
+		log.Printf("WARNING: %d verifications failed!", failed)
+	}
+	fmt.Println()
+
+	// =========================================================================
 	// Summary
-	// -------------------------------------------------------------------------
+	// =========================================================================
 	fmt.Println("================================================================================")
 	fmt.Println("BUILD COMPLETE")
 	fmt.Println("================================================================================")
-	fmt.Printf("Index file:   %s\n", idxPath)
-	fmt.Printf("Index size:   %s\n", helpers.FormatBytes(idxInfo.Size()))
-	fmt.Printf("Key count:    %s\n", helpers.FormatNumber(int64(keyCount)))
-	fmt.Printf("Bits per key: %.2f\n", bitsPerKey)
-	fmt.Printf("Build time:   %s\n", helpers.FormatDuration(buildDuration))
+	fmt.Printf("Index file:    %s (%s)\n", filepath.Join(outputDir, "txhash.idx"), helpers.FormatBytes(idxInfo.Size()))
+	fmt.Printf("Values file:   %s (%s)\n", valuesPath, helpers.FormatBytes(valuesInfo.Size()))
+	fmt.Printf("Total size:    %s\n", helpers.FormatBytes(idxInfo.Size()+valuesInfo.Size()))
+	fmt.Printf("Bits per key:  %.2f\n", float64(idxInfo.Size()*8)/float64(keyCount))
 	fmt.Println()
-	fmt.Println("Use recsplit_lookup to query transactions by hash.")
+	fmt.Printf("Build time:    %s\n", helpers.FormatDuration(buildDuration))
+	fmt.Printf("Total time:    %s\n", helpers.FormatDuration(time.Since(startBuild)))
+	fmt.Println()
+	fmt.Println("You can now use recsplit_two_step_lookup.go for O(1) lookups!")
 	fmt.Println("================================================================================")
 }
 
-// =============================================================================
-// RocksDB Functions
-// =============================================================================
-
-// countKeysInRocksDB counts the exact number of keys in the database.
-// We need this for RecSplit initialization.
-func countKeysInRocksDB(dbPath string) (int, error) {
-	// Open RocksDB in read-only mode
+// countKeys counts the number of keys in RocksDB
+func countKeys(dbPath string) (int, error) {
 	opts := grocksdb.NewDefaultOptions()
 	defer opts.Destroy()
 
@@ -348,14 +273,13 @@ func countKeysInRocksDB(dbPath string) (int, error) {
 	}
 	defer db.Close()
 
-	// First, get the estimate (fast but approximate)
+	// Try to get estimate first
 	estKeys := db.GetProperty("rocksdb.estimate-num-keys")
 	var estCount int64
 	fmt.Sscanf(estKeys, "%d", &estCount)
-	fmt.Printf("Estimated keys (from RocksDB property): %s\n", helpers.FormatNumber(estCount))
+	fmt.Printf("Estimated keys: %s\n", helpers.FormatNumber(estCount))
 
-	// Now count exactly by iterating
-	// This is slower but necessary for RecSplit
+	// Count exactly
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -367,8 +291,6 @@ func countKeysInRocksDB(dbPath string) (int, error) {
 
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		count++
-
-		// Progress reporting every 5 seconds
 		if time.Since(lastReport) > 5*time.Second {
 			fmt.Printf("  Counting: %s keys...\n", helpers.FormatNumber(int64(count)))
 			lastReport = time.Now()
@@ -382,9 +304,8 @@ func countKeysInRocksDB(dbPath string) (int, error) {
 	return count, nil
 }
 
-// iterateRocksDB iterates through all key-value pairs and calls the callback.
-// Keys are 32-byte txHashes, values are 4-byte big-endian ledgerSeqs.
-func iterateRocksDB(dbPath string, callback func(txHash []byte, ledgerSeq uint32) error) error {
+// iterateRocksDB iterates through all key-value pairs and calls the callback
+func iterateRocksDB(dbPath string, callback func(txHash []byte, ledgerSeq uint32, index int) error) error {
 	opts := grocksdb.NewDefaultOptions()
 	defer opts.Destroy()
 
@@ -400,26 +321,27 @@ func iterateRocksDB(dbPath string, callback func(txHash []byte, ledgerSeq uint32
 	iter := db.NewIterator(ro)
 	defer iter.Close()
 
+	index := 0
+
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		keySlice := iter.Key()
 		valueSlice := iter.Value()
 
 		// Copy key (32-byte txHash)
-		// We must copy because the slice is only valid until next iteration
 		txHash := make([]byte, len(keySlice.Data()))
 		copy(txHash, keySlice.Data())
 
 		// Parse value (4-byte big-endian ledger sequence)
 		ledgerSeq := binary.BigEndian.Uint32(valueSlice.Data())
 
-		// Free the slices (required by grocksdb)
 		keySlice.Free()
 		valueSlice.Free()
 
-		// Call the callback
-		if err := callback(txHash, ledgerSeq); err != nil {
+		if err := callback(txHash, ledgerSeq, index); err != nil {
 			return err
 		}
+
+		index++
 	}
 
 	if err := iter.Err(); err != nil {
@@ -429,20 +351,30 @@ func iterateRocksDB(dbPath string, callback func(txHash []byte, ledgerSeq uint32
 	return nil
 }
 
-// =============================================================================
-// Verification
-// =============================================================================
-
-// verifyRecSplitIndex verifies a sample of lookups against the original RocksDB.
-// Returns (verified count, failed count).
-func verifyRecSplitIndex(idxPath, db3Path string, sampleSize int) (int, int) {
+// verifyRecSplit verifies a sample of lookups against the original RocksDB
+func verifyRecSplit(outputDir, db3Path string, sampleSize int) (int, int) {
 	// Open RecSplit index
-	idx, err := recsplit.OpenIndex(idxPath)
+	idx, err := recsplit.OpenIndex(filepath.Join(outputDir, "txhash.idx"))
 	if err != nil {
 		log.Printf("Failed to open RecSplit index: %v", err)
 		return 0, 0
 	}
 	defer idx.Close()
+
+	// Load values
+	valuesPath := filepath.Join(outputDir, "values.bin")
+	valuesFile, err := os.Open(valuesPath)
+	if err != nil {
+		log.Printf("Failed to open values file: %v", err)
+		return 0, 0
+	}
+	defer valuesFile.Close()
+
+	var numEntries uint64
+	binary.Read(valuesFile, binary.LittleEndian, &numEntries)
+
+	values := make([]uint32, numEntries)
+	binary.Read(valuesFile, binary.LittleEndian, values)
 
 	// Create reader for thread-safe lookups
 	reader := recsplit.NewIndexReader(idx)
@@ -473,7 +405,7 @@ func verifyRecSplitIndex(idxPath, db3Path string, sampleSize int) (int, int) {
 		keySlice := iter.Key()
 		valueSlice := iter.Value()
 
-		// Get expected ledgerSeq from RocksDB
+		// Get expected value from RocksDB
 		expectedLedgerSeq := binary.BigEndian.Uint32(valueSlice.Data())
 
 		// Copy key
@@ -484,16 +416,24 @@ func verifyRecSplitIndex(idxPath, db3Path string, sampleSize int) (int, int) {
 		valueSlice.Free()
 
 		// Lookup via RecSplit
-		// Lookup() returns the offset we stored, which is the ledgerSeq
-		actualLedgerSeq := reader.Lookup(txHash)
+		idx := reader.Lookup(txHash)
+		if idx >= uint64(len(values)) {
+			failed++
+			if failed <= 5 {
+				fmt.Printf("  Index out of range at %d: %d >= %d\n", checked, idx, len(values))
+			}
+			checked++
+			continue
+		}
 
-		if uint32(actualLedgerSeq) == expectedLedgerSeq {
+		actualLedgerSeq := values[idx]
+		if actualLedgerSeq == expectedLedgerSeq {
 			verified++
 		} else {
 			failed++
 			if failed <= 5 {
-				fmt.Printf("  MISMATCH at %d: expected ledgerSeq=%d, got=%d\n",
-					checked, expectedLedgerSeq, actualLedgerSeq)
+				fmt.Printf("  Mismatch at %d: expected %d, got %d (idx=%d)\n",
+					checked, expectedLedgerSeq, actualLedgerSeq, idx)
 			}
 		}
 
@@ -503,15 +443,11 @@ func verifyRecSplitIndex(idxPath, db3Path string, sampleSize int) (int, int) {
 	return verified, failed
 }
 
-// =============================================================================
-// Utility Functions
-// =============================================================================
-
-// printMemoryStats prints current memory usage for monitoring.
-func printMemoryStats() {
+// printMemStats prints current memory usage
+func printMemStats() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	fmt.Printf("  Memory: Alloc=%s, Sys=%s, HeapInuse=%s\n",
+	fmt.Printf("Memory: Alloc=%s, Sys=%s, HeapInuse=%s\n",
 		helpers.FormatBytes(int64(m.Alloc)),
 		helpers.FormatBytes(int64(m.Sys)),
 		helpers.FormatBytes(int64(m.HeapInuse)))
