@@ -109,7 +109,7 @@ func main() {
 		IndexFile:  filepath.Join(outputDir, "txhash.idx"),
 		TmpDir:     tmpDir,
 		LeafSize:   8,
-		Enums:      false, // We store offsets directly, not enumerations
+		Enums:      true, // We store offsets directly, not enumerations
 	}, logger)
 	if err != nil {
 		log.Fatalf("Failed to create RecSplit: %v", err)

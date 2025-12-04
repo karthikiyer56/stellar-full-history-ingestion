@@ -559,6 +559,7 @@ func main() {
 	// ================================
 	processedLedgerCount := 0
 	skippedLedgerCount := 0
+	processedTxCount := 0
 	lastReportedPercent := -1
 
 	var totalTimingStats DBTimingStats
@@ -719,6 +720,7 @@ func main() {
 		currentBatch.BatchGetLedgerTime = 0
 		currentBatch.LedgerCount = 0
 		currentBatch.BatchRocksDBTimingStats = RocksDBTimingStats{}
+		processedTxCount += currentBatch.TxCount
 	}
 
 	// ================================
@@ -962,7 +964,7 @@ func main() {
 	if skippedLedgerCount > 0 {
 		log.Printf("Total ledgers skipped: %s", helpers.FormatNumber(int64(skippedLedgerCount)))
 	}
-	log.Printf("Total transactions: %s", helpers.FormatNumber(totalCompressionStats.TxCount))
+	log.Printf("Total transactions: %s", helpers.FormatNumber(int64(processedTxCount)))
 	log.Printf("Total time: %s", helpers.FormatDuration(elapsed))
 	log.Printf("Average speed: %.2f ledgers/sec", float64(processedLedgerCount)/elapsed.Seconds())
 	log.Printf("")
