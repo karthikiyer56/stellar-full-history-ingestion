@@ -33,8 +33,8 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"github.com/cespare/xxhash/v2"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,7 +56,7 @@ func main() {
 	flag.StringVar(&db3Path, "db3", "", "Path to RocksDB DB3 (txHash -> ledgerSeq)")
 	flag.StringVar(&outputDir, "output", "", "Output directory for .idx and .values files")
 	flag.StringVar(&tmpDir, "tmp", "", "Temporary directory for RecSplit (defaults to output dir)")
-	flag.IntVar(&bucketSize, "bucket-size", 200, "RecSplit bucket size (100-2000, larger = smaller index but slower)")
+	flag.IntVar(&bucketSize, "bucket-size", 128, "RecSplit bucket size (100-2000, larger = smaller index but slower)")
 
 	flag.Parse()
 
@@ -109,29 +109,37 @@ func main() {
 		IndexFile:  filepath.Join(outputDir, "txhash.idx"),
 		TmpDir:     tmpDir,
 		LeafSize:   8,
-		Enums:      true, // We store offsets directly, not enumerations
+		Enums:      false,
 	}, logger)
 	if err != nil {
 		log.Fatalf("Failed to create RecSplit: %v", err)
 	}
 
-	// Collect values while adding keys
-	values := make([]uint32, 0, keyCount)
+	values := make([]uint32, keyCount)
+
+	offsets := make([]uint64, keyCount)
+	for i := 0; i < keyCount; i++ {
+		offsets[i] = uint64(i)
+	}
+
+	// Shuffle offsets in a deterministic pseudo-random way
+	randSrc := rand.NewSource(42) // fixed seed for reproducibility
+	r := rand.New(randSrc)
+	for i := len(offsets) - 1; i > 0; i-- {
+		j := r.Intn(i + 1)
+		offsets[i], offsets[j] = offsets[j], offsets[i]
+	}
 
 	err = iterateRocksDB(db3Path, func(txHash []byte, ledgerSeq uint32, index int) error {
-		// Add key to RecSplit with index as the "offset"
-		// The index will be used to look up the value in our values array
-
+		shuffledIndex := offsets[index] // shuffled offset
+		values[shuffledIndex] = ledgerSeq
 		// Hash the key for proper entropy and bucket uniformity
-		h := xxhash.Sum64(txHash)
-		var keyBytes [8]byte
-		binary.BigEndian.PutUint64(keyBytes[:], h)
-		if err := rs.AddKey(txHash, uint64(index)); err != nil {
+		if err := rs.AddKey(txHash, shuffledIndex); err != nil {
 			return fmt.Errorf("failed to add key %d: %v", index, err)
 		}
 
 		// Collect value
-		values = append(values, ledgerSeq)
+		//values = append(values, ledgerSeq)
 
 		if index > 0 && index%10_000_000 == 0 {
 			fmt.Printf("  Added %s keys...\n", helpers.FormatNumber(int64(index)))
