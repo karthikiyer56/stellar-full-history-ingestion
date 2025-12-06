@@ -5,6 +5,7 @@ go 1.24.3
 toolchain go1.24.8
 
 require (
+	github.com/BurntSushi/toml v1.3.2
 	github.com/erigontech/mdbx-go v0.38.2
 	github.com/klauspost/compress v1.17.6
 	github.com/ledgerwatch/erigon-lib v1.0.0
