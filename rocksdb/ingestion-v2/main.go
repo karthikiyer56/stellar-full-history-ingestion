@@ -364,7 +364,7 @@ func processRocksDBSource(
 		currentBatch.TransactionCount = txCountInBatch
 
 		// Process and write batch
-		processBatchData(config, stores, globalStats, currentBatch, lcms, transactions, numWorkers, totalBatches)
+		processBatchData(config, stores, globalStats, currentBatch, lcms, transactions, numWorkers, totalBatches, globalStats.StartTime)
 
 		// Log progress
 		LogProgress(globalStats, totalLedgers, chunkEnd, lastReportedPercent)
@@ -465,7 +465,7 @@ func processGCSSource(
 			currentBatch.EndLedger = ledgerSeq
 
 			// Process and write batch
-			processBatchData(config, stores, globalStats, currentBatch, lcms, transactions, numWorkers, totalBatches)
+			processBatchData(config, stores, globalStats, currentBatch, lcms, transactions, numWorkers, totalBatches, globalStats.StartTime)
 
 			// Log progress
 			LogProgress(globalStats, totalLedgers, ledgerSeq, lastReportedPercent)
@@ -498,6 +498,7 @@ func processBatchData(
 	transactions []RawTxData,
 	numWorkers int,
 	totalBatches uint32,
+	globalStartTime time.Time,
 ) {
 	// Process batch (compress LCMs and transactions)
 	processResult, err := ProcessBatch(config, lcms, transactions, numWorkers)
@@ -542,7 +543,7 @@ func processBatchData(
 	globalStats.AddBatchStats(batch)
 
 	// Log batch summary
-	LogBatchSummary(batch, config, totalBatches)
+	LogBatchSummary(batch, config, totalBatches, globalStartTime)
 }
 
 // resetBatchStats resets batch statistics for the next batch.

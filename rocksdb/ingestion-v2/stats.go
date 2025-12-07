@@ -198,8 +198,9 @@ func (g *GlobalStats) AddSkippedLedgers(count int) {
 // =============================================================================
 
 // LogBatchSummary logs a detailed summary for a single batch.
-func LogBatchSummary(batch *BatchStats, config *IngestionConfig, totalBatches uint32) {
+func LogBatchSummary(batch *BatchStats, config *IngestionConfig, totalBatches uint32, globalStartTime time.Time) {
 	totalBatchDuration := time.Since(batch.StartTime)
+	totalElapsed := time.Since(globalStartTime)
 
 	log.Printf("")
 	log.Printf("================================================================================")
@@ -212,7 +213,8 @@ func LogBatchSummary(batch *BatchStats, config *IngestionConfig, totalBatches ui
 	log.Printf("  Ledger Range:        %d - %d", batch.StartLedger, batch.EndLedger)
 	log.Printf("  Ledgers Processed:   %d", batch.LedgerCount)
 	log.Printf("  Transactions:        %s", helpers.FormatNumber(int64(batch.TransactionCount)))
-	log.Printf("  Total Batch Time:    %s", helpers.FormatDuration(totalBatchDuration))
+	log.Printf("  Batch Time:          %s", helpers.FormatDuration(totalBatchDuration))
+	log.Printf("  Total Elapsed:       %s", helpers.FormatDuration(totalElapsed))
 	log.Printf("")
 
 	// Output paths (always show for each batch)
@@ -464,30 +466,57 @@ func LogExtendedStats(
 	log.Printf("")
 
 	var totalRaw, totalCompressed, totalDisk int64
+	var lcmDisk, txDataDisk, hashSeqDisk int64
+
 	totalRaw = global.LcmStats.UncompressedBytes + global.TxDataStats.UncompressedBytes + global.HashSeqStats.ExpectedBytes
 	totalCompressed = global.LcmStats.CompressedBytes + global.TxDataStats.CompressedBytes + global.HashSeqStats.ExpectedBytes
 
 	if config.EnableLedgerSeqToLcm && lcmDB != nil {
-		totalDisk += getRocksDBSSTSize(lcmDB)
+		lcmDisk = getRocksDBSSTSize(lcmDB)
+		totalDisk += lcmDisk
 	}
 	if config.EnableTxHashToTxData && txDataDB != nil {
-		totalDisk += getRocksDBSSTSize(txDataDB)
+		txDataDisk = getRocksDBSSTSize(txDataDB)
+		totalDisk += txDataDisk
 	}
 	if config.EnableTxHashToLedgerSeq && hashSeqDB != nil {
-		totalDisk += getRocksDBSSTSize(hashSeqDB)
+		hashSeqDisk = getRocksDBSSTSize(hashSeqDB)
+		totalDisk += hashSeqDisk
 	}
 
-	log.Printf("  Total Raw Data:      %s", helpers.FormatBytes(totalRaw))
-	log.Printf("  Total Compressed:    %s", helpers.FormatBytes(totalCompressed))
-	log.Printf("  Total Disk Usage:    %s", helpers.FormatBytes(totalDisk))
+	// Show per-store breakdown
+	log.Printf("  Per-Store Breakdown:")
+	if config.EnableLedgerSeqToLcm {
+		log.Printf("    ledger_seq_to_lcm:     %s → %s → %s",
+			helpers.FormatBytes(global.LcmStats.UncompressedBytes),
+			helpers.FormatBytes(global.LcmStats.CompressedBytes),
+			helpers.FormatBytes(lcmDisk))
+	}
+	if config.EnableTxHashToTxData {
+		log.Printf("    tx_hash_to_tx_data:    %s → %s → %s",
+			helpers.FormatBytes(global.TxDataStats.UncompressedBytes),
+			helpers.FormatBytes(global.TxDataStats.CompressedBytes),
+			helpers.FormatBytes(txDataDisk))
+	}
+	if config.EnableTxHashToLedgerSeq {
+		log.Printf("    tx_hash_to_ledger_seq: %s (raw) → %s (disk)",
+			helpers.FormatBytes(global.HashSeqStats.ExpectedBytes),
+			helpers.FormatBytes(hashSeqDisk))
+	}
+	log.Printf("")
 
-	if totalCompressed > 0 {
+	log.Printf("  Total:  %s (raw) → %s (compressed) → %s (disk)",
+		helpers.FormatBytes(totalRaw),
+		helpers.FormatBytes(totalCompressed),
+		helpers.FormatBytes(totalDisk))
+
+	if totalCompressed > 0 && totalDisk > 0 {
 		overallOverhead := float64(totalDisk-totalCompressed) / float64(totalCompressed) * 100
-		log.Printf("  Overall Overhead:    %.2f%% over compressed", overallOverhead)
+		log.Printf("  Overhead: %.2f%% over compressed data", overallOverhead)
 	}
-	if totalRaw > 0 {
+	if totalRaw > 0 && totalDisk > 0 {
 		effectiveCompression := 100.0 * (1.0 - float64(totalDisk)/float64(totalRaw))
-		log.Printf("  Effective Savings:   %.2f%% (raw → disk)", effectiveCompression)
+		log.Printf("  Savings:  %.2f%% (raw → disk)", effectiveCompression)
 	}
 	log.Printf("")
 
@@ -524,15 +553,32 @@ func LogExtendedStats(
 		helpers.FormatDuration(global.Timing.GetLedgerTime),
 		100*global.Timing.GetLedgerTime.Seconds()/elapsed.Seconds())
 
-	totalCompression := global.Timing.LcmCompressionTime + global.Timing.TxDataCompressionTime
+	// Compression breakdown by store
+	totalCompTime := global.Timing.LcmCompressionTime + global.Timing.TxDataCompressionTime
 	log.Printf("  Compression:         %s (%.1f%%)",
-		helpers.FormatDuration(totalCompression),
-		100*totalCompression.Seconds()/elapsed.Seconds())
+		helpers.FormatDuration(totalCompTime),
+		100*totalCompTime.Seconds()/elapsed.Seconds())
+	if config.EnableLedgerSeqToLcm && global.Timing.LcmCompressionTime > 0 {
+		log.Printf("    └─ ledger_seq_to_lcm:     %s", helpers.FormatDuration(global.Timing.LcmCompressionTime))
+	}
+	if config.EnableTxHashToTxData && global.Timing.TxDataCompressionTime > 0 {
+		log.Printf("    └─ tx_hash_to_tx_data:    %s", helpers.FormatDuration(global.Timing.TxDataCompressionTime))
+	}
 
+	// RocksDB Write breakdown by store
 	totalWrite := global.Timing.LcmWriteTime + global.Timing.TxDataWriteTime + global.Timing.HashSeqWriteTime
 	log.Printf("  RocksDB Write:       %s (%.1f%%)",
 		helpers.FormatDuration(totalWrite),
 		100*totalWrite.Seconds()/elapsed.Seconds())
+	if config.EnableLedgerSeqToLcm && global.Timing.LcmWriteTime > 0 {
+		log.Printf("    └─ ledger_seq_to_lcm:     %s", helpers.FormatDuration(global.Timing.LcmWriteTime))
+	}
+	if config.EnableTxHashToTxData && global.Timing.TxDataWriteTime > 0 {
+		log.Printf("    └─ tx_hash_to_tx_data:    %s", helpers.FormatDuration(global.Timing.TxDataWriteTime))
+	}
+	if config.EnableTxHashToLedgerSeq && global.Timing.HashSeqWriteTime > 0 {
+		log.Printf("    └─ tx_hash_to_ledger_seq: %s", helpers.FormatDuration(global.Timing.HashSeqWriteTime))
+	}
 
 	if config.TxHashToLedgerSeq.RawDataFilePath != "" {
 		log.Printf("  Raw File Write:      %s (%.1f%%)",
@@ -804,30 +850,57 @@ func LogFinalSummary(
 	log.Printf("")
 
 	var totalRaw, totalCompressed, totalDisk int64
+	var lcmDisk, txDataDisk, hashSeqDisk int64
+
 	totalRaw = global.LcmStats.UncompressedBytes + global.TxDataStats.UncompressedBytes + global.HashSeqStats.ExpectedBytes
 	totalCompressed = global.LcmStats.CompressedBytes + global.TxDataStats.CompressedBytes + global.HashSeqStats.ExpectedBytes
 
 	if config.EnableLedgerSeqToLcm && lcmDB != nil {
-		totalDisk += getRocksDBSSTSize(lcmDB)
+		lcmDisk = getRocksDBSSTSize(lcmDB)
+		totalDisk += lcmDisk
 	}
 	if config.EnableTxHashToTxData && txDataDB != nil {
-		totalDisk += getRocksDBSSTSize(txDataDB)
+		txDataDisk = getRocksDBSSTSize(txDataDB)
+		totalDisk += txDataDisk
 	}
 	if config.EnableTxHashToLedgerSeq && hashSeqDB != nil {
-		totalDisk += getRocksDBSSTSize(hashSeqDB)
+		hashSeqDisk = getRocksDBSSTSize(hashSeqDB)
+		totalDisk += hashSeqDisk
 	}
 
-	log.Printf("  Total Raw Data:              %s", helpers.FormatBytes(totalRaw))
-	log.Printf("  Total After Compression:     %s", helpers.FormatBytes(totalCompressed))
-	log.Printf("  Total Disk Usage:            %s", helpers.FormatBytes(totalDisk))
+	// Show per-store breakdown
+	log.Printf("  Per-Store Breakdown:")
+	if config.EnableLedgerSeqToLcm {
+		log.Printf("    ledger_seq_to_lcm:     %s → %s → %s",
+			helpers.FormatBytes(global.LcmStats.UncompressedBytes),
+			helpers.FormatBytes(global.LcmStats.CompressedBytes),
+			helpers.FormatBytes(lcmDisk))
+	}
+	if config.EnableTxHashToTxData {
+		log.Printf("    tx_hash_to_tx_data:    %s → %s → %s",
+			helpers.FormatBytes(global.TxDataStats.UncompressedBytes),
+			helpers.FormatBytes(global.TxDataStats.CompressedBytes),
+			helpers.FormatBytes(txDataDisk))
+	}
+	if config.EnableTxHashToLedgerSeq {
+		log.Printf("    tx_hash_to_ledger_seq: %s (raw) → %s (disk)",
+			helpers.FormatBytes(global.HashSeqStats.ExpectedBytes),
+			helpers.FormatBytes(hashSeqDisk))
+	}
+	log.Printf("")
+
+	log.Printf("  Total:  %s (raw) → %s (compressed) → %s (disk)",
+		helpers.FormatBytes(totalRaw),
+		helpers.FormatBytes(totalCompressed),
+		helpers.FormatBytes(totalDisk))
 
 	if totalCompressed > 0 && totalDisk > 0 {
 		overallOverhead := float64(totalDisk-totalCompressed) / float64(totalCompressed) * 100
-		log.Printf("  Overall RocksDB Overhead:    %.2f%% over compressed", overallOverhead)
+		log.Printf("  Overhead: %.2f%% over compressed data", overallOverhead)
 	}
 	if totalRaw > 0 && totalDisk > 0 {
 		effectiveSavings := 100.0 * (1.0 - float64(totalDisk)/float64(totalRaw))
-		log.Printf("  Effective Space Savings:     %.2f%% (raw → disk)", effectiveSavings)
+		log.Printf("  Savings:  %.2f%% (raw → disk)", effectiveSavings)
 	}
 
 	log.Printf("")
