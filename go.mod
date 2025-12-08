@@ -6,10 +6,10 @@ toolchain go1.24.8
 
 require (
 	github.com/BurntSushi/toml v1.3.2
+	github.com/erigontech/erigon v1.9.7-0.20251206022704-4ba16aa56f2c
 	github.com/erigontech/mdbx-go v0.39.11
 	github.com/klauspost/compress v1.18.0
 	github.com/ledgerwatch/erigon-lib v1.0.0
-	github.com/ledgerwatch/log/v3 v3.9.0
 	github.com/linxGnu/grocksdb v1.10.3
 	github.com/pkg/errors v0.9.1
 	github.com/stellar/go v0.0.0-20251104133942-0bd7280d08e8
@@ -62,7 +62,6 @@ require (
 	github.com/djherbis/fscache v0.10.1 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/edsrzf/mmap-go v1.2.0 // indirect
-	github.com/erigontech/erigon v1.9.7-0.20251206022704-4ba16aa56f2c // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
@@ -80,9 +79,9 @@ require (
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/ianlancetaylor/cgosymbolizer v0.0.0-20241129212102-9c50ad6b591e // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/ledgerwatch/log/v3 v3.9.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/opencontainers/runtime-spec v1.2.0 // indirect
