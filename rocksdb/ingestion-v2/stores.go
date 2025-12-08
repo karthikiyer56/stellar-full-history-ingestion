@@ -286,7 +286,7 @@ func openRocksDBWithSettings(path, name string, settings *RocksDBSettings) (*gro
 	// Target file size at L0/L1
 	opts.SetTargetFileSizeBase(uint64(settings.TargetFileSizeMB * MB))
 	// Files at each subsequent level are 2x larger
-	opts.SetTargetFileSizeMultiplier(2)
+	opts.SetTargetFileSizeMultiplier(1)
 
 	// L1 max size (L2 = L1 × 10, L3 = L2 × 10, etc.)
 	opts.SetMaxBytesForLevelBase(uint64(settings.MaxBytesForLevelBaseMB * MB))
