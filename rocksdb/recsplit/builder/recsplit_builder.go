@@ -93,7 +93,7 @@ const (
 	DefaultVerifyCount = 10000
 
 	// ProgressInterval is how often to print progress during processing
-	ProgressInterval = 1_000_000
+	ProgressInterval = 10_000_000
 )
 
 // =============================================================================
@@ -188,6 +188,7 @@ func main() {
 		leafSize           int
 		lessFalsePositives bool
 		verifyCount        int
+		dataVersion        int
 	)
 
 	flag.StringVar(&rawDataFile, "raw-data-file", "", "Path to raw binary data file (required)")
@@ -198,6 +199,7 @@ func main() {
 	flag.IntVar(&leafSize, "leaf-size", 0, "RecSplit leaf size (0 = use default)")
 	flag.BoolVar(&lessFalsePositives, "less-false-positives", false, "Enable false-positive detection filter (~9 bits/key overhead)")
 	flag.IntVar(&verifyCount, "verify-count", DefaultVerifyCount, "Number of keys to verify after build: 0=skip, -1=all, N=sample N keys")
+	flag.IntVar(&dataVersion, "version", 0, "Data structure version: 0=legacy, 1=with fuse filter support (required for --less-false-positives with Enums=false)")
 
 	flag.Parse()
 
@@ -260,6 +262,7 @@ func main() {
 	fmt.Printf("  Bucket size:          %d\n", bucketSize)
 	fmt.Printf("  Leaf size:            %d\n", leafSize)
 	fmt.Printf("  Less false positives: %v\n", lessFalsePositives)
+	fmt.Printf("  Data version:         %d\n", dataVersion)
 	fmt.Printf("  Verify count:         %d\n", verifyCount)
 	fmt.Println()
 	printMemStats()
@@ -328,6 +331,7 @@ func main() {
 	fmt.Printf("  Leaf size:            %d\n", leafSize)
 	fmt.Printf("  Bucket count:         %s\n", formatNumber(int64(bucketCount)))
 	fmt.Printf("  Less false positives: %v\n", lessFalsePositives)
+	fmt.Printf("  Data version:         %d\n", dataVersion)
 	fmt.Println()
 
 	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
@@ -339,6 +343,7 @@ func main() {
 		TmpDir:             tmpDir,
 		IndexFile:          idxPath,
 		BaseDataID:         0,
+		Version:            uint8(dataVersion),
 	}, logger)
 	if err != nil {
 		fmt.Printf("ERROR: Failed to create RecSplit: %v\n", err)
