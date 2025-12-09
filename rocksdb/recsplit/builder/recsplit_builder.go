@@ -36,13 +36,12 @@ package main
 //   - Existence filter (optional): For detecting non-existent keys (~9 bits/key if enabled)
 //
 // USAGE:
-//   ./recsplit_builder_optimized \
+//   ./recsplit_builder \
 //     --raw-data-file /path/to/transactions.bin \
-//     --output-dir /path/to/output \
-//     --output-filename txhash.idx \
+//     --output-file /path/to/output/txhash.idx \
 //     [--bucket-size 2000] \
 //     [--leaf-size 8] \
-//     [--less-false-positives] \
+//     [--enable-false-positive-support] \
 //     [--tmp-dir /path/to/tmp] \
 //     [--verify-count 10000] \
 //     [--read-buffer-mb 1024] \
@@ -75,6 +74,13 @@ package main
 //   4. Consider using a RAM disk for tmp-dir if possible
 //   5. Verification automatically uses memory-mapped I/O for speed
 //
+// TMP DIR CLEANUP:
+//   The --tmp-dir directory will be AUTOMATICALLY DELETED (recursively) when:
+//   - The program completes successfully
+//   - The program exits with an error
+//   - The program crashes or panics
+//   WARNING: If you specify an existing directory with files, those files WILL BE DELETED!
+//
 // =============================================================================
 
 import (
@@ -83,18 +89,22 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"io"
+	"log"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 
-	"github.com/erigontech/erigon/common/log/v3"
+	erigonlog "github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/recsplit"
 )
 
@@ -129,6 +139,12 @@ const (
 )
 
 // =============================================================================
+// Global logger
+// =============================================================================
+
+var logger *log.Logger
+
+// =============================================================================
 // Timing structures
 // =============================================================================
 
@@ -143,72 +159,74 @@ type BuildTiming struct {
 	TotalTime    time.Duration // Total wall-clock time
 }
 
-// =============================================================================
-// Helper functions
-// =============================================================================
-
-// formatDuration formats a duration in a human-readable way
-func formatDuration(d time.Duration) string {
-	if d < time.Millisecond {
-		return fmt.Sprintf("%.2fµs", float64(d.Microseconds()))
-	} else if d < time.Second {
-		return fmt.Sprintf("%.2fms", float64(d.Milliseconds()))
-	} else if d < time.Minute {
-		return fmt.Sprintf("%.2fs", d.Seconds())
-	} else {
-		return fmt.Sprintf("%.2fm", d.Minutes())
-	}
-}
-
-// formatBytes formats a byte count in a human-readable way
-func formatBytes(bytes int64) string {
-	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
-	)
-	switch {
-	case bytes >= GB:
-		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
-	case bytes >= MB:
-		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
-	case bytes >= KB:
-		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
-	default:
-		return fmt.Sprintf("%d bytes", bytes)
-	}
-}
-
-// formatNumber formats a number with thousands separators
-func formatNumber(n int64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-	if n < 1_000_000 {
-		return fmt.Sprintf("%d,%03d", n/1000, n%1000)
-	}
-	if n < 1_000_000_000 {
-		return fmt.Sprintf("%d,%03d,%03d", n/1_000_000, (n/1000)%1000, n%1000)
-	}
-	return fmt.Sprintf("%d,%03d,%03d,%03d", n/1_000_000_000, (n/1_000_000)%1000, (n/1000)%1000, n%1000)
-}
-
-// printMemStats prints current memory statistics
+// printMemStats prints current memory statistics using logger
 // This function calls runtime.ReadMemStats which causes a brief stop-the-world pause
 // Use sparingly (every 10% progress) to minimize impact on performance
 func printMemStats() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	fmt.Printf("  Memory: Alloc=%s, Sys=%s, HeapInuse=%s, NumGC=%d\n",
-		formatBytes(int64(m.Alloc)),
-		formatBytes(int64(m.Sys)),
-		formatBytes(int64(m.HeapInuse)),
+	logger.Printf("  Memory: Alloc=%s, Sys=%s, HeapInuse=%s, NumGC=%d",
+		helpers.FormatBytes(int64(m.Alloc)),
+		helpers.FormatBytes(int64(m.Sys)),
+		helpers.FormatBytes(int64(m.HeapInuse)),
 		m.NumGC)
 }
 
 // printSeparator prints a visual separator line
 func printSeparator() {
-	fmt.Println("================================================================================")
+	logger.Println("================================================================================")
+}
+
+// =============================================================================
+// Tmp directory cleanup management
+// =============================================================================
+
+// TmpDirCleaner manages automatic cleanup of the temporary directory
+type TmpDirCleaner struct {
+	tmpDir  string
+	cleaned bool
+	mu      sync.Mutex
+}
+
+// NewTmpDirCleaner creates a new cleaner and sets up signal handlers and panic recovery
+func NewTmpDirCleaner(tmpDir string) *TmpDirCleaner {
+	cleaner := &TmpDirCleaner{
+		tmpDir:  tmpDir,
+		cleaned: false,
+	}
+
+	// Set up signal handler for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+
+	go func() {
+		sig := <-sigChan
+		logger.Printf("Received signal %v, cleaning up tmp directory: %s", sig, tmpDir)
+		cleaner.Cleanup()
+		os.Exit(1)
+	}()
+
+	return cleaner
+}
+
+// Cleanup removes the temporary directory recursively
+func (c *TmpDirCleaner) Cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cleaned {
+		return
+	}
+
+	if c.tmpDir != "" {
+		logger.Printf("Cleaning up tmp directory: %s", c.tmpDir)
+		if err := os.RemoveAll(c.tmpDir); err != nil {
+			logger.Printf("WARNING: Failed to remove tmp directory %s: %v", c.tmpDir, err)
+		} else {
+			logger.Printf("Successfully removed tmp directory: %s", c.tmpDir)
+		}
+	}
+	c.cleaned = true
 }
 
 // =============================================================================
@@ -251,7 +269,7 @@ func NewMmapReader(path string) (*MmapReader, error) {
 	// Note: This is just a hint to the kernel - if it fails, we can continue without it
 	if err := unix.Madvise(data, unix.MADV_RANDOM); err != nil {
 		// Log the error but don't fail - madvise is an optimization hint, not critical
-		fmt.Printf("  Warning: madvise(MADV_RANDOM) failed: %v (continuing anyway)\n", err)
+		logger.Printf("  Warning: madvise(MADV_RANDOM) failed: %v (continuing anyway)", err)
 	}
 
 	return &MmapReader{
@@ -422,55 +440,66 @@ func parallelVerifySample(
 // =============================================================================
 
 func main() {
+	// Initialize logger with timestamps
+	logger = log.New(os.Stdout, "", log.LstdFlags)
+
 	// -------------------------------------------------------------------------
 	// Parse command-line flags
 	// -------------------------------------------------------------------------
 	var (
-		rawDataFile        string
-		outputDir          string
-		outputFilename     string
-		tmpDir             string
-		bucketSize         int
-		leafSize           int
-		lessFalsePositives bool
-		verifyCount        int
-		dataVersion        int
-		readBufferMB       int
-		verifyWorkers      int
+		rawDataFile                string
+		outputFile                 string
+		tmpDir                     string
+		bucketSize                 int
+		leafSize                   int
+		enableFalsePositiveSupport bool
+		verifyCount                int
+		readBufferMB               int
+		verifyWorkers              int
 	)
 
 	flag.StringVar(&rawDataFile, "raw-data-file", "", "Path to raw binary data file (required)")
-	flag.StringVar(&outputDir, "output-dir", "", "Output directory for index file (required)")
-	flag.StringVar(&outputFilename, "output-filename", "txhash.idx", "Name of the output index file")
-	flag.StringVar(&tmpDir, "tmp-dir", "", "Temp directory for RecSplit (defaults to output-dir)")
+	flag.StringVar(&outputFile, "output-file", "", "Full path to output index file (required)")
+	flag.StringVar(&tmpDir, "tmp-dir", "", "Temp directory for RecSplit (required, will be auto-deleted on exit/crash)")
 	flag.IntVar(&bucketSize, "bucket-size", 0, "RecSplit bucket size (0 = use default)")
 	flag.IntVar(&leafSize, "leaf-size", 0, "RecSplit leaf size (0 = use default)")
-	flag.BoolVar(&lessFalsePositives, "less-false-positives", false, "Enable false-positive detection filter (~9 bits/key overhead)")
+	flag.BoolVar(&enableFalsePositiveSupport, "enable-false-positive-support", false, "Enable false-positive detection filter (~9 bits/key overhead), sets LessFalsePositives=true and DataVersion=1")
 	flag.IntVar(&verifyCount, "verify-count", DefaultVerifyCount, "Number of keys to verify after build: 0=skip, -1=all, N=sample N keys")
-	flag.IntVar(&dataVersion, "version", 0, "Data structure version: 0=legacy, 1=with fuse filter support")
 	flag.IntVar(&readBufferMB, "read-buffer-mb", DefaultReadBufferMB, "Read buffer size in MB for key reading phase (larger = fewer syscalls)")
 	flag.IntVar(&verifyWorkers, "verify-workers", DefaultVerifyWorkers, "Number of parallel workers for verification")
 
 	flag.Parse()
 
 	// Validate required flags
-	if rawDataFile == "" || outputDir == "" {
-		fmt.Println("Usage: recsplit_builder_optimized --raw-data-file <path> --output-dir <path> [options]")
-		fmt.Println()
+	if rawDataFile == "" || outputFile == "" || tmpDir == "" {
+		logger.Println("Usage: recsplit_builder --raw-data-file <path> --output-file <path> --tmp-dir <path> [options]")
+		logger.Println()
 		flag.PrintDefaults()
-		fmt.Println()
-		fmt.Println("Examples:")
-		fmt.Println("  # Basic usage with defaults (256MB buffer)")
-		fmt.Println("  recsplit_builder_optimized --raw-data-file txns.bin --output-dir ./index")
-		fmt.Println()
-		fmt.Println("  # Maximum performance for large datasets (2B keys)")
-		fmt.Println("  recsplit_builder_optimized --raw-data-file txns.bin --output-dir ./index \\")
-		fmt.Println("    --read-buffer-mb 1024 --verify-workers 64 --verify-count -1")
-		fmt.Println()
-		fmt.Println("  # With false-positive protection")
-		fmt.Println("  recsplit_builder_optimized --raw-data-file txns.bin --output-dir ./index \\")
-		fmt.Println("    --less-false-positives --version 1")
+		logger.Println()
+		logger.Println("Examples:")
+		logger.Println("  # Basic usage with defaults (256MB buffer)")
+		logger.Println("  recsplit_builder --raw-data-file txns.bin --output-file ./index/txhash.idx --tmp-dir /tmp/recsplit")
+		logger.Println()
+		logger.Println("  # Maximum performance for large datasets (2B keys)")
+		logger.Println("  recsplit_builder --raw-data-file txns.bin --output-file ./index/txhash.idx --tmp-dir /tmp/recsplit \\")
+		logger.Println("    --read-buffer-mb 1024 --verify-workers 64 --verify-count -1")
+		logger.Println()
+		logger.Println("  # With false-positive protection (automatically sets LessFalsePositives=true, DataVersion=1)")
+		logger.Println("  recsplit_builder --raw-data-file txns.bin --output-file ./index/txhash.idx --tmp-dir /tmp/recsplit \\")
+		logger.Println("    --enable-false-positive-support")
+		logger.Println()
+		logger.Println("NOTE: The --tmp-dir will be DELETED (recursively) when the program exits or crashes!")
 		os.Exit(1)
+	}
+
+	// When --enable-false-positive-support is set, automatically configure:
+	// - LessFalsePositives = true
+	// - DataVersion = 1
+	lessFalsePositives := false
+	dataVersion := 0
+	if enableFalsePositiveSupport {
+		lessFalsePositives = true
+		dataVersion = 1
 	}
 
 	// Set verify workers to number of CPUs if not specified or too high
@@ -478,18 +507,29 @@ func main() {
 		verifyWorkers = runtime.NumCPU()
 	}
 
-	// Default tmp directory to output directory
-	if tmpDir == "" {
-		tmpDir = outputDir
-	}
-
-	// Create directories if needed
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		fmt.Printf("ERROR: Failed to create output directory: %v\n", err)
+	// Create tmp directory if needed
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		logger.Printf("ERROR: Failed to create temp directory %s: %v", tmpDir, err)
 		os.Exit(1)
 	}
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		fmt.Printf("ERROR: Failed to create temp directory: %v\n", err)
+
+	// Set up automatic cleanup of tmp directory on exit/crash
+	cleaner := NewTmpDirCleaner(tmpDir)
+	defer cleaner.Cleanup()
+
+	// Also handle panics
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("PANIC: %v", r)
+			cleaner.Cleanup()
+			panic(r) // Re-panic after cleanup
+		}
+	}()
+
+	// Create output directory if needed
+	outputDir := filepath.Dir(outputFile)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		logger.Printf("ERROR: Failed to create output directory %s: %v", outputDir, err)
 		os.Exit(1)
 	}
 
@@ -513,64 +553,67 @@ func main() {
 	// Print configuration
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("RecSplit Index Builder (OPTIMIZED)")
+	logger.Println("RecSplit Index Builder (OPTIMIZED)")
 	printSeparator()
-	fmt.Println()
-	fmt.Println("Configuration:")
-	fmt.Printf("  Raw data file:        %s\n", rawDataFile)
-	fmt.Printf("  Output directory:     %s\n", outputDir)
-	fmt.Printf("  Output filename:      %s\n", outputFilename)
-	fmt.Printf("  Temp directory:       %s\n", tmpDir)
-	fmt.Printf("  Bucket size:          %d\n", bucketSize)
-	fmt.Printf("  Leaf size:            %d\n", leafSize)
-	fmt.Printf("  Less false positives: %v\n", lessFalsePositives)
-	fmt.Printf("  Data version:         %d\n", dataVersion)
-	fmt.Printf("  Verify count:         %d\n", verifyCount)
-	fmt.Println()
-	fmt.Println("Optimization settings:")
-	fmt.Printf("  Read buffer size:     %s (for key reading phase)\n", formatBytes(int64(readBufferSize)))
-	fmt.Printf("  Verify workers:       %d (for parallel verification)\n", verifyWorkers)
-	fmt.Printf("  Verification uses:    memory-mapped I/O (mmap)\n")
-	fmt.Printf("  CPU cores available:  %d\n", runtime.NumCPU())
-	fmt.Printf("  GOMAXPROCS:           %d\n", runtime.GOMAXPROCS(0))
-	fmt.Println()
+	logger.Println()
+	logger.Println("Configuration:")
+	logger.Printf("  Raw data file:               %s", rawDataFile)
+	logger.Printf("  Output file:                 %s", outputFile)
+	logger.Printf("  Temp directory:              %s (will be auto-deleted)", tmpDir)
+	logger.Printf("  Bucket size:                 %d", bucketSize)
+	logger.Printf("  Leaf size:                   %d", leafSize)
+	logger.Printf("  Enable false-positive support: %v", enableFalsePositiveSupport)
+	if enableFalsePositiveSupport {
+		logger.Printf("    -> LessFalsePositives:     %v (auto-set)", lessFalsePositives)
+		logger.Printf("    -> DataVersion:            %d (auto-set)", dataVersion)
+	}
+	logger.Printf("  Verify count:                %d", verifyCount)
+	logger.Println()
+	logger.Println("Optimization settings:")
+	logger.Printf("  Read buffer size:     %s (for key reading phase)", helpers.FormatBytes(int64(readBufferSize)))
+	logger.Printf("  Verify workers:       %d (for parallel verification)", verifyWorkers)
+	logger.Printf("  Verification uses:    memory-mapped I/O (mmap)")
+	logger.Printf("  CPU cores available:  %d", runtime.NumCPU())
+	logger.Printf("  GOMAXPROCS:           %d", runtime.GOMAXPROCS(0))
+	logger.Println()
 	printMemStats()
-	fmt.Println()
+	logger.Println()
 
 	// -------------------------------------------------------------------------
 	// Step 1: Open file and calculate key count
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("STEP 1: Analyzing raw data file")
+	logger.Println("STEP 1: Analyzing raw data file")
 	printSeparator()
-	fmt.Println()
+	logger.Println()
 
 	stepStart := time.Now()
 
 	fileInfo, err := os.Stat(rawDataFile)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to stat raw data file: %v\n", err)
+		logger.Printf("ERROR: Failed to stat raw data file %s: %v", rawDataFile, err)
 		os.Exit(1)
 	}
 
 	fileSize := fileInfo.Size()
 	if fileSize%RecordSize != 0 {
-		fmt.Printf("ERROR: File size (%d) is not a multiple of record size (%d)\n", fileSize, RecordSize)
-		fmt.Printf("       This suggests the file is corrupted or not in the expected format.\n")
+		logger.Printf("ERROR: File size (%s bytes) is not a multiple of record size (%d)", helpers.FormatNumber(fileSize), RecordSize)
+		logger.Printf("       This suggests the file is corrupted or not in the expected format.")
 		os.Exit(1)
 	}
 
 	keyCount := int(fileSize / RecordSize)
 	timing.FileOpen = time.Since(stepStart)
 
-	fmt.Printf("  File size:            %s\n", formatBytes(fileSize))
-	fmt.Printf("  Record size:          %d bytes\n", RecordSize)
-	fmt.Printf("  Key count:            %s\n", formatNumber(int64(keyCount)))
-	fmt.Printf("  Time:                 %s\n", formatDuration(timing.FileOpen))
-	fmt.Println()
+	logger.Printf("  File:                 %s", rawDataFile)
+	logger.Printf("  File size:            %s (%s bytes)", helpers.FormatBytes(fileSize), helpers.FormatNumber(fileSize))
+	logger.Printf("  Record size:          %d bytes", RecordSize)
+	logger.Printf("  Key count:            %s", helpers.FormatNumber(int64(keyCount)))
+	logger.Printf("  Time:                 %s", helpers.FormatDuration(timing.FileOpen))
+	logger.Println()
 
 	if keyCount == 0 {
-		fmt.Println("ERROR: No records found in file")
+		logger.Println("ERROR: No records found in file")
 		os.Exit(1)
 	}
 
@@ -578,30 +621,29 @@ func main() {
 	// Step 2: Initialize RecSplit
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("STEP 2: Initializing RecSplit")
+	logger.Println("STEP 2: Initializing RecSplit")
 	printSeparator()
-	fmt.Println()
+	logger.Println()
 
 	stepStart = time.Now()
 
-	idxPath := filepath.Join(outputDir, outputFilename)
-	fmt.Printf("  Index file:           %s\n", idxPath)
+	logger.Printf("  Index file:           %s", outputFile)
 
 	// Remove existing index if present
-	os.Remove(idxPath)
+	os.Remove(outputFile)
 
 	// Create logger (using erigon's logger)
-	logger := log.New()
+	erigonLogger := erigonlog.New()
 
 	// Calculate bucket count for information
 	bucketCount := (keyCount + bucketSize - 1) / bucketSize
 
-	fmt.Printf("  Bucket size:          %d\n", bucketSize)
-	fmt.Printf("  Leaf size:            %d\n", leafSize)
-	fmt.Printf("  Bucket count:         %s\n", formatNumber(int64(bucketCount)))
-	fmt.Printf("  Less false positives: %v\n", lessFalsePositives)
-	fmt.Printf("  Data version:         %d\n", dataVersion)
-	fmt.Println()
+	logger.Printf("  Bucket size:          %d", bucketSize)
+	logger.Printf("  Leaf size:            %d", leafSize)
+	logger.Printf("  Bucket count:         %s", helpers.FormatNumber(int64(bucketCount)))
+	logger.Printf("  Less false positives: %v", lessFalsePositives)
+	logger.Printf("  Data version:         %d", dataVersion)
+	logger.Println()
 
 	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
 		KeyCount:           keyCount,
@@ -610,35 +652,35 @@ func main() {
 		BucketSize:         bucketSize,
 		LeafSize:           uint16(leafSize),
 		TmpDir:             tmpDir,
-		IndexFile:          idxPath,
+		IndexFile:          outputFile,
 		BaseDataID:         0,
 		Version:            uint8(dataVersion),
-	}, logger)
+	}, erigonLogger)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to create RecSplit: %v\n", err)
+		logger.Printf("ERROR: Failed to create RecSplit: %v", err)
 		os.Exit(1)
 	}
 	defer rs.Close()
 
 	timing.RecSplitInit = time.Since(stepStart)
-	fmt.Printf("  Initialization time:  %s\n", formatDuration(timing.RecSplitInit))
-	fmt.Println()
+	logger.Printf("  Initialization time:  %s", helpers.FormatDuration(timing.RecSplitInit))
+	logger.Println()
 	printMemStats()
-	fmt.Println()
+	logger.Println()
 
 	// -------------------------------------------------------------------------
 	// Step 3: Read raw data file and add keys
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("STEP 3: Reading keys and adding to RecSplit")
+	logger.Println("STEP 3: Reading keys and adding to RecSplit")
 	printSeparator()
-	fmt.Println()
+	logger.Println()
 
 	stepStart = time.Now()
 
 	file, err := os.Open(rawDataFile)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to open raw data file: %v\n", err)
+		logger.Printf("ERROR: Failed to open raw data file %s: %v", rawDataFile, err)
 		os.Exit(1)
 	}
 	defer file.Close()
@@ -655,8 +697,8 @@ func main() {
 	lastPercentReported := -1
 	startTime := time.Now()
 
-	fmt.Printf("  Reading %s records with %s buffer...\n", formatNumber(int64(keyCount)), formatBytes(int64(readBufferSize)))
-	fmt.Println()
+	logger.Printf("  Reading %s records with %s buffer...", helpers.FormatNumber(int64(keyCount)), helpers.FormatBytes(int64(readBufferSize)))
+	logger.Println()
 
 	// Process records in batches for better performance
 	for keysAdded < keyCount {
@@ -671,7 +713,7 @@ func main() {
 		// Read a batch of records
 		n, err := io.ReadFull(bufReader, batchBuffer[:batchBytes])
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-			fmt.Printf("ERROR: Failed to read batch at record %d: %v\n", keysAdded, err)
+			logger.Printf("ERROR: Failed to read batch at record %d: %v", keysAdded, err)
 			os.Exit(1)
 		}
 
@@ -691,7 +733,7 @@ func main() {
 
 			// Add to RecSplit
 			if err := rs.AddKey(txHash, uint64(ledgerSeq)); err != nil {
-				fmt.Printf("ERROR: Failed to add key %d: %v\n", keysAdded+i, err)
+				logger.Printf("ERROR: Failed to add key %d: %v", keysAdded+i, err)
 				os.Exit(1)
 			}
 		}
@@ -705,8 +747,8 @@ func main() {
 			rate := float64(keysAdded) / elapsed.Seconds()
 			eta := time.Duration(float64(keyCount-keysAdded)/rate) * time.Second
 
-			fmt.Printf("  [%3d%%] Added %s keys | Rate: %.0f keys/sec | ETA: %s\n",
-				currentPercent, formatNumber(int64(keysAdded)), rate, formatDuration(eta))
+			logger.Printf("  [%3d%%] Added %s keys | Rate: %.0f keys/sec | ETA: %s",
+				currentPercent, helpers.FormatNumber(int64(keysAdded)), rate, helpers.FormatDuration(eta))
 
 			// Print memory stats every 10% to avoid overhead
 			if currentPercent%MemStatsInterval == 0 && currentPercent > 0 {
@@ -719,16 +761,16 @@ func main() {
 
 	timing.KeyReading = time.Since(stepStart)
 
-	fmt.Println()
-	fmt.Printf("  Total keys added:     %s\n", formatNumber(int64(keysAdded)))
-	fmt.Printf("  Reading time:         %s\n", formatDuration(timing.KeyReading))
-	fmt.Printf("  Average rate:         %.0f keys/sec\n", float64(keysAdded)/timing.KeyReading.Seconds())
-	fmt.Println()
+	logger.Println()
+	logger.Printf("  Total keys added:     %s", helpers.FormatNumber(int64(keysAdded)))
+	logger.Printf("  Reading time:         %s", helpers.FormatDuration(timing.KeyReading))
+	logger.Printf("  Average rate:         %.0f keys/sec", float64(keysAdded)/timing.KeyReading.Seconds())
+	logger.Println()
 	printMemStats()
-	fmt.Println()
+	logger.Println()
 
 	if keysAdded != keyCount {
-		fmt.Printf("ERROR: Key count mismatch: expected %d, got %d\n", keyCount, keysAdded)
+		logger.Printf("ERROR: Key count mismatch: expected %d, got %d", keyCount, keysAdded)
 		os.Exit(1)
 	}
 
@@ -739,110 +781,110 @@ func main() {
 	// Step 4: Build the index
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("STEP 4: Building RecSplit index")
+	logger.Println("STEP 4: Building RecSplit index")
 	printSeparator()
-	fmt.Println()
+	logger.Println()
 
 	stepStart = time.Now()
-	fmt.Println("  Building perfect hash function...")
-	fmt.Println("  (This is CPU-intensive and may take a while for large datasets)")
-	fmt.Println()
+	logger.Println("  Building perfect hash function...")
+	logger.Println("  (This is CPU-intensive and may take a while for large datasets)")
+	logger.Println()
 
 	// Force garbage collection before the memory-intensive build phase
 	// This gives us maximum available heap for the build process
 	runtime.GC()
-	fmt.Println("  Pre-build GC completed")
+	logger.Println("  Pre-build GC completed")
 	printMemStats()
-	fmt.Println()
+	logger.Println()
 
 	ctx := context.Background()
 	if err := rs.Build(ctx); err != nil {
 		if err == recsplit.ErrCollision {
-			fmt.Println("ERROR: Hash collision detected during build")
-			fmt.Println("       This is rare. Try rebuilding - a different salt will be used.")
+			logger.Println("ERROR: Hash collision detected during build")
+			logger.Println("       This is rare. Try rebuilding - a different salt will be used.")
 		} else {
-			fmt.Printf("ERROR: Failed to build RecSplit: %v\n", err)
+			logger.Printf("ERROR: Failed to build RecSplit: %v", err)
 		}
 		os.Exit(1)
 	}
 
 	timing.IndexBuild = time.Since(stepStart)
 
-	fmt.Printf("  Build time:           %s\n", formatDuration(timing.IndexBuild))
-	fmt.Println()
+	logger.Printf("  Build time:           %s", helpers.FormatDuration(timing.IndexBuild))
+	logger.Println()
 	printMemStats()
-	fmt.Println()
+	logger.Println()
 
 	// -------------------------------------------------------------------------
 	// Step 5: Analyze index size and structure
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("STEP 5: Index analysis")
+	logger.Println("STEP 5: Index analysis")
 	printSeparator()
-	fmt.Println()
+	logger.Println()
 
 	// Get file size
-	idxInfo, err := os.Stat(idxPath)
+	idxInfo, err := os.Stat(outputFile)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to stat index file: %v\n", err)
+		logger.Printf("ERROR: Failed to stat index file %s: %v", outputFile, err)
 		os.Exit(1)
 	}
 	idxSize := idxInfo.Size()
 
-	fmt.Printf("  Index file:           %s\n", idxPath)
-	fmt.Printf("  Index size:           %s\n", formatBytes(idxSize))
-	fmt.Printf("  Total bits/key:       %.2f\n", float64(idxSize*8)/float64(keyCount))
-	fmt.Println()
+	logger.Printf("  Index file:           %s", outputFile)
+	logger.Printf("  Index size:           %s (%s bytes)", helpers.FormatBytes(idxSize), helpers.FormatNumber(idxSize))
+	logger.Printf("  Total bits/key:       %.2f", float64(idxSize*8)/float64(keyCount))
+	logger.Println()
 
 	// Open index to get detailed sizes
-	idx, err := recsplit.OpenIndex(idxPath)
+	idx, err := recsplit.OpenIndex(outputFile)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to open index for analysis: %v\n", err)
+		logger.Printf("ERROR: Failed to open index for analysis: %v", err)
 		os.Exit(1)
 	}
 
 	// Get size breakdown from the index
 	total, offsets, ef, golombRice, existence, layer1 := idx.Sizes()
 
-	fmt.Println("  Size breakdown:")
-	fmt.Printf("    GolombRice (hash):  %s (%.2f bits/key) - The perfect hash function\n",
+	logger.Println("  Size breakdown:")
+	logger.Printf("    GolombRice (hash):  %s (%.2f bits/key) - The perfect hash function",
 		golombRice.String(), float64(golombRice)*8/float64(keyCount))
-	fmt.Printf("    EF (bucket meta):   %s (%.2f bits/key) - Bucket metadata\n",
+	logger.Printf("    EF (bucket meta):   %s (%.2f bits/key) - Bucket metadata",
 		ef.String(), float64(ef)*8/float64(keyCount))
-	fmt.Printf("    Offsets (values):   %s (%.2f bits/key) - Elias-Fano encoded ledgerSeqs\n",
+	logger.Printf("    Offsets (values):   %s (%.2f bits/key) - Elias-Fano encoded ledgerSeqs",
 		offsets.String(), float64(offsets)*8/float64(keyCount))
-	fmt.Printf("    Existence filter:   %s (%.2f bits/key) - False-positive detection\n",
+	logger.Printf("    Existence filter:   %s (%.2f bits/key) - False-positive detection",
 		existence.String(), float64(existence)*8/float64(keyCount))
-	fmt.Printf("    Layer1:             %s (%.2f bits/key)\n",
+	logger.Printf("    Layer1:             %s (%.2f bits/key)",
 		layer1.String(), float64(layer1)*8/float64(keyCount))
-	fmt.Printf("    -----------------------------------------\n")
-	fmt.Printf("    Total (from Sizes): %s\n", total.String())
-	fmt.Printf("    Total (file):       %s\n", formatBytes(idxSize))
-	fmt.Println()
+	logger.Printf("    -----------------------------------------")
+	logger.Printf("    Total (from Sizes): %s", total.String())
+	logger.Printf("    Total (file):       %s", helpers.FormatBytes(idxSize))
+	logger.Println()
 
-	fmt.Println("  Component analysis:")
-	fmt.Printf("    Hash function:      %.2f bits/key (GolombRice)\n", float64(golombRice)*8/float64(keyCount))
-	fmt.Printf("    Value storage:      %.2f bits/key (Offsets/EliasFano)\n", float64(offsets)*8/float64(keyCount))
-	fmt.Printf("    Metadata:           %.2f bits/key (EF + Existence + Layer1)\n",
+	logger.Println("  Component analysis:")
+	logger.Printf("    Hash function:      %.2f bits/key (GolombRice)", float64(golombRice)*8/float64(keyCount))
+	logger.Printf("    Value storage:      %.2f bits/key (Offsets/EliasFano)", float64(offsets)*8/float64(keyCount))
+	logger.Printf("    Metadata:           %.2f bits/key (EF + Existence + Layer1)",
 		float64(ef+existence+layer1)*8/float64(keyCount))
-	fmt.Println()
+	logger.Println()
 
 	// -------------------------------------------------------------------------
 	// Step 6: Verification (with parallel processing)
 	// -------------------------------------------------------------------------
 	if verifyCount != 0 {
 		printSeparator()
-		fmt.Println("STEP 6: Verification (PARALLEL)")
+		logger.Println("STEP 6: Verification (PARALLEL)")
 		printSeparator()
-		fmt.Println()
+		logger.Println()
 
 		stepStart = time.Now()
 
 		// Use memory-mapped file for verification (much faster for random access)
 		mmapReader, err := NewMmapReader(rawDataFile)
 		if err != nil {
-			fmt.Printf("ERROR: Failed to create mmap reader for verification: %v\n", err)
-			fmt.Println("       Falling back to sequential verification...")
+			logger.Printf("ERROR: Failed to create mmap reader for verification: %v", err)
+			logger.Println("       Falling back to sequential verification...")
 
 			// Fallback to sequential verification (original code path)
 			// This is slower but doesn't require mmap support
@@ -854,9 +896,9 @@ func main() {
 
 			if verifyCount == -1 {
 				// Verify all keys with parallel workers
-				fmt.Printf("  Verifying ALL %s keys with %d parallel workers...\n",
-					formatNumber(int64(keyCount)), verifyWorkers)
-				fmt.Println()
+				logger.Printf("  Verifying ALL %s keys with %d parallel workers...",
+					helpers.FormatNumber(int64(keyCount)), verifyWorkers)
+				logger.Println()
 
 				// Create progress channel
 				progressChan := make(chan int, verifyWorkers*2)
@@ -877,8 +919,8 @@ func main() {
 							rate := float64(processed) / elapsed.Seconds()
 							eta := time.Duration(float64(keyCount-processed)/rate) * time.Second
 
-							fmt.Printf("  [%3d%%] Verified %s keys | Rate: %.0f keys/sec | ETA: %s\n",
-								currentPercent, formatNumber(int64(processed)), rate, formatDuration(eta))
+							logger.Printf("  [%3d%%] Verified %s keys | Rate: %.0f keys/sec | ETA: %s",
+								currentPercent, helpers.FormatNumber(int64(processed)), rate, helpers.FormatDuration(eta))
 
 							// Print memory stats every 10%
 							if currentPercent%MemStatsInterval == 0 && currentPercent > 0 {
@@ -902,34 +944,34 @@ func main() {
 					keysToVerify = keyCount
 				}
 
-				fmt.Printf("  Verifying %s randomly sampled keys with %d parallel workers...\n",
-					formatNumber(int64(keysToVerify)), verifyWorkers)
-				fmt.Println()
+				logger.Printf("  Verifying %s randomly sampled keys with %d parallel workers...",
+					helpers.FormatNumber(int64(keysToVerify)), verifyWorkers)
+				logger.Println()
 
 				verified, failed = parallelVerifySample(idx, mmapReader, keyCount, keysToVerify, verifyWorkers)
 			}
 
 			timing.Verification = time.Since(stepStart)
 
-			fmt.Println()
-			fmt.Printf("  Verified:             %s\n", formatNumber(verified))
-			fmt.Printf("  Failed:               %s\n", formatNumber(failed))
+			logger.Println()
+			logger.Printf("  Verified:             %s", helpers.FormatNumber(verified))
+			logger.Printf("  Failed:               %s", helpers.FormatNumber(failed))
 			if verified+failed > 0 {
-				fmt.Printf("  Success rate:         %.4f%%\n", float64(verified)*100/float64(verified+failed))
+				logger.Printf("  Success rate:         %.4f%%", float64(verified)*100/float64(verified+failed))
 			}
-			fmt.Printf("  Verification time:    %s\n", formatDuration(timing.Verification))
-			fmt.Printf("  Verification rate:    %.0f keys/sec\n", float64(verified+failed)/timing.Verification.Seconds())
-			fmt.Println()
+			logger.Printf("  Verification time:    %s", helpers.FormatDuration(timing.Verification))
+			logger.Printf("  Verification rate:    %.0f keys/sec", float64(verified+failed)/timing.Verification.Seconds())
+			logger.Println()
 
 			if failed > 0 {
-				fmt.Println("WARNING: Some verifications failed!")
-				fmt.Println("         The index may be corrupted or there's a bug.")
+				logger.Println("WARNING: Some verifications failed!")
+				logger.Println("         The index may be corrupted or there's a bug.")
 			}
 		}
 	} else {
-		fmt.Println()
-		fmt.Println("  Verification skipped (--verify-count 0)")
-		fmt.Println()
+		logger.Println()
+		logger.Println("  Verification skipped (--verify-count 0)")
+		logger.Println()
 	}
 
 	idx.Close()
@@ -940,52 +982,77 @@ func main() {
 	timing.TotalTime = time.Since(totalStart)
 
 	printSeparator()
-	fmt.Println("BUILD COMPLETE")
+	logger.Println("BUILD COMPLETE")
 	printSeparator()
-	fmt.Println()
-	fmt.Println("  Output:")
-	fmt.Printf("    Index file:         %s\n", idxPath)
-	fmt.Printf("    Index size:         %s\n", formatBytes(idxSize))
-	fmt.Println()
-	fmt.Println("  Statistics:")
-	fmt.Printf("    Key count:          %s\n", formatNumber(int64(keyCount)))
-	fmt.Printf("    Total bits/key:     %.2f\n", float64(idxSize*8)/float64(keyCount))
-	fmt.Printf("    Hash function:      %.2f bits/key\n", float64(golombRice)*8/float64(keyCount))
-	fmt.Printf("    Value storage:      %.2f bits/key\n", float64(offsets)*8/float64(keyCount))
-	fmt.Println()
-	fmt.Println("  Timing:")
-	fmt.Printf("    File analysis:      %s\n", formatDuration(timing.FileOpen))
-	fmt.Printf("    RecSplit init:      %s\n", formatDuration(timing.RecSplitInit))
-	fmt.Printf("    Key reading:        %s\n", formatDuration(timing.KeyReading))
-	fmt.Printf("    Index build:        %s\n", formatDuration(timing.IndexBuild))
-	if verifyCount != 0 {
-		fmt.Printf("    Verification:       %s\n", formatDuration(timing.Verification))
+	logger.Println()
+	logger.Println("  Output:")
+	logger.Printf("    Index file:         %s", outputFile)
+	logger.Printf("    Index size:         %s (%s bytes)", helpers.FormatBytes(idxSize), helpers.FormatNumber(idxSize))
+	logger.Println()
+	logger.Println("  Statistics:")
+	logger.Printf("    Key count:          %s", helpers.FormatNumber(int64(keyCount)))
+	logger.Printf("    Total bits/key:     %.2f", float64(idxSize*8)/float64(keyCount))
+	logger.Printf("    Hash function:      %.2f bits/key", float64(golombRice)*8/float64(keyCount))
+	logger.Printf("    Value storage:      %.2f bits/key", float64(offsets)*8/float64(keyCount))
+	logger.Println()
+
+	// -------------------------------------------------------------------------
+	// Size comparison and reduction metric
+	// -------------------------------------------------------------------------
+	logger.Println("  Size Comparison:")
+	logger.Printf("    Original raw file:  %s (%s bytes)", helpers.FormatBytes(fileSize), helpers.FormatNumber(fileSize))
+	logger.Printf("    Index file:         %s (%s bytes)", helpers.FormatBytes(idxSize), helpers.FormatNumber(idxSize))
+
+	// Calculate reduction percentage
+	if fileSize > 0 {
+		reductionBytes := fileSize - idxSize
+		reductionPercent := float64(reductionBytes) * 100.0 / float64(fileSize)
+		if reductionBytes > 0 {
+			logger.Printf("    Size reduction:     %s (%.2f%% smaller)", helpers.FormatBytes(reductionBytes), reductionPercent)
+		} else {
+			increaseBytes := -reductionBytes
+			increasePercent := float64(increaseBytes) * 100.0 / float64(fileSize)
+			logger.Printf("    Size increase:      %s (%.2f%% larger)", helpers.FormatBytes(increaseBytes), increasePercent)
+		}
+		logger.Printf("    Compression ratio:  %.2fx", float64(fileSize)/float64(idxSize))
 	}
-	fmt.Printf("    -----------------------------------------\n")
-	fmt.Printf("    Total time:         %s\n", formatDuration(timing.TotalTime))
-	fmt.Println()
+	logger.Println()
+
+	logger.Println("  Timing:")
+	logger.Printf("    File analysis:      %s", helpers.FormatDuration(timing.FileOpen))
+	logger.Printf("    RecSplit init:      %s", helpers.FormatDuration(timing.RecSplitInit))
+	logger.Printf("    Key reading:        %s", helpers.FormatDuration(timing.KeyReading))
+	logger.Printf("    Index build:        %s", helpers.FormatDuration(timing.IndexBuild))
+	if verifyCount != 0 {
+		logger.Printf("    Verification:       %s", helpers.FormatDuration(timing.Verification))
+	}
+	logger.Printf("    -----------------------------------------")
+	logger.Printf("    Total time:         %s", helpers.FormatDuration(timing.TotalTime))
+	logger.Println()
 	printMemStats()
-	fmt.Println()
+	logger.Println()
 
 	// Projections for scale
 	printSeparator()
-	fmt.Println("PROJECTIONS")
+	logger.Println("PROJECTIONS")
 	printSeparator()
-	fmt.Println()
+	logger.Println()
 	bitsPerKey := float64(idxSize*8) / float64(keyCount)
-	fmt.Println("  Based on current bits/key ratio:")
-	fmt.Println()
-	fmt.Printf("    1M keys:     %s\n", formatBytes(int64(1_000_000*bitsPerKey/8)))
-	fmt.Printf("    10M keys:    %s\n", formatBytes(int64(10_000_000*bitsPerKey/8)))
-	fmt.Printf("    100M keys:   %s\n", formatBytes(int64(100_000_000*bitsPerKey/8)))
-	fmt.Printf("    1B keys:     %s\n", formatBytes(int64(1_000_000_000*bitsPerKey/8)))
-	fmt.Printf("    1.5B keys:   %s\n", formatBytes(int64(1_500_000_000*bitsPerKey/8)))
-	fmt.Printf("    2.5B keys:   %s\n", formatBytes(int64(2_500_000_000*bitsPerKey/8)))
-	fmt.Println()
-	fmt.Println("  For 10 years of data (15B keys):")
-	fmt.Printf("    Estimated index size: %s\n", formatBytes(int64(15_000_000_000*bitsPerKey/8)))
-	fmt.Println()
+	logger.Println("  Based on current bits/key ratio:")
+	logger.Println()
+	logger.Printf("    1M keys:     %s", helpers.FormatBytes(int64(1_000_000*bitsPerKey/8)))
+	logger.Printf("    10M keys:    %s", helpers.FormatBytes(int64(10_000_000*bitsPerKey/8)))
+	logger.Printf("    100M keys:   %s", helpers.FormatBytes(int64(100_000_000*bitsPerKey/8)))
+	logger.Printf("    1B keys:     %s", helpers.FormatBytes(int64(1_000_000_000*bitsPerKey/8)))
+	logger.Printf("    1.5B keys:   %s", helpers.FormatBytes(int64(1_500_000_000*bitsPerKey/8)))
+	logger.Printf("    2.5B keys:   %s", helpers.FormatBytes(int64(2_500_000_000*bitsPerKey/8)))
+	logger.Println()
+	logger.Println("  For 10 years of data (15B keys):")
+	logger.Printf("    Estimated index size: %s", helpers.FormatBytes(int64(15_000_000_000*bitsPerKey/8)))
+	logger.Println()
 	printSeparator()
+
+	// Note: tmp directory cleanup happens automatically via defer cleaner.Cleanup()
 }
 
 // =============================================================================
@@ -1004,7 +1071,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 	// Open raw data file
 	file, err := os.Open(rawDataFile)
 	if err != nil {
-		fmt.Printf("ERROR: Failed to open raw data file for verification: %v\n", err)
+		logger.Printf("ERROR: Failed to open raw data file %s for verification: %v", rawDataFile, err)
 		return
 	}
 	defer file.Close()
@@ -1017,15 +1084,15 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 	if verifyCount == -1 {
 		keysToVerify = keyCount
 		verifyAll = true
-		fmt.Printf("  Verifying ALL %s keys (sequential fallback)...\n", formatNumber(int64(keyCount)))
+		logger.Printf("  Verifying ALL %s keys (sequential fallback)...", helpers.FormatNumber(int64(keyCount)))
 	} else {
 		keysToVerify = verifyCount
 		if keysToVerify > keyCount {
 			keysToVerify = keyCount
 		}
-		fmt.Printf("  Verifying %s keys (sequential fallback)...\n", formatNumber(int64(keysToVerify)))
+		logger.Printf("  Verifying %s keys (sequential fallback)...", helpers.FormatNumber(int64(keysToVerify)))
 	}
-	fmt.Println()
+	logger.Println()
 
 	verified := 0
 	failed := 0
@@ -1036,7 +1103,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 		for i := 0; i < keyCount; i++ {
 			n, err := io.ReadFull(bufReader, recordBuf)
 			if err != nil || n != RecordSize {
-				fmt.Printf("ERROR: Failed to read record %d for verification\n", i)
+				logger.Printf("ERROR: Failed to read record %d for verification", i)
 				break
 			}
 
@@ -1047,7 +1114,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 			if !found {
 				failed++
 				if failed <= 5 {
-					fmt.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d\n",
+					logger.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d",
 						i, expectedLedgerSeq)
 				}
 				continue
@@ -1058,7 +1125,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 			} else {
 				failed++
 				if failed <= 5 {
-					fmt.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d\n",
+					logger.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d",
 						i, expectedLedgerSeq, actualLedgerSeq)
 				}
 			}
@@ -1066,13 +1133,13 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 			// Report progress at each 1%
 			currentPercent := ((i + 1) * 100) / keyCount
 			if currentPercent > lastPercentReported {
-				fmt.Printf("  [%3d%%] Verified %s keys...\n", currentPercent, formatNumber(int64(i+1)))
+				logger.Printf("  [%3d%%] Verified %s keys...", currentPercent, helpers.FormatNumber(int64(i+1)))
 				lastPercentReported = currentPercent
 			}
 		}
 	} else {
 		// For sample verification without mmap, we need to load records first
-		fmt.Println("  Loading records for random sampling...")
+		logger.Println("  Loading records for random sampling...")
 		records := make([]struct {
 			txHash    [TxHashSize]byte
 			ledgerSeq uint32
@@ -1081,14 +1148,14 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 		for i := 0; i < keyCount; i++ {
 			n, err := io.ReadFull(bufReader, recordBuf)
 			if err != nil || n != RecordSize {
-				fmt.Printf("ERROR: Failed to read record %d\n", i)
+				logger.Printf("ERROR: Failed to read record %d", i)
 				return
 			}
 			copy(records[i].txHash[:], recordBuf[:TxHashSize])
 			records[i].ledgerSeq = binary.BigEndian.Uint32(recordBuf[TxHashSize:])
 		}
 
-		fmt.Println("  Sampling and verifying...")
+		logger.Println("  Sampling and verifying...")
 
 		// Random sampling
 		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -1099,7 +1166,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 			if !found {
 				failed++
 				if failed <= 5 {
-					fmt.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d\n",
+					logger.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d",
 						i, records[i].ledgerSeq)
 				}
 				continue
@@ -1110,7 +1177,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 			} else {
 				failed++
 				if failed <= 5 {
-					fmt.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d\n",
+					logger.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d",
 						i, records[i].ledgerSeq, actualLedgerSeq)
 				}
 			}
@@ -1118,7 +1185,7 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 			// Progress for sample verification
 			currentPercent := ((j + 1) * 100) / keysToVerify
 			if currentPercent > lastPercentReported && currentPercent%10 == 0 {
-				fmt.Printf("  [%3d%%] Verified %s samples...\n", currentPercent, formatNumber(int64(j+1)))
+				logger.Printf("  [%3d%%] Verified %s samples...", currentPercent, helpers.FormatNumber(int64(j+1)))
 				lastPercentReported = currentPercent
 			}
 		}
@@ -1126,17 +1193,17 @@ func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyC
 
 	verificationTime := time.Since(stepStart)
 
-	fmt.Println()
-	fmt.Printf("  Verified:             %s\n", formatNumber(int64(verified)))
-	fmt.Printf("  Failed:               %s\n", formatNumber(int64(failed)))
+	logger.Println()
+	logger.Printf("  Verified:             %s", helpers.FormatNumber(int64(verified)))
+	logger.Printf("  Failed:               %s", helpers.FormatNumber(int64(failed)))
 	if verified+failed > 0 {
-		fmt.Printf("  Success rate:         %.4f%%\n", float64(verified)*100/float64(verified+failed))
+		logger.Printf("  Success rate:         %.4f%%", float64(verified)*100/float64(verified+failed))
 	}
-	fmt.Printf("  Verification time:    %s\n", formatDuration(verificationTime))
-	fmt.Println()
+	logger.Printf("  Verification time:    %s", helpers.FormatDuration(verificationTime))
+	logger.Println()
 
 	if failed > 0 {
-		fmt.Println("WARNING: Some verifications failed!")
-		fmt.Println("         The index may be corrupted or there's a bug.")
+		logger.Println("WARNING: Some verifications failed!")
+		logger.Println("         The index may be corrupted or there's a bug.")
 	}
 }
