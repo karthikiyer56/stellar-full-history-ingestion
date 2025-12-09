@@ -1,12 +1,21 @@
 package main
 
 // =============================================================================
-// recsplit_builder.go
+// recsplit_builder_optimized.go
 // =============================================================================
 //
 // PURPOSE:
 //   Builds a RecSplit index from a raw binary data file that maps
 //   txHash (32 bytes) -> ledgerSeq (4 bytes).
+//
+//   This is an OPTIMIZED version with the following improvements:
+//   - Buffered I/O with large buffers (configurable, default 256MB)
+//   - Memory-mapped file reading option for faster access
+//   - Parallel verification using worker pools
+//   - Percentage-based progress reporting (1% increments)
+//   - Reduced memory stats collection frequency
+//   - Pre-allocated buffers to reduce GC pressure
+//   - Batch processing for better CPU cache utilization
 //
 // RAW DATA FILE FORMAT:
 //   - No headers, no delimiters, no newlines
@@ -27,7 +36,7 @@ package main
 //   - Existence filter (optional): For detecting non-existent keys (~9 bits/key if enabled)
 //
 // USAGE:
-//   ./recsplit_builder \
+//   ./recsplit_builder_optimized \
 //     --raw-data-file /path/to/transactions.bin \
 //     --output-dir /path/to/output \
 //     --output-filename txhash.idx \
@@ -35,7 +44,9 @@ package main
 //     [--leaf-size 8] \
 //     [--less-false-positives] \
 //     [--tmp-dir /path/to/tmp] \
-//     [--verify-count 10000]
+//     [--verify-count 10000] \
+//     [--read-buffer-mb 1024] \
+//     [--verify-workers 64]
 //
 // BUCKET SIZE / LEAF SIZE GUIDELINES:
 //   These values are generally fixed regardless of key count. Erigon uses:
@@ -49,7 +60,7 @@ package main
 //   - ~40 bytes per key during construction (for 2.5B keys: ~100GB)
 //   - For 1.5B keys: ~60GB
 //   - For 1B keys: ~40GB
-//   - This implementation assumes everything fits in memory (up to 64GB usable)
+//   - This implementation assumes everything fits in memory (up to 256GB usable)
 //
 // VERIFY COUNT:
 //   --verify-count controls how many keys to verify after building:
@@ -57,9 +68,17 @@ package main
 //   - -1 = verify ALL keys (can take hours for billions of keys)
 //   -  N = verify N randomly sampled keys (default: 10000)
 //
+// PERFORMANCE TIPS FOR LARGE DATASETS (2B+ keys):
+//   1. Use a fast SSD or NVMe drive for both input and tmp-dir
+//   2. Set --read-buffer-mb to 1024 or higher (you have 256GB RAM)
+//   3. Set --verify-workers to match your CPU core count (64 for your machine)
+//   4. Consider using a RAM disk for tmp-dir if possible
+//   5. Verification automatically uses memory-mapped I/O for speed
+//
 // =============================================================================
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"flag"
@@ -69,7 +88,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/recsplit"
@@ -86,34 +109,45 @@ const (
 	// TxHashSize is the size of a transaction hash
 	TxHashSize = 32
 
-	// LedgerSeqSize is the size of a ledger sequence number
-	LedgerSeqSize = 4
-
 	// DefaultVerifyCount is the default number of keys to verify
 	DefaultVerifyCount = 10000
 
-	// ProgressInterval is how often to print progress during processing
-	ProgressInterval = 10_000_000
+	// DefaultReadBufferMB is the default read buffer size in megabytes
+	// Larger buffers significantly reduce syscall overhead
+	DefaultReadBufferMB = 256
+
+	// DefaultVerifyWorkers is the default number of parallel verification workers
+	DefaultVerifyWorkers = 16
+
+	// BatchSize is the number of records to process in a batch
+	// This improves CPU cache utilization
+	BatchSize = 100000
+
+	// MemStatsInterval controls how often we collect memory stats (as percentage)
+	// Collecting mem stats is expensive, so we do it sparingly
+	MemStatsInterval = 10 // Every 10%
 )
 
 // =============================================================================
 // Timing structures
 // =============================================================================
 
+// BuildTiming holds timing information for each build phase
 type BuildTiming struct {
-	FileOpen     time.Duration
-	KeyCounting  time.Duration
-	RecSplitInit time.Duration
-	KeyReading   time.Duration
-	IndexBuild   time.Duration
-	Verification time.Duration
-	TotalTime    time.Duration
+	FileOpen     time.Duration // Time to open and analyze file
+	KeyCounting  time.Duration // Time to count keys (included in FileOpen)
+	RecSplitInit time.Duration // Time to initialize RecSplit
+	KeyReading   time.Duration // Time to read all keys and add to RecSplit
+	IndexBuild   time.Duration // Time to build the perfect hash function
+	Verification time.Duration // Time to verify the index
+	TotalTime    time.Duration // Total wall-clock time
 }
 
 // =============================================================================
 // Helper functions
 // =============================================================================
 
+// formatDuration formats a duration in a human-readable way
 func formatDuration(d time.Duration) string {
 	if d < time.Millisecond {
 		return fmt.Sprintf("%.2fµs", float64(d.Microseconds()))
@@ -126,6 +160,7 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
+// formatBytes formats a byte count in a human-readable way
 func formatBytes(bytes int64) string {
 	const (
 		KB = 1024
@@ -144,6 +179,7 @@ func formatBytes(bytes int64) string {
 	}
 }
 
+// formatNumber formats a number with thousands separators
 func formatNumber(n int64) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
@@ -157,6 +193,9 @@ func formatNumber(n int64) string {
 	return fmt.Sprintf("%d,%03d,%03d,%03d", n/1_000_000_000, (n/1_000_000)%1000, (n/1000)%1000, n%1000)
 }
 
+// printMemStats prints current memory statistics
+// This function calls runtime.ReadMemStats which causes a brief stop-the-world pause
+// Use sparingly (every 10% progress) to minimize impact on performance
 func printMemStats() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -167,8 +206,215 @@ func printMemStats() {
 		m.NumGC)
 }
 
+// printSeparator prints a visual separator line
 func printSeparator() {
 	fmt.Println("================================================================================")
+}
+
+// =============================================================================
+// Memory-mapped file reader (optional, for faster access)
+// =============================================================================
+
+// MmapReader provides memory-mapped file access for faster reading
+type MmapReader struct {
+	data     []byte // Memory-mapped data
+	fileSize int64  // Size of the file
+	file     *os.File
+}
+
+// NewMmapReader creates a new memory-mapped file reader
+func NewMmapReader(path string) (*MmapReader, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	fileSize := info.Size()
+
+	// Memory-map the file using unix package (works on Linux)
+	data, err := unix.Mmap(int(file.Fd()), 0, int(fileSize),
+		unix.PROT_READ, unix.MAP_SHARED)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to mmap file: %w", err)
+	}
+
+	// Advise the kernel about our access pattern
+	// For verification, we do random lookups, so MADV_RANDOM is more appropriate
+	// This tells the kernel to disable read-ahead since we won't be reading sequentially
+	// Note: This is just a hint to the kernel - if it fails, we can continue without it
+	if err := unix.Madvise(data, unix.MADV_RANDOM); err != nil {
+		// Log the error but don't fail - madvise is an optimization hint, not critical
+		fmt.Printf("  Warning: madvise(MADV_RANDOM) failed: %v (continuing anyway)\n", err)
+	}
+
+	return &MmapReader{
+		data:     data,
+		fileSize: fileSize,
+		file:     file,
+	}, nil
+}
+
+// Close unmaps and closes the file
+func (r *MmapReader) Close() error {
+	if r.data != nil {
+		unix.Munmap(r.data)
+		r.data = nil
+	}
+	if r.file != nil {
+		return r.file.Close()
+	}
+	return nil
+}
+
+// GetRecord returns the record at the given index
+func (r *MmapReader) GetRecord(index int) (txHash []byte, ledgerSeq uint32) {
+	offset := index * RecordSize
+	txHash = r.data[offset : offset+TxHashSize]
+	ledgerSeq = binary.BigEndian.Uint32(r.data[offset+TxHashSize : offset+RecordSize])
+	return
+}
+
+// =============================================================================
+// Parallel verification
+// =============================================================================
+
+// parallelVerifyAll verifies all keys using multiple workers
+func parallelVerifyAll(
+	idx *recsplit.Index,
+	mmapReader *MmapReader,
+	keyCount int,
+	numWorkers int,
+	progressChan chan<- int, // Channel to report progress
+) (verified, failed int64) {
+	var wg sync.WaitGroup
+	var verifiedCount, failedCount atomic.Int64
+
+	// Create a channel for work distribution
+	// Each item is a range of records to verify
+	type workRange struct {
+		start int
+		end   int
+	}
+	workChan := make(chan workRange, numWorkers*2)
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker gets its own index reader
+			reader := recsplit.NewIndexReader(idx)
+			defer reader.Close()
+
+			for work := range workChan {
+				localVerified := int64(0)
+				localFailed := int64(0)
+
+				for i := work.start; i < work.end; i++ {
+					txHash, expectedSeq := mmapReader.GetRecord(i)
+					actualSeq, found := reader.Lookup(txHash)
+
+					if !found {
+						localFailed++
+					} else if uint32(actualSeq) == expectedSeq {
+						localVerified++
+					} else {
+						localFailed++
+					}
+				}
+
+				verifiedCount.Add(localVerified)
+				failedCount.Add(localFailed)
+
+				// Report progress
+				if progressChan != nil {
+					progressChan <- work.end - work.start
+				}
+			}
+		}()
+	}
+
+	// Distribute work in chunks
+	chunkSize := 100000 // 100k records per chunk for good load balancing
+	for start := 0; start < keyCount; start += chunkSize {
+		end := start + chunkSize
+		if end > keyCount {
+			end = keyCount
+		}
+		workChan <- workRange{start: start, end: end}
+	}
+	close(workChan)
+
+	wg.Wait()
+	return verifiedCount.Load(), failedCount.Load()
+}
+
+// parallelVerifySample verifies a random sample of keys using multiple workers
+func parallelVerifySample(
+	idx *recsplit.Index,
+	mmapReader *MmapReader,
+	keyCount int,
+	sampleSize int,
+	numWorkers int,
+) (verified, failed int64) {
+	// Generate random indices
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	indices := rng.Perm(keyCount)[:sampleSize]
+
+	var wg sync.WaitGroup
+	var verifiedCount, failedCount atomic.Int64
+
+	// Distribute indices among workers
+	indicesPerWorker := (sampleSize + numWorkers - 1) / numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		start := w * indicesPerWorker
+		end := start + indicesPerWorker
+		if end > sampleSize {
+			end = sampleSize
+		}
+		if start >= sampleSize {
+			break
+		}
+
+		wg.Add(1)
+		go func(workerIndices []int) {
+			defer wg.Done()
+
+			reader := recsplit.NewIndexReader(idx)
+			defer reader.Close()
+
+			localVerified := int64(0)
+			localFailed := int64(0)
+
+			for _, recordIdx := range workerIndices {
+				txHash, expectedSeq := mmapReader.GetRecord(recordIdx)
+				actualSeq, found := reader.Lookup(txHash)
+
+				if !found {
+					localFailed++
+				} else if uint32(actualSeq) == expectedSeq {
+					localVerified++
+				} else {
+					localFailed++
+				}
+			}
+
+			verifiedCount.Add(localVerified)
+			failedCount.Add(localFailed)
+		}(indices[start:end])
+	}
+
+	wg.Wait()
+	return verifiedCount.Load(), failedCount.Load()
 }
 
 // =============================================================================
@@ -189,6 +435,8 @@ func main() {
 		lessFalsePositives bool
 		verifyCount        int
 		dataVersion        int
+		readBufferMB       int
+		verifyWorkers      int
 	)
 
 	flag.StringVar(&rawDataFile, "raw-data-file", "", "Path to raw binary data file (required)")
@@ -199,26 +447,35 @@ func main() {
 	flag.IntVar(&leafSize, "leaf-size", 0, "RecSplit leaf size (0 = use default)")
 	flag.BoolVar(&lessFalsePositives, "less-false-positives", false, "Enable false-positive detection filter (~9 bits/key overhead)")
 	flag.IntVar(&verifyCount, "verify-count", DefaultVerifyCount, "Number of keys to verify after build: 0=skip, -1=all, N=sample N keys")
-	flag.IntVar(&dataVersion, "version", 0, "Data structure version: 0=legacy, 1=with fuse filter support (required for --less-false-positives with Enums=false)")
+	flag.IntVar(&dataVersion, "version", 0, "Data structure version: 0=legacy, 1=with fuse filter support")
+	flag.IntVar(&readBufferMB, "read-buffer-mb", DefaultReadBufferMB, "Read buffer size in MB for key reading phase (larger = fewer syscalls)")
+	flag.IntVar(&verifyWorkers, "verify-workers", DefaultVerifyWorkers, "Number of parallel workers for verification")
 
 	flag.Parse()
 
 	// Validate required flags
 	if rawDataFile == "" || outputDir == "" {
-		fmt.Println("Usage: recsplit_builder --raw-data-file <path> --output-dir <path> [options]")
+		fmt.Println("Usage: recsplit_builder_optimized --raw-data-file <path> --output-dir <path> [options]")
 		fmt.Println()
 		flag.PrintDefaults()
 		fmt.Println()
 		fmt.Println("Examples:")
-		fmt.Println("  # Basic usage with defaults")
-		fmt.Println("  recsplit_builder --raw-data-file txns.bin --output-dir ./index")
+		fmt.Println("  # Basic usage with defaults (256MB buffer)")
+		fmt.Println("  recsplit_builder_optimized --raw-data-file txns.bin --output-dir ./index")
 		fmt.Println()
-		fmt.Println("  # With false-positive protection and full verification")
-		fmt.Println("  recsplit_builder --raw-data-file txns.bin --output-dir ./index --less-false-positives --verify-count -1")
+		fmt.Println("  # Maximum performance for large datasets (2B keys)")
+		fmt.Println("  recsplit_builder_optimized --raw-data-file txns.bin --output-dir ./index \\")
+		fmt.Println("    --read-buffer-mb 1024 --verify-workers 64 --verify-count -1")
 		fmt.Println()
-		fmt.Println("  # Custom bucket/leaf size for experimentation")
-		fmt.Println("  recsplit_builder --raw-data-file txns.bin --output-dir ./index --bucket-size 1000 --leaf-size 16")
+		fmt.Println("  # With false-positive protection")
+		fmt.Println("  recsplit_builder_optimized --raw-data-file txns.bin --output-dir ./index \\")
+		fmt.Println("    --less-false-positives --version 1")
 		os.Exit(1)
+	}
+
+	// Set verify workers to number of CPUs if not specified or too high
+	if verifyWorkers <= 0 {
+		verifyWorkers = runtime.NumCPU()
 	}
 
 	// Default tmp directory to output directory
@@ -244,6 +501,11 @@ func main() {
 		leafSize = int(recsplit.DefaultLeafSize)
 	}
 
+	// Calculate read buffer size in bytes
+	readBufferSize := readBufferMB * 1024 * 1024
+	// Ensure buffer size is a multiple of record size for clean reads
+	readBufferSize = (readBufferSize / RecordSize) * RecordSize
+
 	timing := BuildTiming{}
 	totalStart := time.Now()
 
@@ -251,7 +513,7 @@ func main() {
 	// Print configuration
 	// -------------------------------------------------------------------------
 	printSeparator()
-	fmt.Println("RecSplit Index Builder")
+	fmt.Println("RecSplit Index Builder (OPTIMIZED)")
 	printSeparator()
 	fmt.Println()
 	fmt.Println("Configuration:")
@@ -264,6 +526,13 @@ func main() {
 	fmt.Printf("  Less false positives: %v\n", lessFalsePositives)
 	fmt.Printf("  Data version:         %d\n", dataVersion)
 	fmt.Printf("  Verify count:         %d\n", verifyCount)
+	fmt.Println()
+	fmt.Println("Optimization settings:")
+	fmt.Printf("  Read buffer size:     %s (for key reading phase)\n", formatBytes(int64(readBufferSize)))
+	fmt.Printf("  Verify workers:       %d (for parallel verification)\n", verifyWorkers)
+	fmt.Printf("  Verification uses:    memory-mapped I/O (mmap)\n")
+	fmt.Printf("  CPU cores available:  %d\n", runtime.NumCPU())
+	fmt.Printf("  GOMAXPROCS:           %d\n", runtime.GOMAXPROCS(0))
 	fmt.Println()
 	printMemStats()
 	fmt.Println()
@@ -321,7 +590,7 @@ func main() {
 	// Remove existing index if present
 	os.Remove(idxPath)
 
-	// Create logger
+	// Create logger (using erigon's logger)
 	logger := log.New()
 
 	// Calculate bucket count for information
@@ -374,47 +643,77 @@ func main() {
 	}
 	defer file.Close()
 
-	// Read buffer for one record
-	recordBuf := make([]byte, RecordSize)
-	keysAdded := 0
-	lastProgressTime := time.Now()
+	// Use buffered reader with large buffer for reduced syscall overhead
+	// The buffer size is configurable via --read-buffer-mb flag
+	bufReader := bufio.NewReaderSize(file, readBufferSize)
 
-	fmt.Printf("  Reading %s records...\n", formatNumber(int64(keyCount)))
+	// Pre-allocate a large buffer for batch reading
+	// This reduces allocations and improves cache locality
+	batchBuffer := make([]byte, BatchSize*RecordSize)
+
+	keysAdded := 0
+	lastPercentReported := -1
+	startTime := time.Now()
+
+	fmt.Printf("  Reading %s records with %s buffer...\n", formatNumber(int64(keyCount)), formatBytes(int64(readBufferSize)))
 	fmt.Println()
 
-	for {
-		n, err := io.ReadFull(file, recordBuf)
-		if err == io.EOF {
+	// Process records in batches for better performance
+	for keysAdded < keyCount {
+		// Calculate how many records to read in this batch
+		remaining := keyCount - keysAdded
+		batchRecords := BatchSize
+		if remaining < batchRecords {
+			batchRecords = remaining
+		}
+		batchBytes := batchRecords * RecordSize
+
+		// Read a batch of records
+		n, err := io.ReadFull(bufReader, batchBuffer[:batchBytes])
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			fmt.Printf("ERROR: Failed to read batch at record %d: %v\n", keysAdded, err)
+			os.Exit(1)
+		}
+
+		actualRecords := n / RecordSize
+		if actualRecords == 0 {
 			break
 		}
-		if err != nil {
-			fmt.Printf("ERROR: Failed to read record %d: %v\n", keysAdded, err)
-			os.Exit(1)
-		}
-		if n != RecordSize {
-			fmt.Printf("ERROR: Short read at record %d: got %d bytes, expected %d\n", keysAdded, n, RecordSize)
-			os.Exit(1)
-		}
 
-		// Extract txHash and ledgerSeq
-		txHash := recordBuf[:TxHashSize]
-		ledgerSeq := binary.BigEndian.Uint32(recordBuf[TxHashSize:])
+		// Process each record in the batch
+		for i := 0; i < actualRecords; i++ {
+			offset := i * RecordSize
 
-		// Add to RecSplit
-		if err := rs.AddKey(txHash, uint64(ledgerSeq)); err != nil {
-			fmt.Printf("ERROR: Failed to add key %d: %v\n", keysAdded, err)
-			os.Exit(1)
+			// Extract txHash and ledgerSeq from the buffer
+			// Note: We pass a slice of the buffer directly to avoid copying
+			txHash := batchBuffer[offset : offset+TxHashSize]
+			ledgerSeq := binary.BigEndian.Uint32(batchBuffer[offset+TxHashSize : offset+RecordSize])
+
+			// Add to RecSplit
+			if err := rs.AddKey(txHash, uint64(ledgerSeq)); err != nil {
+				fmt.Printf("ERROR: Failed to add key %d: %v\n", keysAdded+i, err)
+				os.Exit(1)
+			}
 		}
 
-		keysAdded++
+		keysAdded += actualRecords
 
-		// Progress reporting
-		if keysAdded%ProgressInterval == 0 {
-			elapsed := time.Since(lastProgressTime)
-			rate := float64(ProgressInterval) / elapsed.Seconds()
-			fmt.Printf("  Added %s keys (%.0f keys/sec)...\n", formatNumber(int64(keysAdded)), rate)
-			printMemStats()
-			lastProgressTime = time.Now()
+		// Report progress at each 1% increment
+		currentPercent := (keysAdded * 100) / keyCount
+		if currentPercent > lastPercentReported {
+			elapsed := time.Since(startTime)
+			rate := float64(keysAdded) / elapsed.Seconds()
+			eta := time.Duration(float64(keyCount-keysAdded)/rate) * time.Second
+
+			fmt.Printf("  [%3d%%] Added %s keys | Rate: %.0f keys/sec | ETA: %s\n",
+				currentPercent, formatNumber(int64(keysAdded)), rate, formatDuration(eta))
+
+			// Print memory stats every 10% to avoid overhead
+			if currentPercent%MemStatsInterval == 0 && currentPercent > 0 {
+				printMemStats()
+			}
+
+			lastPercentReported = currentPercent
 		}
 	}
 
@@ -433,6 +732,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Close the file as we're done reading for key addition
+	file.Close()
+
 	// -------------------------------------------------------------------------
 	// Step 4: Build the index
 	// -------------------------------------------------------------------------
@@ -443,7 +745,14 @@ func main() {
 
 	stepStart = time.Now()
 	fmt.Println("  Building perfect hash function...")
-	fmt.Println("  (This may take a while for large datasets)")
+	fmt.Println("  (This is CPU-intensive and may take a while for large datasets)")
+	fmt.Println()
+
+	// Force garbage collection before the memory-intensive build phase
+	// This gives us maximum available heap for the build process
+	runtime.GC()
+	fmt.Println("  Pre-build GC completed")
+	printMemStats()
 	fmt.Println()
 
 	ctx := context.Background()
@@ -492,7 +801,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get size breakdown
+	// Get size breakdown from the index
 	total, offsets, ef, golombRice, existence, layer1 := idx.Sizes()
 
 	fmt.Println("  Size breakdown:")
@@ -519,137 +828,103 @@ func main() {
 	fmt.Println()
 
 	// -------------------------------------------------------------------------
-	// Step 6: Verification
+	// Step 6: Verification (with parallel processing)
 	// -------------------------------------------------------------------------
 	if verifyCount != 0 {
 		printSeparator()
-		fmt.Println("STEP 6: Verification")
+		fmt.Println("STEP 6: Verification (PARALLEL)")
 		printSeparator()
 		fmt.Println()
 
 		stepStart = time.Now()
 
-		// Create index reader
-		reader := recsplit.NewIndexReader(idx)
-		defer reader.Close()
+		// Use memory-mapped file for verification (much faster for random access)
+		mmapReader, err := NewMmapReader(rawDataFile)
+		if err != nil {
+			fmt.Printf("ERROR: Failed to create mmap reader for verification: %v\n", err)
+			fmt.Println("       Falling back to sequential verification...")
 
-		// Reopen raw data file
-		file.Seek(0, 0)
-
-		var keysToVerify int
-		var verifyAll bool
-		if verifyCount == -1 {
-			keysToVerify = keyCount
-			verifyAll = true
-			fmt.Printf("  Verifying ALL %s keys...\n", formatNumber(int64(keyCount)))
+			// Fallback to sequential verification (original code path)
+			// This is slower but doesn't require mmap support
+			verifySequential(idx, rawDataFile, keyCount, verifyCount)
 		} else {
-			keysToVerify = verifyCount
-			if keysToVerify > keyCount {
-				keysToVerify = keyCount
-			}
-			fmt.Printf("  Verifying %s randomly sampled keys...\n", formatNumber(int64(keysToVerify)))
-		}
-		fmt.Println()
+			defer mmapReader.Close()
 
-		verified := 0
-		failed := 0
+			var verified, failed int64
 
-		if verifyAll {
-			// Verify all keys sequentially
-			for i := 0; i < keyCount; i++ {
-				n, err := io.ReadFull(file, recordBuf)
-				if err != nil || n != RecordSize {
-					fmt.Printf("ERROR: Failed to read record %d for verification\n", i)
-					break
-				}
+			if verifyCount == -1 {
+				// Verify all keys with parallel workers
+				fmt.Printf("  Verifying ALL %s keys with %d parallel workers...\n",
+					formatNumber(int64(keyCount)), verifyWorkers)
+				fmt.Println()
 
-				txHash := recordBuf[:TxHashSize]
-				expectedLedgerSeq := binary.BigEndian.Uint32(recordBuf[TxHashSize:])
+				// Create progress channel
+				progressChan := make(chan int, verifyWorkers*2)
+				done := make(chan bool)
 
-				actualLedgerSeq, found := reader.Lookup(txHash)
-				if !found {
-					failed++
-					if failed <= 5 {
-						fmt.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d\n",
-							i, expectedLedgerSeq)
+				// Start progress reporter goroutine
+				go func() {
+					processed := 0
+					lastPercentReported := -1
+					startTime := time.Now()
+
+					for count := range progressChan {
+						processed += count
+						currentPercent := (processed * 100) / keyCount
+
+						if currentPercent > lastPercentReported {
+							elapsed := time.Since(startTime)
+							rate := float64(processed) / elapsed.Seconds()
+							eta := time.Duration(float64(keyCount-processed)/rate) * time.Second
+
+							fmt.Printf("  [%3d%%] Verified %s keys | Rate: %.0f keys/sec | ETA: %s\n",
+								currentPercent, formatNumber(int64(processed)), rate, formatDuration(eta))
+
+							// Print memory stats every 10%
+							if currentPercent%MemStatsInterval == 0 && currentPercent > 0 {
+								printMemStats()
+							}
+
+							lastPercentReported = currentPercent
+						}
 					}
-					continue
+					done <- true
+				}()
+
+				verified, failed = parallelVerifyAll(idx, mmapReader, keyCount, verifyWorkers, progressChan)
+				close(progressChan)
+				<-done
+
+			} else {
+				// Verify random sample with parallel workers
+				keysToVerify := verifyCount
+				if keysToVerify > keyCount {
+					keysToVerify = keyCount
 				}
 
-				if uint32(actualLedgerSeq) == expectedLedgerSeq {
-					verified++
-				} else {
-					failed++
-					if failed <= 5 {
-						fmt.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d\n",
-							i, expectedLedgerSeq, actualLedgerSeq)
-					}
-				}
+				fmt.Printf("  Verifying %s randomly sampled keys with %d parallel workers...\n",
+					formatNumber(int64(keysToVerify)), verifyWorkers)
+				fmt.Println()
 
-				if (i+1)%ProgressInterval == 0 {
-					fmt.Printf("  Verified %s keys...\n", formatNumber(int64(i+1)))
-				}
-			}
-		} else {
-			// Verify randomly sampled keys
-			// First, collect all records into memory for random access
-			fmt.Println("  Loading records for random sampling...")
-			records := make([]struct {
-				txHash    [TxHashSize]byte
-				ledgerSeq uint32
-			}, keyCount)
-
-			for i := 0; i < keyCount; i++ {
-				n, err := io.ReadFull(file, recordBuf)
-				if err != nil || n != RecordSize {
-					fmt.Printf("ERROR: Failed to read record %d\n", i)
-					os.Exit(1)
-				}
-				copy(records[i].txHash[:], recordBuf[:TxHashSize])
-				records[i].ledgerSeq = binary.BigEndian.Uint32(recordBuf[TxHashSize:])
+				verified, failed = parallelVerifySample(idx, mmapReader, keyCount, keysToVerify, verifyWorkers)
 			}
 
-			fmt.Println("  Sampling and verifying...")
+			timing.Verification = time.Since(stepStart)
 
-			// Random sampling
-			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-			indices := rng.Perm(keyCount)[:keysToVerify]
-
-			for _, i := range indices {
-				actualLedgerSeq, found := reader.Lookup(records[i].txHash[:])
-				if !found {
-					failed++
-					if failed <= 5 {
-						fmt.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d\n",
-							i, records[i].ledgerSeq)
-					}
-					continue
-				}
-
-				if uint32(actualLedgerSeq) == records[i].ledgerSeq {
-					verified++
-				} else {
-					failed++
-					if failed <= 5 {
-						fmt.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d\n",
-							i, records[i].ledgerSeq, actualLedgerSeq)
-					}
-				}
+			fmt.Println()
+			fmt.Printf("  Verified:             %s\n", formatNumber(verified))
+			fmt.Printf("  Failed:               %s\n", formatNumber(failed))
+			if verified+failed > 0 {
+				fmt.Printf("  Success rate:         %.4f%%\n", float64(verified)*100/float64(verified+failed))
 			}
-		}
+			fmt.Printf("  Verification time:    %s\n", formatDuration(timing.Verification))
+			fmt.Printf("  Verification rate:    %.0f keys/sec\n", float64(verified+failed)/timing.Verification.Seconds())
+			fmt.Println()
 
-		timing.Verification = time.Since(stepStart)
-
-		fmt.Println()
-		fmt.Printf("  Verified:             %s\n", formatNumber(int64(verified)))
-		fmt.Printf("  Failed:               %s\n", formatNumber(int64(failed)))
-		fmt.Printf("  Success rate:         %.4f%%\n", float64(verified)*100/float64(verified+failed))
-		fmt.Printf("  Verification time:    %s\n", formatDuration(timing.Verification))
-		fmt.Println()
-
-		if failed > 0 {
-			fmt.Println("WARNING: Some verifications failed!")
-			fmt.Println("         The index may be corrupted or there's a bug.")
+			if failed > 0 {
+				fmt.Println("WARNING: Some verifications failed!")
+				fmt.Println("         The index may be corrupted or there's a bug.")
+			}
 		}
 	} else {
 		fmt.Println()
@@ -711,4 +986,157 @@ func main() {
 	fmt.Printf("    Estimated index size: %s\n", formatBytes(int64(15_000_000_000*bitsPerKey/8)))
 	fmt.Println()
 	printSeparator()
+}
+
+// =============================================================================
+// Fallback sequential verification (used if mmap fails)
+// =============================================================================
+
+// verifySequential performs sequential verification without mmap
+// This is used as a fallback when memory mapping is not available
+func verifySequential(idx *recsplit.Index, rawDataFile string, keyCount, verifyCount int) {
+	stepStart := time.Now()
+
+	// Create index reader
+	reader := recsplit.NewIndexReader(idx)
+	defer reader.Close()
+
+	// Open raw data file
+	file, err := os.Open(rawDataFile)
+	if err != nil {
+		fmt.Printf("ERROR: Failed to open raw data file for verification: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	bufReader := bufio.NewReaderSize(file, 64*1024*1024) // 64MB buffer
+	recordBuf := make([]byte, RecordSize)
+
+	var keysToVerify int
+	var verifyAll bool
+	if verifyCount == -1 {
+		keysToVerify = keyCount
+		verifyAll = true
+		fmt.Printf("  Verifying ALL %s keys (sequential fallback)...\n", formatNumber(int64(keyCount)))
+	} else {
+		keysToVerify = verifyCount
+		if keysToVerify > keyCount {
+			keysToVerify = keyCount
+		}
+		fmt.Printf("  Verifying %s keys (sequential fallback)...\n", formatNumber(int64(keysToVerify)))
+	}
+	fmt.Println()
+
+	verified := 0
+	failed := 0
+	lastPercentReported := -1
+
+	if verifyAll {
+		// Verify all keys sequentially
+		for i := 0; i < keyCount; i++ {
+			n, err := io.ReadFull(bufReader, recordBuf)
+			if err != nil || n != RecordSize {
+				fmt.Printf("ERROR: Failed to read record %d for verification\n", i)
+				break
+			}
+
+			txHash := recordBuf[:TxHashSize]
+			expectedLedgerSeq := binary.BigEndian.Uint32(recordBuf[TxHashSize:])
+
+			actualLedgerSeq, found := reader.Lookup(txHash)
+			if !found {
+				failed++
+				if failed <= 5 {
+					fmt.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d\n",
+						i, expectedLedgerSeq)
+				}
+				continue
+			}
+
+			if uint32(actualLedgerSeq) == expectedLedgerSeq {
+				verified++
+			} else {
+				failed++
+				if failed <= 5 {
+					fmt.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d\n",
+						i, expectedLedgerSeq, actualLedgerSeq)
+				}
+			}
+
+			// Report progress at each 1%
+			currentPercent := ((i + 1) * 100) / keyCount
+			if currentPercent > lastPercentReported {
+				fmt.Printf("  [%3d%%] Verified %s keys...\n", currentPercent, formatNumber(int64(i+1)))
+				lastPercentReported = currentPercent
+			}
+		}
+	} else {
+		// For sample verification without mmap, we need to load records first
+		fmt.Println("  Loading records for random sampling...")
+		records := make([]struct {
+			txHash    [TxHashSize]byte
+			ledgerSeq uint32
+		}, keyCount)
+
+		for i := 0; i < keyCount; i++ {
+			n, err := io.ReadFull(bufReader, recordBuf)
+			if err != nil || n != RecordSize {
+				fmt.Printf("ERROR: Failed to read record %d\n", i)
+				return
+			}
+			copy(records[i].txHash[:], recordBuf[:TxHashSize])
+			records[i].ledgerSeq = binary.BigEndian.Uint32(recordBuf[TxHashSize:])
+		}
+
+		fmt.Println("  Sampling and verifying...")
+
+		// Random sampling
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		indices := rng.Perm(keyCount)[:keysToVerify]
+
+		for j, i := range indices {
+			actualLedgerSeq, found := reader.Lookup(records[i].txHash[:])
+			if !found {
+				failed++
+				if failed <= 5 {
+					fmt.Printf("  NOT FOUND at record %d: expected ledgerSeq=%d\n",
+						i, records[i].ledgerSeq)
+				}
+				continue
+			}
+
+			if uint32(actualLedgerSeq) == records[i].ledgerSeq {
+				verified++
+			} else {
+				failed++
+				if failed <= 5 {
+					fmt.Printf("  MISMATCH at record %d: expected ledgerSeq=%d, got=%d\n",
+						i, records[i].ledgerSeq, actualLedgerSeq)
+				}
+			}
+
+			// Progress for sample verification
+			currentPercent := ((j + 1) * 100) / keysToVerify
+			if currentPercent > lastPercentReported && currentPercent%10 == 0 {
+				fmt.Printf("  [%3d%%] Verified %s samples...\n", currentPercent, formatNumber(int64(j+1)))
+				lastPercentReported = currentPercent
+			}
+		}
+	}
+
+	verificationTime := time.Since(stepStart)
+
+	fmt.Println()
+	fmt.Printf("  Verified:             %s\n", formatNumber(int64(verified)))
+	fmt.Printf("  Failed:               %s\n", formatNumber(int64(failed)))
+	if verified+failed > 0 {
+		fmt.Printf("  Success rate:         %.4f%%\n", float64(verified)*100/float64(verified+failed))
+	}
+	fmt.Printf("  Verification time:    %s\n", formatDuration(verificationTime))
+	fmt.Println()
+
+	if failed > 0 {
+		fmt.Println("WARNING: Some verifications failed!")
+		fmt.Println("         The index may be corrupted or there's a bug.")
+	}
 }
