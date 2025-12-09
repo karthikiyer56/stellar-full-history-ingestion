@@ -70,23 +70,13 @@ import (
 	"strings"
 	"time"
 
-	// Stellar SDK imports for parsing LedgerCloseMeta and transactions
+	"github.com/erigontech/erigon/db/recsplit"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/klauspost/compress/zstd"
+	"github.com/linxGnu/grocksdb"
 	"github.com/stellar/go/ingest"
 	"github.com/stellar/go/network"
 	"github.com/stellar/go/xdr"
-
-	// RecSplit from erigontech (NOT erigon-lib!)
-	// This is the production-tested implementation used in Ethereum's Erigon client
-	"github.com/erigontech/erigon/db/recsplit"
-
-	// RocksDB Go bindings for querying ledger data
-	"github.com/linxGnu/grocksdb"
-
-	// Zstd decompression for compressed LedgerCloseMeta
-	"github.com/klauspost/compress/zstd"
-
-	// Local helpers for formatting (FormatDuration, FormatBytes, etc.)
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 )
 
 // =============================================================================
@@ -115,32 +105,15 @@ type OpenTiming struct {
 
 // QueryTiming tracks the time for each step of a single query
 type QueryTiming struct {
-	// Part 1: RecSplit lookup (txHash -> ledgerSeq)
-	// This should be O(1) and very fast (~100-500ns typically)
-	RecSplitLookup time.Duration
-
-	// Part 2: RocksDB lookup (ledgerSeq -> compressed LCM)
-	// This depends on cache hit rate and disk I/O
-	RocksDBQuery time.Duration
-
-	// Decompression of LedgerCloseMeta using zstd
-	// LCMs can be large (100KB-10MB+), so this can be significant
-	Decompress time.Duration
-
-	// XDR unmarshaling of the decompressed LedgerCloseMeta
-	// This parses the binary XDR format into Go structs
-	Unmarshal time.Duration
-
-	// Transaction reader creation and search
-	TxReaderCreate time.Duration // Time to create the transaction reader
-	TxSearch       time.Duration // Time to iterate through transactions
-	TxCount        int           // Number of transactions scanned in this ledger
-
-	// Transaction data extraction (marshaling envelope, result, meta to bytes)
-	TxExtract time.Duration
-
-	// Total end-to-end query time
-	Total time.Duration
+	RecSplitLookup time.Duration // Part 1: RecSplit lookup (txHash -> ledgerSeq)
+	RocksDBQuery   time.Duration // Part 2: RocksDB lookup (ledgerSeq -> compressed LCM)
+	Decompress     time.Duration // Decompression of LedgerCloseMeta using zstd
+	Unmarshal      time.Duration // XDR unmarshaling
+	TxReaderCreate time.Duration // Transaction reader creation
+	TxSearch       time.Duration // Time to find matching hash
+	TxCount        int           // Number of transactions scanned
+	TxExtract      time.Duration // Transaction data extraction
+	Total          time.Duration // Total end-to-end query time
 }
 
 // =============================================================================
@@ -178,54 +151,42 @@ type QueryResult struct {
 // We separate "found" queries from various "not found" scenarios.
 
 type RunningStats struct {
-	// === SUCCESSFUL QUERIES ===
-	// These are queries where the txHash was found and all data extracted
-	QueryCount      int           // Total successful queries
-	TotalRecSplit   time.Duration // Cumulative RecSplit lookup time
-	TotalRocksDB    time.Duration // Cumulative RocksDB query time
-	TotalDecompress time.Duration // Cumulative decompression time
-	TotalUnmarshal  time.Duration // Cumulative XDR unmarshal time
-	TotalTxSearch   time.Duration // Cumulative transaction search time
-	TotalTxExtract  time.Duration // Cumulative extraction time
-	TotalTime       time.Duration // Cumulative total query time
-	TotalTxScanned  int           // Total transactions scanned across all queries
+	// Successful queries
+	QueryCount          int
+	TotalRecSplit       time.Duration
+	TotalRocksDB        time.Duration
+	TotalDecompress     time.Duration
+	TotalUnmarshal      time.Duration
+	TotalTxReaderCreate time.Duration
+	TotalTxSearch       time.Duration
+	TotalTxExtract      time.Duration
+	TotalTime           time.Duration
+	TotalTxScanned      int
 
-	// === NOT FOUND SCENARIOS ===
-	// We track three distinct "not found" scenarios:
+	// Not found in RecSplit filter
+	NotFoundInRecSplit          int
+	TotalTimeNotFoundFilter     time.Duration
+	TotalRecSplitNotFoundFilter time.Duration
 
-	// 1. RecSplit returned found=false (only possible with false-positive filter)
-	//    This is a clean rejection - the key definitely doesn't exist
-	NotFoundInRecSplit      int
-	TotalTimeNotFoundFilter time.Duration // Time spent on these (very fast)
-
-	// 2. RecSplit returned found=true, but ledger not in RocksDB
-	//    This indicates data inconsistency between index and database
+	// Not found in RocksDB
 	NotFoundInRocksDB       int
 	TotalTimeNotFoundDB     time.Duration
-	TotalRecSplitNotFoundDB time.Duration // RecSplit time for these queries
+	TotalRecSplitNotFoundDB time.Duration
+	TotalRocksDBNotFoundDB  time.Duration
 
-	// 3. RecSplit returned a ledgerSeq, ledger exists, but txHash not in ledger
-	//    This is a "false positive" from RecSplit - it mapped a non-existent
-	//    key to some bucket that happened to point to a valid ledger
-	FalsePositiveLedgerScan      int
-	TotalTimeFalsePositive       time.Duration
-	TotalRecSplitFalsePositive   time.Duration
-	TotalRocksDBFalsePositive    time.Duration
-	TotalDecompressFalsePositive time.Duration
-	TotalUnmarshalFalsePositive  time.Duration
-	TotalTxSearchFalsePositive   time.Duration
-	TotalTxScannedFalsePositive  int
+	// False positives (found in RecSplit, but not in ledger)
+	FalsePositiveLedgerScan          int
+	TotalTimeFalsePositive           time.Duration
+	TotalRecSplitFalsePositive       time.Duration
+	TotalRocksDBFalsePositive        time.Duration
+	TotalDecompressFalsePositive     time.Duration
+	TotalUnmarshalFalsePositive      time.Duration
+	TotalTxReaderCreateFalsePositive time.Duration
+	TotalTxSearchFalsePositive       time.Duration
+	TotalTxScannedFalsePositive      int
 }
 
-// =============================================================================
-// MAIN FUNCTION
-// =============================================================================
-
 func main() {
-	// =========================================================================
-	// PARSE COMMAND-LINE FLAGS
-	// =========================================================================
-
 	var (
 		// Required: Path to the RecSplit index file (.idx)
 		recsplitIndexFile string
@@ -266,10 +227,6 @@ func main() {
 
 	flag.Parse()
 
-	// =========================================================================
-	// VALIDATE ARGUMENTS
-	// =========================================================================
-
 	if recsplitIndexFile == "" || ledgerSeqToLCMDB == "" {
 		log.Fatalf("Both --recsplit-index-file and --ledger-seq-to-lcm-db are required")
 	}
@@ -279,8 +236,6 @@ func main() {
 	if !ongoing && txHashHex == "" {
 		log.Fatalf("Provide either --tx <hash> for single query OR --ongoing for batch mode")
 	}
-
-	// Verify paths exist
 	if _, err := os.Stat(recsplitIndexFile); os.IsNotExist(err) {
 		log.Fatalf("RecSplit index file does not exist: %s", recsplitIndexFile)
 	}
@@ -288,14 +243,10 @@ func main() {
 		log.Fatalf("RocksDB path does not exist: %s", ledgerSeqToLCMDB)
 	}
 
-	// =========================================================================
-	// OPEN RESOURCES WITH TIMING
-	// =========================================================================
-
+	// Open resources with timing
 	openTiming := OpenTiming{}
 	grandStart := time.Now()
 
-	// -------------------------------------------------------------------------
 	// Open RecSplit Index
 	// -------------------------------------------------------------------------
 	// RecSplit uses mmap internally, so "opening" the index is very fast.
@@ -313,7 +264,6 @@ func main() {
 	rsReader := recsplit.NewIndexReader(rsIndex)
 	defer rsReader.Close()
 
-	// -------------------------------------------------------------------------
 	// Open RocksDB
 	// -------------------------------------------------------------------------
 	// RocksDB stores ledgerSeq -> compressed LedgerCloseMeta
@@ -324,9 +274,7 @@ func main() {
 
 	t2 := time.Now()
 	rocksOpts := grocksdb.NewDefaultOptions()
-	rocksOpts.SetCreateIfMissing(false) // Database must already exist
-
-	// Configure block-based table options for better read performance
+	rocksOpts.SetCreateIfMissing(false)
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
 	if blockCacheSizeMB > 0 {
 		// LRU cache for frequently accessed data blocks
@@ -356,7 +304,6 @@ func main() {
 	openTiming.RocksDBROCreate = time.Since(t4)
 	openTiming.RocksDBTotal = openTiming.RocksDBOptsCreate + openTiming.RocksDBOpen + openTiming.RocksDBROCreate
 
-	// -------------------------------------------------------------------------
 	// Create Zstd Decoder
 	// -------------------------------------------------------------------------
 	// LedgerCloseMeta data is compressed with zstd for storage efficiency.
@@ -368,57 +315,14 @@ func main() {
 	}
 	defer zstdDecoder.Close()
 	openTiming.DecoderCreate = time.Since(t5)
-
 	openTiming.GrandTotal = time.Since(grandStart)
 
-	// =========================================================================
-	// PRINT INITIALIZATION SUMMARY
-	// =========================================================================
-
-	fmt.Println()
-	printSeparator()
-	fmt.Println("RecSplit + RocksDB Two-Part Lookup - Initialization")
-	printSeparator()
-	fmt.Println()
-
-	// RecSplit index info
-	fmt.Printf("RecSplit Index: %s\n", recsplitIndexFile)
-	fmt.Printf("  Load time:                    %s\n", helpers.FormatDuration(openTiming.RecSplitLoad))
-	fmt.Printf("  Keys indexed:                 %s\n", helpers.FormatNumber(int64(rsIndex.KeyCount())))
-	fmt.Printf("  Index size:                   %s\n", helpers.FormatBytes(rsIndex.Size()))
-	fmt.Printf("  Bits per key:                 %.2f\n", float64(rsIndex.Size()*8)/float64(rsIndex.KeyCount()))
-	fmt.Printf("  Bucket size:                  %d\n", rsIndex.BucketSize())
-	fmt.Printf("  Leaf size:                    %d\n", rsIndex.LeafSize())
-	fmt.Printf("  False-positive filter:        %v\n", builtWithFalsePositiveSupport)
-	fmt.Println()
-
-	// RocksDB info
-	fmt.Printf("RocksDB: %s\n", ledgerSeqToLCMDB)
-	fmt.Printf("  Options create:               %s\n", helpers.FormatDuration(openTiming.RocksDBOptsCreate))
-	fmt.Printf("  DB open:                      %s\n", helpers.FormatDuration(openTiming.RocksDBOpen))
-	fmt.Printf("  ReadOpts create:              %s\n", helpers.FormatDuration(openTiming.RocksDBROCreate))
-	fmt.Printf("  Total:                        %s\n", helpers.FormatDuration(openTiming.RocksDBTotal))
-	fmt.Printf("  Block cache:                  %d MB\n", blockCacheSizeMB)
-	printRocksDBStats(rocksDB)
-	fmt.Println()
-
-	fmt.Printf("Zstd decoder create:            %s\n", helpers.FormatDuration(openTiming.DecoderCreate))
-	fmt.Println()
-	fmt.Printf("TOTAL INITIALIZATION TIME:      %s\n", helpers.FormatDuration(openTiming.GrandTotal))
-	printSeparator()
-	fmt.Println()
-
-	printMemStats()
-	fmt.Println()
-
-	// =========================================================================
-	// ONGOING MODE (BATCH/INTERACTIVE)
-	// =========================================================================
+	// Print initialization summary
+	printInitSummary(recsplitIndexFile, ledgerSeqToLCMDB, rsIndex, rocksDB, openTiming, blockCacheSizeMB, builtWithFalsePositiveSupport)
 
 	if ongoing {
 		stats := RunningStats{}
 		scanner := bufio.NewScanner(os.Stdin)
-
 		fmt.Println("Ongoing mode: enter tx hashes (one per line)")
 		fmt.Println("Commands: STATS (show statistics), STOP (exit)")
 		fmt.Println()
@@ -440,64 +344,26 @@ func main() {
 				continue
 			}
 
-			// Execute the query
-			timing, result, queryErr := runQuery(
-				rsReader,
-				rocksDB,
-				rocksRO,
-				zstdDecoder,
-				line,
-				builtWithFalsePositiveSupport,
-			)
-
-			// Update statistics based on the result
+			fmt.Println(line)
+			timing, result, queryErr := runQuery(rsReader, rocksDB, rocksRO, zstdDecoder, line, builtWithFalsePositiveSupport)
 			updateStats(&stats, timing, result, queryErr)
 
-			// Print output based on quiet mode and result
 			if queryErr != nil {
-				if !quiet {
-					fmt.Printf("NOT FOUND: %s\n", line)
-					fmt.Printf("  Reason: %v\n", queryErr)
-					fmt.Printf("  RecSplit lookup: %s\n", helpers.FormatDuration(timing.RecSplitLookup))
-					if timing.RocksDBQuery > 0 {
-						fmt.Printf("  RocksDB query:   %s\n", helpers.FormatDuration(timing.RocksDBQuery))
-					}
-					if timing.TxSearch > 0 {
-						fmt.Printf("  Tx search:       %s (scanned %d txs)\n",
-							helpers.FormatDuration(timing.TxSearch), timing.TxCount)
-					}
-					fmt.Printf("  Total time:      %s\n", helpers.FormatDuration(timing.Total))
-					fmt.Println()
-				} else {
-					// Quiet mode - single line for not found
-					fmt.Printf("NOT_FOUND: %s | RecSplit: %s | Total: %s | Reason: %v\n",
-						truncateHash(line), helpers.FormatDuration(timing.RecSplitLookup),
-						helpers.FormatDuration(timing.Total), queryErr)
-				}
+				printNotFoundResult(result, timing, queryErr, quiet)
 			} else {
 				printQueryResult(timing, result, quiet)
 			}
 		}
-
-		// Scanner finished (EOF from piped input)
 		printFinalStats(stats, builtWithFalsePositiveSupport)
 		return
 	}
 
-	// =========================================================================
-	// SINGLE QUERY MODE
-	// =========================================================================
-
-	timing, result, err := runQuery(
-		rsReader,
-		rocksDB,
-		rocksRO,
-		zstdDecoder,
-		txHashHex,
-		builtWithFalsePositiveSupport,
-	)
+	// Single query mode
+	fmt.Println(txHashHex)
+	timing, result, err := runQuery(rsReader, rocksDB, rocksRO, zstdDecoder, txHashHex, builtWithFalsePositiveSupport)
 	if err != nil {
-		log.Fatalf("Query failed: %v", err)
+		printNotFoundResult(result, timing, err, quiet)
+		os.Exit(1)
 	}
 	printQueryResult(timing, result, quiet)
 }
@@ -532,19 +398,19 @@ func runQuery(
 	timing := QueryTiming{}
 	totalStart := time.Now()
 
-	// -------------------------------------------------------------------------
 	// Step 1: Parse the transaction hash
 	// -------------------------------------------------------------------------
 	// Transaction hashes are 32 bytes (256 bits), represented as 64 hex characters
 	txHashBytes, err := hex.DecodeString(txHashHex)
 	if err != nil {
+		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("invalid hex string: %v", err)
 	}
 	if len(txHashBytes) != 32 {
+		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("invalid hash length: expected 32 bytes, got %d", len(txHashBytes))
 	}
 
-	// -------------------------------------------------------------------------
 	// Step 2: RecSplit Lookup (txHash -> ledgerSeq)
 	// -------------------------------------------------------------------------
 	// RecSplit provides O(1) lookup with ~2 bits per key overhead.
@@ -564,11 +430,8 @@ func runQuery(
 		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("not found in RecSplit filter")
 	}
-
-	// Convert to uint32 (ledger sequence numbers fit in 32 bits)
 	ledgerSeq := uint32(ledgerSeqU64)
 
-	// -------------------------------------------------------------------------
 	// Step 3: RocksDB Lookup (ledgerSeq -> compressed LCM)
 	// -------------------------------------------------------------------------
 	// The key is a 4-byte big-endian encoding of the ledger sequence number.
@@ -586,7 +449,6 @@ func runQuery(
 	}
 	defer slice.Free()
 
-	// Check if the ledger exists in RocksDB
 	if !slice.Exists() {
 		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
@@ -596,7 +458,6 @@ func runQuery(
 	compressedLCM := make([]byte, len(slice.Data()))
 	copy(compressedLCM, slice.Data())
 
-	// -------------------------------------------------------------------------
 	// Step 4: Decompress LedgerCloseMeta
 	// -------------------------------------------------------------------------
 	// LedgerCloseMeta contains all the information about a closed ledger,
@@ -605,51 +466,34 @@ func runQuery(
 	t3 := time.Now()
 	uncompressedLCM, err := zstdDecoder.DecodeAll(compressedLCM, nil)
 	timing.Decompress = time.Since(t3)
-
 	if err != nil {
 		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("zstd decompression failed: %v", err)
 	}
 
-	// -------------------------------------------------------------------------
 	// Step 5: Unmarshal XDR to LedgerCloseMeta
-	// -------------------------------------------------------------------------
-	// XDR (External Data Representation) is Stellar's binary serialization format.
-	// LedgerCloseMeta contains the ledger header, transaction set, and results.
 	t4 := time.Now()
 	var lcm xdr.LedgerCloseMeta
 	err = lcm.UnmarshalBinary(uncompressedLCM)
 	timing.Unmarshal = time.Since(t4)
-
 	if err != nil {
 		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("XDR unmarshal failed: %v", err)
 	}
 
-	// -------------------------------------------------------------------------
 	// Step 6: Search for Transaction in Ledger
-	// -------------------------------------------------------------------------
-	// Create a transaction reader that iterates through all transactions in the ledger.
-	// We need to find the transaction with the matching hash.
-	//
-	// Note: This is a linear scan. For ledgers with many transactions, this
-	// could be optimized by storing the transaction index in the RecSplit value.
 	t5 := time.Now()
-	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(
-		network.PublicNetworkPassphrase, lcm)
+	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(network.PublicNetworkPassphrase, lcm)
 	timing.TxReaderCreate = time.Since(t5)
-
 	if err != nil {
 		timing.Total = time.Since(totalStart)
 		return timing, nil, fmt.Errorf("failed to create transaction reader: %v", err)
 	}
 	defer txReader.Close()
 
-	// Iterate through all transactions to find the matching hash
 	t6 := time.Now()
 	var foundTx *ingest.LedgerTransaction
 	txCount := 0
-
 	for {
 		tx, err := txReader.Read()
 		if err == io.EOF {
@@ -660,9 +504,6 @@ func runQuery(
 			return timing, nil, fmt.Errorf("error reading transaction: %v", err)
 		}
 		txCount++
-
-		// Compare the transaction hash
-		// tx.Hash is a [32]byte, HexString() returns lowercase hex
 		if tx.Hash.HexString() == strings.ToLower(txHashHex) {
 			foundTx = &tx
 			break
@@ -675,40 +516,23 @@ func runQuery(
 	// The key was never in the index, but RecSplit mapped it to this ledger anyway
 	if foundTx == nil {
 		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("txHash not found in ledger %d (scanned %d txs) - RecSplit false positive",
-			ledgerSeq, txCount)
+		// hack.. include the incorrectly returned ledgerSequence so that you can print it to console
+		badResult := &QueryResult{
+			TxHash:    txHashHex,
+			LedgerSeq: ledgerSeq,
+		}
+		return timing, badResult, fmt.Errorf("txHash not found in ledger %d (scanned %d txs) - RecSplit false positive", ledgerSeq, txCount)
 	}
 
-	// -------------------------------------------------------------------------
 	// Step 7: Extract Transaction Data
-	// -------------------------------------------------------------------------
-	// Marshal the transaction components back to XDR binary format.
-	// This gives us the raw bytes that can be used for further processing.
 	t7 := time.Now()
-
-	envelopeBytes, err := foundTx.Envelope.MarshalBinary()
-	if err != nil {
-		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("failed to marshal envelope: %v", err)
-	}
-
-	resultBytes, err := foundTx.Result.MarshalBinary()
-	if err != nil {
-		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("failed to marshal result: %v", err)
-	}
-
-	metaBytes, err := foundTx.UnsafeMeta.MarshalBinary()
-	if err != nil {
-		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("failed to marshal meta: %v", err)
-	}
-
+	envelopeBytes, _ := foundTx.Envelope.MarshalBinary()
+	resultBytes, _ := foundTx.Result.MarshalBinary()
+	metaBytes, _ := foundTx.UnsafeMeta.MarshalBinary()
 	timing.TxExtract = time.Since(t7)
 	timing.Total = time.Since(totalStart)
 
-	// Build the result
-	result := &QueryResult{
+	return timing, &QueryResult{
 		TxHash:              txHashHex,
 		LedgerSeq:           ledgerSeq,
 		TxIndex:             foundTx.Index,
@@ -718,9 +542,7 @@ func runQuery(
 		MetaBytes:           metaBytes,
 		CompressedLCMSize:   len(compressedLCM),
 		UncompressedLCMSize: len(uncompressedLCM),
-	}
-
-	return timing, result, nil
+	}, nil
 }
 
 // =============================================================================
@@ -735,12 +557,12 @@ func runQuery(
 //  4. False positive from RecSplit (txHash not in ledger)
 func updateStats(stats *RunningStats, timing QueryTiming, result *QueryResult, err error) {
 	if err == nil {
-		// Successful query
 		stats.QueryCount++
 		stats.TotalRecSplit += timing.RecSplitLookup
 		stats.TotalRocksDB += timing.RocksDBQuery
 		stats.TotalDecompress += timing.Decompress
 		stats.TotalUnmarshal += timing.Unmarshal
+		stats.TotalTxReaderCreate += timing.TxReaderCreate
 		stats.TotalTxSearch += timing.TxSearch
 		stats.TotalTxExtract += timing.TxExtract
 		stats.TotalTime += timing.Total
@@ -754,77 +576,164 @@ func updateStats(stats *RunningStats, timing QueryTiming, result *QueryResult, e
 	if strings.Contains(errStr, "not found in RecSplit filter") {
 		stats.NotFoundInRecSplit++
 		stats.TotalTimeNotFoundFilter += timing.Total
-		return
-	}
-
-	// Case 2: Not found in RocksDB
-	if strings.Contains(errStr, "not found in RocksDB") {
+		stats.TotalRecSplitNotFoundFilter += timing.RecSplitLookup
+	} else if strings.Contains(errStr, "not found in RocksDB") {
 		stats.NotFoundInRocksDB++
 		stats.TotalTimeNotFoundDB += timing.Total
 		stats.TotalRecSplitNotFoundDB += timing.RecSplitLookup
-		return
-	}
-
-	// Case 3: False positive (txHash not found in ledger)
-	if strings.Contains(errStr, "RecSplit false positive") {
+		stats.TotalRocksDBNotFoundDB += timing.RocksDBQuery
+	} else if strings.Contains(errStr, "RecSplit false positive") {
 		stats.FalsePositiveLedgerScan++
 		stats.TotalTimeFalsePositive += timing.Total
 		stats.TotalRecSplitFalsePositive += timing.RecSplitLookup
 		stats.TotalRocksDBFalsePositive += timing.RocksDBQuery
 		stats.TotalDecompressFalsePositive += timing.Decompress
 		stats.TotalUnmarshalFalsePositive += timing.Unmarshal
+		stats.TotalTxReaderCreateFalsePositive += timing.TxReaderCreate
 		stats.TotalTxSearchFalsePositive += timing.TxSearch
 		stats.TotalTxScannedFalsePositive += timing.TxCount
-		return
+	} else {
+		stats.NotFoundInRecSplit++
+		stats.TotalTimeNotFoundFilter += timing.Total
 	}
-
-	// Other errors (hex parsing, etc.) - count as filter not found for simplicity
-	stats.NotFoundInRecSplit++
-	stats.TotalTimeNotFoundFilter += timing.Total
 }
 
-// =============================================================================
-// OUTPUT FUNCTIONS
-// =============================================================================
+func printInitSummary(rsFile, dbPath string, rsIndex *recsplit.Index, rocksDB *grocksdb.DB, t OpenTiming, cacheMB int, hasFP bool) {
+	fmt.Println()
+	fmt.Println("================================================================================")
+	fmt.Println("RecSplit + RocksDB Two-Part Lookup - Initialization")
+	fmt.Println("================================================================================")
+	fmt.Println()
+	fmt.Printf("RecSplit Index: %s\n", rsFile)
+	fmt.Printf("  Load time:                    %s\n", helpers.FormatDuration(t.RecSplitLoad))
+	fmt.Printf("  Keys indexed:                 %s\n", helpers.FormatNumber(int64(rsIndex.KeyCount())))
+	fmt.Printf("  Index size:                   %s\n", helpers.FormatBytes(rsIndex.Size()))
+	fmt.Printf("  Bits per key:                 %.2f\n", float64(rsIndex.Size()*8)/float64(rsIndex.KeyCount()))
+	fmt.Printf("  Bucket size:                  %d\n", rsIndex.BucketSize())
+	fmt.Printf("  Leaf size:                    %d\n", rsIndex.LeafSize())
+	fmt.Printf("  False-positive filter:        %v\n", hasFP)
+	fmt.Println()
+	fmt.Printf("RocksDB (ledgerSeq -> LCM): %s\n", dbPath)
+	fmt.Printf("  Options create:               %s\n", helpers.FormatDuration(t.RocksDBOptsCreate))
+	fmt.Printf("  DB open:                      %s\n", helpers.FormatDuration(t.RocksDBOpen))
+	fmt.Printf("  ReadOpts create:              %s\n", helpers.FormatDuration(t.RocksDBROCreate))
+	fmt.Printf("  Subtotal:                     %s\n", helpers.FormatDuration(t.RocksDBTotal))
+	fmt.Printf("  Block cache:                  %d MB\n", cacheMB)
+	fmt.Println()
+	fmt.Println("RocksDB Statistics:")
+	fmt.Printf("  Estimated keys:               %s\n", rocksDB.GetProperty("rocksdb.estimate-num-keys"))
+	fmt.Printf("  Total SST size:               %s\n", formatBytesFromProperty(rocksDB.GetProperty("rocksdb.total-sst-files-size")))
+	fmt.Printf("  Live SST size:                %s\n", formatBytesFromProperty(rocksDB.GetProperty("rocksdb.live-sst-files-size")))
+	fmt.Printf("  Files by level:               ")
+	for i := 0; i < 7; i++ {
+		files := rocksDB.GetProperty(fmt.Sprintf("rocksdb.num-files-at-level%d", i))
+		if i > 0 {
+			fmt.Printf(" ")
+		}
+		fmt.Printf("L%d=%s", i, files)
+	}
+	fmt.Println()
+	fmt.Println()
+	fmt.Printf("Zstd decoder create:            %s\n", helpers.FormatDuration(t.DecoderCreate))
+	fmt.Println()
+	fmt.Printf("TOTAL INITIALIZATION TIME:      %s\n", helpers.FormatDuration(t.GrandTotal))
+	fmt.Println("================================================================================")
+	fmt.Println()
+	printMemStats()
+	fmt.Println()
+}
 
-// printQueryResult prints the result of a successful query.
-// In quiet mode, prints a single summary line.
-// In verbose mode, prints detailed breakdown with hex-encoded transaction data.
+func printNotFoundResult(result *QueryResult, timing QueryTiming, err error, quiet bool) {
+	errStr := err.Error()
+
+	if strings.Contains(errStr, "not found in RecSplit filter") {
+		fmt.Printf("NOT FOUND in RecSplit filter - Query took: %s\n", helpers.FormatDuration(timing.RecSplitLookup))
+		if !quiet {
+			fmt.Printf("Error: %v\n", err)
+		}
+	} else if strings.Contains(errStr, "not found in RocksDB") {
+		fmt.Printf("NOT FOUND in RocksDB - Query took: %s\n", helpers.FormatDuration(timing.Total))
+		if !quiet {
+			fmt.Println()
+			fmt.Println("Timing Breakdown:")
+			fmt.Printf("  RecSplit (hash->seq):      %s\n", helpers.FormatDuration(timing.RecSplitLookup))
+			fmt.Printf("  RocksDB (seq->LCM):        %s\n", helpers.FormatDuration(timing.RocksDBQuery))
+			fmt.Printf("  ----------------------------------------\n")
+			fmt.Printf("  TOTAL:                     %s\n", helpers.FormatDuration(timing.Total))
+			fmt.Println()
+			fmt.Printf("Error: %v\n", err)
+		}
+	} else if strings.Contains(errStr, "RecSplit false positive") {
+		// AHA, this case will have returned a random ledgerSequence number, that recsplit thought contained the txHash
+		// Just print it for kicks
+		falseLedgerSeq := result.LedgerSeq
+		txHash := result.TxHash
+		fmt.Printf("FALSE POSITIVE - RecSplit returned ledger %d, but txHash: %s not found. Query took %s\n",
+			falseLedgerSeq, txHash, helpers.FormatDuration(timing.Total))
+		if !quiet {
+			fmt.Println()
+			fmt.Println("Timing Breakdown:")
+			fmt.Printf("  RecSplit (hash->seq):      %s\n", helpers.FormatDuration(timing.RecSplitLookup))
+			fmt.Printf("  RocksDB (seq->LCM):        %s\n", helpers.FormatDuration(timing.RocksDBQuery))
+			fmt.Printf("  Decompress (zstd):         %s\n", helpers.FormatDuration(timing.Decompress))
+			fmt.Printf("  Unmarshal (XDR):           %s\n", helpers.FormatDuration(timing.Unmarshal))
+			fmt.Printf("  TxReader Create:           %s\n", helpers.FormatDuration(timing.TxReaderCreate))
+			fmt.Printf("  TxSearch (%d txs):         %s\n", timing.TxCount, helpers.FormatDuration(timing.TxSearch))
+			fmt.Printf("  ----------------------------------------\n")
+			fmt.Printf("  TOTAL:                     %s\n", helpers.FormatDuration(timing.Total))
+			fmt.Println()
+			fmt.Printf("Error: %v\n", err)
+		}
+	} else {
+		fmt.Printf("Error: %v - Query took: %s\n", err, helpers.FormatDuration(timing.Total))
+	}
+	fmt.Println()
+}
+
 func printQueryResult(timing QueryTiming, result *QueryResult, quiet bool) {
+	compressionRatio := 100 * (1 - float64(result.CompressedLCMSize)/float64(result.UncompressedLCMSize))
+
 	if quiet {
-		// Compact single-line output for benchmarking
-		fmt.Printf("FOUND: %s | Ledger: %d | RecSplit: %s | RocksDB: %s | Total: %s\n",
-			truncateHash(result.TxHash),
-			result.LedgerSeq,
-			helpers.FormatDuration(timing.RecSplitLookup),
-			helpers.FormatDuration(timing.RocksDBQuery),
-			helpers.FormatDuration(timing.Total))
+		fmt.Printf("TX: %s\n", result.TxHash)
+		fmt.Printf("Ledger: %d | ClosedAt: %v | TxIndex: %d | TxScanned: %d\n",
+			result.LedgerSeq, result.ClosedAt, result.TxIndex, timing.TxCount)
+		fmt.Printf("LCM Size: %s compressed -> %s uncompressed (%.1f%% ratio)\n",
+			helpers.FormatBytes(int64(result.CompressedLCMSize)),
+			helpers.FormatBytes(int64(result.UncompressedLCMSize)),
+			compressionRatio)
+		fmt.Println()
+		fmt.Println("Timing Breakdown:")
+		fmt.Printf("  RecSplit (hash->seq):      %s\n", helpers.FormatDuration(timing.RecSplitLookup))
+		fmt.Printf("  RocksDB (seq->LCM):        %s\n", helpers.FormatDuration(timing.RocksDBQuery))
+		fmt.Printf("  Decompress (zstd):         %s\n", helpers.FormatDuration(timing.Decompress))
+		fmt.Printf("  Unmarshal (XDR):           %s\n", helpers.FormatDuration(timing.Unmarshal))
+		fmt.Printf("  TxReader Create:           %s\n", helpers.FormatDuration(timing.TxReaderCreate))
+		fmt.Printf("  TxSearch (%d txs):         %s\n", timing.TxCount, helpers.FormatDuration(timing.TxSearch))
+		fmt.Printf("  TxExtract (marshal):       %s\n", helpers.FormatDuration(timing.TxExtract))
+		fmt.Printf("  ----------------------------------------\n")
+		fmt.Printf("  TOTAL:                     %s\n", helpers.FormatDuration(timing.Total))
+		fmt.Println()
+		fmt.Println("================================================================================")
+		fmt.Println()
 		return
 	}
 
-	// Verbose output
+	// Full verbose output
 	fmt.Println()
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println("Query Result")
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println()
-
-	// Transaction info
 	fmt.Printf("Transaction Hash:     %s\n", result.TxHash)
 	fmt.Printf("Ledger Sequence:      %d\n", result.LedgerSeq)
 	fmt.Printf("Transaction Index:    %d\n", result.TxIndex)
 	fmt.Printf("Closed At:            %v\n", result.ClosedAt)
 	fmt.Println()
-
-	// LCM size info
-	fmt.Println("LedgerCloseMeta Sizes:")
+	fmt.Println("LCM Sizes:")
 	fmt.Printf("  Compressed:         %s\n", helpers.FormatBytes(int64(result.CompressedLCMSize)))
 	fmt.Printf("  Uncompressed:       %s\n", helpers.FormatBytes(int64(result.UncompressedLCMSize)))
-	compressionRatio := 100 * (1 - float64(result.CompressedLCMSize)/float64(result.UncompressedLCMSize))
 	fmt.Printf("  Compression Ratio:  %.2f%%\n", compressionRatio)
 	fmt.Println()
-
-	// Transaction data sizes
 	fmt.Println("Transaction Data Sizes:")
 	fmt.Printf("  Envelope:           %s\n", helpers.FormatBytes(int64(len(result.EnvelopeBytes))))
 	fmt.Printf("  Result:             %s\n", helpers.FormatBytes(int64(len(result.ResultBytes))))
@@ -832,13 +741,11 @@ func printQueryResult(timing QueryTiming, result *QueryResult, quiet bool) {
 	totalTxSize := len(result.EnvelopeBytes) + len(result.ResultBytes) + len(result.MetaBytes)
 	fmt.Printf("  Total:              %s\n", helpers.FormatBytes(int64(totalTxSize)))
 	fmt.Println()
-
-	// Timing breakdown
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println("Timing Breakdown")
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println()
-	fmt.Printf("Step 1: RecSplit Lookup (txHash -> ledgerSeq)\n")
+	fmt.Printf("Step 1: RecSplit Query (txHash -> ledgerSeq)\n")
 	fmt.Printf("        Time: %s\n", helpers.FormatDuration(timing.RecSplitLookup))
 	fmt.Println()
 	fmt.Printf("Step 2: RocksDB Query (ledgerSeq -> compressed LCM)\n")
@@ -859,41 +766,35 @@ func printQueryResult(timing QueryTiming, result *QueryResult, quiet bool) {
 	fmt.Println()
 	fmt.Println("--------------------------------------------------------------------------------")
 	fmt.Printf("TOTAL QUERY TIME: %s\n", helpers.FormatDuration(timing.Total))
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println()
-
-	// Hex-encoded transaction data
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println("Transaction Data (Hex Encoded)")
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println()
-	fmt.Printf("TxEnvelope:\n%s\n\n", helpers.WrapText(hex.EncodeToString(result.EnvelopeBytes), 80))
-	fmt.Printf("TxResult:\n%s\n\n", helpers.WrapText(hex.EncodeToString(result.ResultBytes), 80))
-	fmt.Printf("TxMeta:\n%s\n\n", helpers.WrapText(hex.EncodeToString(result.MetaBytes), 80))
-	printSeparator()
+	fmt.Printf("TxEnvelope:\n%s\n", helpers.WrapText(hex.EncodeToString(result.EnvelopeBytes), 80))
+	fmt.Printf("TxResult:\n%s\n", helpers.WrapText(hex.EncodeToString(result.ResultBytes), 80))
+	fmt.Printf("TxMeta:\n%s\n", helpers.WrapText(hex.EncodeToString(result.MetaBytes), 80))
+	fmt.Println("================================================================================")
 	fmt.Println()
 }
 
 // printFinalStats prints cumulative statistics for all queries in ongoing mode.
 // Separates successful queries from various "not found" scenarios.
 func printFinalStats(stats RunningStats, hasFalsePositiveFilter bool) {
-	totalQueries := stats.QueryCount + stats.NotFoundInRecSplit +
-		stats.NotFoundInRocksDB + stats.FalsePositiveLedgerScan
-
+	totalQueries := stats.QueryCount + stats.NotFoundInRecSplit + stats.NotFoundInRocksDB + stats.FalsePositiveLedgerScan
 	if totalQueries == 0 {
 		fmt.Println("No queries executed.")
 		return
 	}
 
 	fmt.Println()
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Printf("Cumulative Statistics (%d total queries)\n", totalQueries)
-	printSeparator()
+	fmt.Println("================================================================================")
 	fmt.Println()
 
-	// -------------------------------------------------------------------------
-	// Successful Queries
-	// -------------------------------------------------------------------------
+	// Successful queries
 	fmt.Printf("=== SUCCESSFUL QUERIES: %d ===\n", stats.QueryCount)
 	if stats.QueryCount > 0 {
 		fmt.Println()
@@ -902,6 +803,7 @@ func printFinalStats(stats RunningStats, hasFalsePositiveFilter bool) {
 		fmt.Printf("  RocksDB Queries:      %s\n", helpers.FormatDuration(stats.TotalRocksDB))
 		fmt.Printf("  Decompress:           %s\n", helpers.FormatDuration(stats.TotalDecompress))
 		fmt.Printf("  Unmarshal:            %s\n", helpers.FormatDuration(stats.TotalUnmarshal))
+		fmt.Printf("  TxReader Create:      %s\n", helpers.FormatDuration(stats.TotalTxReaderCreate))
 		fmt.Printf("  Tx Search:            %s\n", helpers.FormatDuration(stats.TotalTxSearch))
 		fmt.Printf("  Tx Extract:           %s\n", helpers.FormatDuration(stats.TotalTxExtract))
 		fmt.Printf("  ----------------------------------------\n")
@@ -914,48 +816,43 @@ func printFinalStats(stats RunningStats, hasFalsePositiveFilter bool) {
 		fmt.Printf("  RocksDB Query:        %s\n", helpers.FormatDuration(stats.TotalRocksDB/n))
 		fmt.Printf("  Decompress:           %s\n", helpers.FormatDuration(stats.TotalDecompress/n))
 		fmt.Printf("  Unmarshal:            %s\n", helpers.FormatDuration(stats.TotalUnmarshal/n))
+		fmt.Printf("  TxReader Create:      %s\n", helpers.FormatDuration(stats.TotalTxReaderCreate/n))
 		fmt.Printf("  Tx Search:            %s\n", helpers.FormatDuration(stats.TotalTxSearch/n))
 		fmt.Printf("  Tx Extract:           %s\n", helpers.FormatDuration(stats.TotalTxExtract/n))
 		fmt.Printf("  ----------------------------------------\n")
 		fmt.Printf("  TOTAL:                %s\n", helpers.FormatDuration(stats.TotalTime/n))
 		fmt.Println()
-
 		avgTxScanned := float64(stats.TotalTxScanned) / float64(stats.QueryCount)
 		fmt.Printf("Average Transactions Scanned: %.1f\n", avgTxScanned)
 	}
 	fmt.Println()
 
-	// -------------------------------------------------------------------------
-	// Not Found in RecSplit Filter
-	// -------------------------------------------------------------------------
-	if hasFalsePositiveFilter {
+	// Not found in RecSplit filter
+	if hasFalsePositiveFilter || stats.NotFoundInRecSplit > 0 {
 		fmt.Printf("=== NOT FOUND IN RECSPLIT FILTER: %d ===\n", stats.NotFoundInRecSplit)
 		if stats.NotFoundInRecSplit > 0 {
 			fmt.Println("  (Key rejected by fuse filter - definitely not in index)")
 			n := time.Duration(stats.NotFoundInRecSplit)
 			fmt.Printf("  Total time:           %s\n", helpers.FormatDuration(stats.TotalTimeNotFoundFilter))
-			fmt.Printf("  Avg time:             %s\n", helpers.FormatDuration(stats.TotalTimeNotFoundFilter/n))
+			fmt.Printf("  Avg RecSplit:         %s\n", helpers.FormatDuration(stats.TotalRecSplitNotFoundFilter/n))
+			fmt.Printf("  Avg total:            %s\n", helpers.FormatDuration(stats.TotalTimeNotFoundFilter/n))
 		}
 		fmt.Println()
 	}
 
-	// -------------------------------------------------------------------------
-	// Not Found in RocksDB
-	// -------------------------------------------------------------------------
+	// Not found in RocksDB
 	fmt.Printf("=== NOT FOUND IN ROCKSDB: %d ===\n", stats.NotFoundInRocksDB)
 	if stats.NotFoundInRocksDB > 0 {
-		fmt.Println("  (RecSplit returned ledgerSeq, but ledger not in database)")
-		fmt.Println("  This indicates index/database inconsistency!")
+		fmt.Println("  (RecSplit returned ledgerSeq, but ledger not in database. this shud never happen IRL !!)")
 		n := time.Duration(stats.NotFoundInRocksDB)
 		fmt.Printf("  Total time:           %s\n", helpers.FormatDuration(stats.TotalTimeNotFoundDB))
 		fmt.Printf("  Avg RecSplit:         %s\n", helpers.FormatDuration(stats.TotalRecSplitNotFoundDB/n))
+		fmt.Printf("  Avg RocksDB:          %s\n", helpers.FormatDuration(stats.TotalRocksDBNotFoundDB/n))
 		fmt.Printf("  Avg total:            %s\n", helpers.FormatDuration(stats.TotalTimeNotFoundDB/n))
 	}
 	fmt.Println()
 
-	// -------------------------------------------------------------------------
-	// False Positives (not found in ledger scan)
-	// -------------------------------------------------------------------------
+	// False positives
 	fmt.Printf("=== FALSE POSITIVES (detected during ledger scan): %d ===\n", stats.FalsePositiveLedgerScan)
 	if stats.FalsePositiveLedgerScan > 0 {
 		fmt.Println("  (RecSplit mapped non-existent key to a valid ledger)")
@@ -965,6 +862,7 @@ func printFinalStats(stats RunningStats, hasFalsePositiveFilter bool) {
 		fmt.Printf("    RocksDB Queries:    %s\n", helpers.FormatDuration(stats.TotalRocksDBFalsePositive))
 		fmt.Printf("    Decompress:         %s\n", helpers.FormatDuration(stats.TotalDecompressFalsePositive))
 		fmt.Printf("    Unmarshal:          %s\n", helpers.FormatDuration(stats.TotalUnmarshalFalsePositive))
+		fmt.Printf("    TxReader Create:    %s\n", helpers.FormatDuration(stats.TotalTxReaderCreateFalsePositive))
 		fmt.Printf("    Tx Search:          %s\n", helpers.FormatDuration(stats.TotalTxSearchFalsePositive))
 		fmt.Printf("    ----------------------------------------\n")
 		fmt.Printf("    TOTAL:              %s\n", helpers.FormatDuration(stats.TotalTimeFalsePositive))
@@ -976,78 +874,36 @@ func printFinalStats(stats RunningStats, hasFalsePositiveFilter bool) {
 		fmt.Printf("    RocksDB Query:      %s\n", helpers.FormatDuration(stats.TotalRocksDBFalsePositive/n))
 		fmt.Printf("    Decompress:         %s\n", helpers.FormatDuration(stats.TotalDecompressFalsePositive/n))
 		fmt.Printf("    Unmarshal:          %s\n", helpers.FormatDuration(stats.TotalUnmarshalFalsePositive/n))
+		fmt.Printf("    TxReader Create:    %s\n", helpers.FormatDuration(stats.TotalTxReaderCreateFalsePositive/n))
 		fmt.Printf("    Tx Search:          %s\n", helpers.FormatDuration(stats.TotalTxSearchFalsePositive/n))
 		fmt.Printf("    ----------------------------------------\n")
 		fmt.Printf("    TOTAL:              %s\n", helpers.FormatDuration(stats.TotalTimeFalsePositive/n))
 		fmt.Println()
-
 		avgTxScanned := float64(stats.TotalTxScannedFalsePositive) / float64(stats.FalsePositiveLedgerScan)
 		fmt.Printf("  Avg Transactions Scanned: %.1f\n", avgTxScanned)
 	}
 	fmt.Println()
 
-	// -------------------------------------------------------------------------
 	// Summary
-	// -------------------------------------------------------------------------
-	printSeparator()
-	fmt.Println("SUMMARY")
-	printSeparator()
-	fmt.Printf("  Successful:           %d (%.2f%%)\n",
-		stats.QueryCount, 100*float64(stats.QueryCount)/float64(totalQueries))
-	if hasFalsePositiveFilter {
-		fmt.Printf("  Not in filter:        %d (%.2f%%)\n",
-			stats.NotFoundInRecSplit, 100*float64(stats.NotFoundInRecSplit)/float64(totalQueries))
-	}
-	fmt.Printf("  Not in RocksDB:       %d (%.2f%%)\n",
-		stats.NotFoundInRocksDB, 100*float64(stats.NotFoundInRocksDB)/float64(totalQueries))
-	fmt.Printf("  False positives:      %d (%.2f%%)\n",
-		stats.FalsePositiveLedgerScan, 100*float64(stats.FalsePositiveLedgerScan)/float64(totalQueries))
-	printSeparator()
-	fmt.Println()
-}
-
-// =============================================================================
-// HELPER FUNCTIONS
-// =============================================================================
-
-// printSeparator prints a visual separator line
-func printSeparator() {
 	fmt.Println("================================================================================")
-}
-
-// truncateHash returns the first 16 characters of a hash with "..." suffix
-func truncateHash(hash string) string {
-	if len(hash) > 16 {
-		return hash[:16] + "..."
+	fmt.Println("SUMMARY")
+	fmt.Println("================================================================================")
+	fmt.Printf("  Successful:           %d (%.2f%%)\n", stats.QueryCount, 100*float64(stats.QueryCount)/float64(totalQueries))
+	if hasFalsePositiveFilter || stats.NotFoundInRecSplit > 0 {
+		fmt.Printf("  Not in filter:        %d (%.2f%%)\n", stats.NotFoundInRecSplit, 100*float64(stats.NotFoundInRecSplit)/float64(totalQueries))
 	}
-	return hash
-}
-
-// printRocksDBStats prints RocksDB statistics
-func printRocksDBStats(db *grocksdb.DB) {
-	fmt.Printf("  Estimated keys:               %s\n", db.GetProperty("rocksdb.estimate-num-keys"))
-	fmt.Printf("  Total SST size:               %s\n", formatBytesFromProperty(db.GetProperty("rocksdb.total-sst-files-size")))
-	fmt.Printf("  Live SST size:                %s\n", formatBytesFromProperty(db.GetProperty("rocksdb.live-sst-files-size")))
-
-	fmt.Printf("  Files by level:               ")
-	for i := 0; i < 7; i++ {
-		files := db.GetProperty(fmt.Sprintf("rocksdb.num-files-at-level%d", i))
-		if i > 0 {
-			fmt.Printf(" ")
-		}
-		fmt.Printf("L%d=%s", i, files)
-	}
+	fmt.Printf("  Not in RocksDB:       %d (%.2f%%)\n", stats.NotFoundInRocksDB, 100*float64(stats.NotFoundInRocksDB)/float64(totalQueries))
+	fmt.Printf("  False positives:      %d (%.2f%%)\n", stats.FalsePositiveLedgerScan, 100*float64(stats.FalsePositiveLedgerScan)/float64(totalQueries))
+	fmt.Println("================================================================================")
 	fmt.Println()
 }
 
-// formatBytesFromProperty converts a string byte count to human-readable format
 func formatBytesFromProperty(s string) string {
 	var bytes int64
 	fmt.Sscanf(s, "%d", &bytes)
 	return helpers.FormatBytes(bytes)
 }
 
-// printMemStats prints current memory usage
 func printMemStats() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
