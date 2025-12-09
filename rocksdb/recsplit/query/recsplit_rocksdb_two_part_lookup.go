@@ -61,6 +61,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -184,6 +185,51 @@ type RunningStats struct {
 	TotalTxReaderCreateFalsePositive time.Duration
 	TotalTxSearchFalsePositive       time.Duration
 	TotalTxScannedFalsePositive      int
+}
+
+// Error reporting
+type ErrInvalidHex struct {
+	Reason error
+}
+
+func (e ErrInvalidHex) Error() string {
+	return fmt.Sprintf("invalid hex string: %v", e.Reason)
+}
+
+func (e ErrInvalidHex) Unwrap() error {
+	return e.Reason
+}
+
+type ErrInvalidHashLength struct {
+	Got int
+}
+
+func (e ErrInvalidHashLength) Error() string {
+	return fmt.Sprintf("invalid hash length: expected 32 bytes, got %d", e.Got)
+}
+
+type ErrRecSplitNotFound struct{}
+
+func (e ErrRecSplitNotFound) Error() string {
+	return "not found in RecSplit filter"
+}
+
+type ErrLedgerNotFound struct {
+	Ledger uint32
+}
+
+func (e ErrLedgerNotFound) Error() string {
+	return fmt.Sprintf("ledger %d not found in RocksDB", e.Ledger)
+}
+
+type ErrRecSplitFalsePositive struct {
+	Ledger  uint32
+	TxHash  string
+	Scanned int
+}
+
+func (e ErrRecSplitFalsePositive) Error() string {
+	return fmt.Sprintf("txHash not found in ledger %d (scanned %d txs)", e.Ledger, e.Scanned)
 }
 
 func main() {
@@ -349,7 +395,7 @@ func main() {
 			updateStats(&stats, timing, result, queryErr)
 
 			if queryErr != nil {
-				printNotFoundResult(result, timing, queryErr, quiet)
+				printNotFoundResult(timing, queryErr, quiet)
 			} else {
 				printQueryResult(timing, result, quiet)
 			}
@@ -362,7 +408,7 @@ func main() {
 	fmt.Println(txHashHex)
 	timing, result, err := runQuery(rsReader, rocksDB, rocksRO, zstdDecoder, txHashHex, builtWithFalsePositiveSupport)
 	if err != nil {
-		printNotFoundResult(result, timing, err, quiet)
+		printNotFoundResult(timing, err, quiet)
 		os.Exit(1)
 	}
 	printQueryResult(timing, result, quiet)
@@ -404,11 +450,11 @@ func runQuery(
 	txHashBytes, err := hex.DecodeString(txHashHex)
 	if err != nil {
 		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("invalid hex string: %v", err)
+		return timing, nil, ErrInvalidHex{Reason: err}
 	}
 	if len(txHashBytes) != 32 {
 		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("invalid hash length: expected 32 bytes, got %d", len(txHashBytes))
+		return timing, nil, ErrInvalidHashLength{Got: len(txHashBytes)}
 	}
 
 	// Step 2: RecSplit Lookup (txHash -> ledgerSeq)
@@ -428,7 +474,7 @@ func runQuery(
 	// This is a clean rejection - the key was never added to the index
 	if hasFalsePositiveFilter && !found {
 		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("not found in RecSplit filter")
+		return timing, nil, ErrRecSplitNotFound{}
 	}
 	ledgerSeq := uint32(ledgerSeqU64)
 
@@ -451,7 +497,7 @@ func runQuery(
 
 	if !slice.Exists() {
 		timing.Total = time.Since(totalStart)
-		return timing, nil, fmt.Errorf("ledger %d not found in RocksDB", ledgerSeq)
+		return timing, nil, ErrLedgerNotFound{Ledger: ledgerSeq}
 	}
 
 	// Copy the compressed data (slice is only valid until Free() is called)
@@ -516,12 +562,11 @@ func runQuery(
 	// The key was never in the index, but RecSplit mapped it to this ledger anyway
 	if foundTx == nil {
 		timing.Total = time.Since(totalStart)
-		// hack.. include the incorrectly returned ledgerSequence so that you can print it to console
-		badResult := &QueryResult{
-			TxHash:    txHashHex,
-			LedgerSeq: ledgerSeq,
+		return timing, nil, ErrRecSplitFalsePositive{
+			Ledger:  ledgerSeq,
+			TxHash:  txHashHex,
+			Scanned: txCount,
 		}
-		return timing, badResult, fmt.Errorf("txHash not found in ledger %d (scanned %d txs) - RecSplit false positive", ledgerSeq, txCount)
 	}
 
 	// Step 7: Extract Transaction Data
@@ -643,16 +688,24 @@ func printInitSummary(rsFile, dbPath string, rsIndex *recsplit.Index, rocksDB *g
 	fmt.Println()
 }
 
-func printNotFoundResult(result *QueryResult, timing QueryTiming, err error, quiet bool) {
-	errStr := err.Error()
-
-	if strings.Contains(errStr, "not found in RecSplit filter") {
-		fmt.Printf("NOT FOUND in RecSplit filter - Query took: %s\n", helpers.FormatDuration(timing.RecSplitLookup))
+func printNotFoundResult(timing QueryTiming, err error, quiet bool) {
+	var (
+		eRSNF ErrRecSplitNotFound
+		eLNF  ErrLedgerNotFound
+		eFPos ErrRecSplitFalsePositive
+	)
+	fmt.Println()
+	switch {
+	case errors.As(err, &eRSNF):
+		fmt.Printf("TXHASH NOT FOUND in RecSplit filter - Query took: %s\n",
+			helpers.FormatDuration(timing.RecSplitLookup))
 		if !quiet {
 			fmt.Printf("Error: %v\n", err)
 		}
-	} else if strings.Contains(errStr, "not found in RocksDB") {
-		fmt.Printf("NOT FOUND in RocksDB - Query took: %s\n", helpers.FormatDuration(timing.Total))
+
+	case errors.As(err, &eLNF):
+		fmt.Printf("LEDGER NOT FOUND in RocksDB - Query took: %s\n",
+			helpers.FormatDuration(timing.Total))
 		if !quiet {
 			fmt.Println()
 			fmt.Println("Timing Breakdown:")
@@ -663,13 +716,13 @@ func printNotFoundResult(result *QueryResult, timing QueryTiming, err error, qui
 			fmt.Println()
 			fmt.Printf("Error: %v\n", err)
 		}
-	} else if strings.Contains(errStr, "RecSplit false positive") {
-		// AHA, this case will have returned a random ledgerSequence number, that recsplit thought contained the txHash
-		// Just print it for kicks
-		falseLedgerSeq := result.LedgerSeq
-		txHash := result.TxHash
-		fmt.Printf("FALSE POSITIVE - RecSplit returned ledger %d, but txHash: %s not found. Query took %s\n",
-			falseLedgerSeq, txHash, helpers.FormatDuration(timing.Total))
+
+	case errors.As(err, &eFPos):
+		fmt.Printf("FALSE POSITIVE - RecSplit returned ledger %d, but txHash %s not found\n",
+			eFPos.Ledger, eFPos.TxHash)
+		fmt.Printf("FALSE POSITIVE - Query took: %s\n",
+			helpers.FormatDuration(timing.Total))
+
 		if !quiet {
 			fmt.Println()
 			fmt.Println("Timing Breakdown:")
@@ -684,9 +737,10 @@ func printNotFoundResult(result *QueryResult, timing QueryTiming, err error, qui
 			fmt.Println()
 			fmt.Printf("Error: %v\n", err)
 		}
-	} else {
+	default:
 		fmt.Printf("Error: %v - Query took: %s\n", err, helpers.FormatDuration(timing.Total))
 	}
+
 	fmt.Println()
 }
 
