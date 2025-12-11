@@ -1218,7 +1218,7 @@ func openMDBXDatabase(path string, name string, settings DbOpenSettings) (*MDBXD
 	}
 
 	// Create environment
-	env, err := mdbx.NewEnv()
+	env, err := mdbx.NewEnv(mdbx.Label(name))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create mdbx environment")
 	}

@@ -57,7 +57,7 @@ func main() {
 	}
 
 	// Open environment
-	env, err := mdbx.NewEnv()
+	env, err := mdbx.NewEnv("default")
 	if err != nil {
 		log.Fatalf("Failed to create MDBX env: %v", err)
 	}
