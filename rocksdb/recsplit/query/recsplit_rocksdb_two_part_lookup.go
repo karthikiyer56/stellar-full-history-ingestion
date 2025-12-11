@@ -559,7 +559,7 @@ func runQuery(
 //  4. False positive from RecSplit (txHash not in ledger)
 func updateStats(stats *RunningStats, timing QueryTiming, err error) {
 	if err == nil {
-		st := stats.SuccessfulQueryStats
+		st := &stats.SuccessfulQueryStats
 		st.Count++ // count of successful queries so far
 		st.Timing.RecSplitLookup += timing.RecSplitLookup
 		st.Timing.RocksDBQuery += timing.RocksDBQuery
@@ -581,20 +581,20 @@ func updateStats(stats *RunningStats, timing QueryTiming, err error) {
 
 	switch {
 	case errors.As(err, &eRSNF):
-		st := stats.NotFoundInRecSplitStats
+		st := &stats.NotFoundInRecSplitStats
 		st.Count++
 		st.Timing.RecSplitLookup += timing.RecSplitLookup
 		st.Timing.Total += timing.Total
 
 	case errors.As(err, &eLNF):
-		st := stats.NotFoundInRocksDbStats
+		st := &stats.NotFoundInRocksDbStats
 		st.Count++
 		st.Timing.RecSplitLookup += timing.RecSplitLookup
 		st.Timing.RocksDBQuery += timing.RocksDBQuery
 		st.Timing.Total += timing.Total
 
 	case errors.As(err, &eFPos):
-		st := stats.FalsePositiveStats
+		st := &stats.FalsePositiveStats
 		st.Count++
 		st.Timing.RecSplitLookup += timing.RecSplitLookup
 		st.Timing.RocksDBQuery += timing.RocksDBQuery
