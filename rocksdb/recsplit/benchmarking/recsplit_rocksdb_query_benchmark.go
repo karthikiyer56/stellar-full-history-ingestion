@@ -12,9 +12,10 @@ package main
 // ARCHITECTURE:
 //   - Producer-Consumer model with buffered channels (Go idiomatic)
 //   - Pre-created worker goroutines (default 16) with dedicated zstd decoders
+//   - Parallel RecSplit batch lookups (default batch size 4) within each worker
 //   - Shared LRU block cache across all RocksDB instances
-//   - Sequential RecSplit search with false-positive handling
 //   - Range-based RocksDB store selection (pre-indexed at startup)
+//   - Lazy sequential processing: stop on first successful transaction find
 //
 // DATA FLOW:
 //   1. Main thread reads input file, pushes txHashes to work channel
@@ -22,12 +23,27 @@ package main
 //   3. Stats aggregator collects results, prints progress at ~1% intervals
 //   4. Final summary printed at completion
 //
+// RECSPLIT PARALLEL BATCH LOOKUP:
+//   For each transaction, we search RecSplit files in parallel batches:
+//   - Batch 1: Search files 0-3 in parallel, wait for all to complete
+//   - If any match found, try to find tx in that ledger
+//   - If success, return immediately (early termination)
+//   - If false positive, continue to next batch
+//   - Repeat until success or all files exhausted
+//
 // FALSE POSITIVE HANDLING:
 //   RecSplit is a Minimal Perfect Hash Function that can return false positives.
 //   This tool handles multiple scenarios:
 //   - FALSE_POSITIVE_NORMAL: Single RecSplit returns wrong ledger
 //   - FALSE_POSITIVE_COMPOUND: Multiple RecSplits return wrong ledgers (all false)
 //   - FALSE_POSITIVE_PARTIAL: Found in one, false positive in others (counts as success)
+//
+// TIMING CALCULATION FOR PARALLEL BATCHES:
+//   When searching RecSplit files in parallel batches:
+//   - Each batch's time = average of individual lookup times in that batch
+//   - Total RecSplit time = average of all batch times
+//   Example: Batch1 (50,60,40,70us) avg=55us, Batch2 (45,55,50,48us) avg=49.5us
+//            Final RecSplit time = (55+49.5)/2 = 52.25us
 //
 // USAGE:
 //   ./benchmark \
@@ -37,6 +53,7 @@ package main
 //     --error-file /path/to/errors.log \
 //     --log-file /path/to/benchmark.log \
 //     --parallelism 16 \
+//     --recsplit-parallel-batch 4 \
 //     --read-buffer-mb 16384
 //
 // =============================================================================
@@ -77,16 +94,20 @@ import (
 
 const (
 	// WorkerBatchSize is the number of transactions each worker processes at a time
+	// before sending results back to the stats aggregator
 	WorkerBatchSize = 1000
 
 	// ChannelBufferMultiplier determines how far ahead the producer reads
 	// Buffer size = parallelism * WorkerBatchSize * ChannelBufferMultiplier
+	// This ensures workers don't block waiting for work
 	ChannelBufferMultiplier = 2
 
-	// ErrorFileFlushInterval is how often we flush the error file buffer
+	// ErrorFileFlushInterval is how often we flush the error file buffer (in error count)
+	// Buffering improves I/O performance for high error rates
 	ErrorFileFlushInterval = 1000
 
-	// ProgressReportPercent is the interval for progress reporting (1%)
+	// ProgressReportPercent is the interval for progress reporting
+	// We report at approximately every 1% of total transactions
 	ProgressReportPercent = 1
 )
 
@@ -98,17 +119,19 @@ const (
 type ErrorType int
 
 const (
-	ErrTypeNone ErrorType = iota
-	ErrTypeInvalidInput
-	ErrTypeRecSplitNotFound
-	ErrTypeLedgerNotFound
-	ErrTypeFalsePositiveNormal
-	ErrTypeFalsePositiveCompound
-	ErrTypeFalsePositivePartial // This is actually a success, but logged for analysis
-	ErrTypeLedgerInMultipleDBs
-	ErrTypeUnforeseen
+	ErrTypeNone                  ErrorType = iota
+	ErrTypeInvalidInput                    // Invalid hex or wrong length - silently skipped
+	ErrTypeRecSplitNotFound                // TxHash not found in any RecSplit index
+	ErrTypeLedgerNotFound                  // LedgerSeq not found in any RocksDB store
+	ErrTypeFalsePositiveNormal             // Single RecSplit returned wrong ledger
+	ErrTypeFalsePositiveCompound           // Multiple RecSplits returned wrong ledgers (all false)
+	ErrTypeFalsePositivePartial            // Found in one, false positive in others (counts as success)
+	ErrTypeLedgerInMultipleDBs             // Data inconsistency: ledger in multiple RocksDB stores
+	ErrTypeUnforeseen                      // Unexpected errors (RocksDB, decompression, unmarshal, etc.)
 )
 
+// String returns the string representation of the error type
+// Used for error log formatting
 func (e ErrorType) String() string {
 	switch e {
 	case ErrTypeNone:
@@ -134,61 +157,91 @@ func (e ErrorType) String() string {
 	}
 }
 
+// LedgerInfo holds ledger sequence and its close time for error reporting
+// The ClosedAt time is extracted from xdr.LedgerCloseMeta.ClosedAt()
+type LedgerInfo struct {
+	Seq      uint32
+	ClosedAt time.Time
+}
+
 // BenchmarkError encapsulates all error information for logging
+// This struct is designed to capture all the context needed for debugging
+// and analysis of failed lookups
 type BenchmarkError struct {
 	Type            ErrorType
 	TxHash          string
-	LedgerSeq       uint32   // For single ledger errors
-	LedgerSeqs      []uint32 // For compound/partial false positives
-	SuccessLedger   uint32   // For partial false positives (the one that worked)
-	DBNames         []string // For ledger-in-multiple-dbs
-	TxsScanned      int
+	LedgerSeq       uint32       // For single ledger errors (LEDGER_NOT_FOUND)
+	LedgerInfo      LedgerInfo   // For FALSE_POSITIVE_NORMAL (includes ClosedAt)
+	LedgerInfos     []LedgerInfo // For compound/partial false positives
+	SuccessLedger   LedgerInfo   // For FALSE_POSITIVE_PARTIAL (the one that worked)
+	DBNames         []string     // For LEDGER_IN_MULTIPLE_DBS
+	TxsScanned      int          // Number of transactions scanned in ledger(s)
 	TotalDuration   time.Duration
 	UnderlyingError error
 }
 
+// Error implements the error interface
 func (e *BenchmarkError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Type.String(), e.formatDetails())
 }
 
 // FormatForLog formats the error as a pipe-delimited line for the error file
+// Format varies by error type to include all relevant information
+// ClosedAt times are printed using %v formatter as requested
 func (e *BenchmarkError) FormatForLog() string {
 	switch e.Type {
 	case ErrTypeRecSplitNotFound:
+		// RECSPLIT_NOT_FOUND|<txhash>|<duration>
 		return fmt.Sprintf("%s|%s|%s",
 			e.Type.String(), e.TxHash, helpers.FormatDuration(e.TotalDuration))
 
 	case ErrTypeLedgerNotFound:
+		// LEDGER_NOT_FOUND|<txhash>|<ledger>|<duration>
+		// Note: No ClosedAt because ledger doesn't exist
 		return fmt.Sprintf("%s|%s|%d|%s",
 			e.Type.String(), e.TxHash, e.LedgerSeq, helpers.FormatDuration(e.TotalDuration))
 
 	case ErrTypeFalsePositiveNormal:
-		return fmt.Sprintf("%s|%s|%d|%d|%s",
-			e.Type.String(), e.TxHash, e.LedgerSeq, e.TxsScanned, helpers.FormatDuration(e.TotalDuration))
+		// FALSE_POSITIVE_NORMAL|<txhash>|(ledger,closedAt)|<txs_scanned>|<duration>
+		return fmt.Sprintf("%s|%s|(%d,%v)|%d|%s",
+			e.Type.String(), e.TxHash,
+			e.LedgerInfo.Seq, e.LedgerInfo.ClosedAt,
+			e.TxsScanned, helpers.FormatDuration(e.TotalDuration))
 
 	case ErrTypeFalsePositiveCompound:
-		ledgers := make([]string, len(e.LedgerSeqs))
-		for i, l := range e.LedgerSeqs {
-			ledgers[i] = fmt.Sprintf("%d", l)
+		// FALSE_POSITIVE_COMPOUND|<txhash>|(ledger1,closedAt1),(ledger2,closedAt2),...|<duration>
+		tuples := make([]string, len(e.LedgerInfos))
+		for i, info := range e.LedgerInfos {
+			tuples[i] = fmt.Sprintf("(%d,%v)", info.Seq, info.ClosedAt)
 		}
 		return fmt.Sprintf("%s|%s|%s|%s",
-			e.Type.String(), e.TxHash, strings.Join(ledgers, ","), helpers.FormatDuration(e.TotalDuration))
+			e.Type.String(), e.TxHash,
+			strings.Join(tuples, ","),
+			helpers.FormatDuration(e.TotalDuration))
 
 	case ErrTypeFalsePositivePartial:
-		falsePositives := make([]string, 0, len(e.LedgerSeqs))
-		for _, l := range e.LedgerSeqs {
-			if l != e.SuccessLedger {
-				falsePositives = append(falsePositives, fmt.Sprintf("%d", l))
+		// FALSE_POSITIVE_PARTIAL|<txhash>|(success_ledger,closedAt)|(fp1,closedAt1),(fp2,closedAt2),...|<duration>
+		fpTuples := make([]string, 0, len(e.LedgerInfos))
+		for _, info := range e.LedgerInfos {
+			if info.Seq != e.SuccessLedger.Seq {
+				fpTuples = append(fpTuples, fmt.Sprintf("(%d,%v)", info.Seq, info.ClosedAt))
 			}
 		}
-		return fmt.Sprintf("%s|%s|%d|%s|%s",
-			e.Type.String(), e.TxHash, e.SuccessLedger, strings.Join(falsePositives, ","), helpers.FormatDuration(e.TotalDuration))
+		return fmt.Sprintf("%s|%s|(%d,%v)|%s|%s",
+			e.Type.String(), e.TxHash,
+			e.SuccessLedger.Seq, e.SuccessLedger.ClosedAt,
+			strings.Join(fpTuples, ","),
+			helpers.FormatDuration(e.TotalDuration))
 
 	case ErrTypeLedgerInMultipleDBs:
+		// LEDGER_IN_MULTIPLE_DBS|<txhash>|<ledger>|<db1,db2,...>|<duration>
 		return fmt.Sprintf("%s|%s|%d|%s|%s",
-			e.Type.String(), e.TxHash, e.LedgerSeq, strings.Join(e.DBNames, ","), helpers.FormatDuration(e.TotalDuration))
+			e.Type.String(), e.TxHash, e.LedgerSeq,
+			strings.Join(e.DBNames, ","),
+			helpers.FormatDuration(e.TotalDuration))
 
 	case ErrTypeUnforeseen:
+		// UNFORESEEN_ERROR|<txhash>|<error_message>|<duration>
 		errMsg := ""
 		if e.UnderlyingError != nil {
 			errMsg = e.UnderlyingError.Error()
@@ -202,6 +255,7 @@ func (e *BenchmarkError) FormatForLog() string {
 	}
 }
 
+// formatDetails returns a human-readable description of the error
 func (e *BenchmarkError) formatDetails() string {
 	switch e.Type {
 	case ErrTypeRecSplitNotFound:
@@ -209,11 +263,17 @@ func (e *BenchmarkError) formatDetails() string {
 	case ErrTypeLedgerNotFound:
 		return fmt.Sprintf("ledger %d not found in any RocksDB store", e.LedgerSeq)
 	case ErrTypeFalsePositiveNormal:
-		return fmt.Sprintf("txHash %s not found in ledger %d (scanned %d txs)", e.TxHash, e.LedgerSeq, e.TxsScanned)
+		return fmt.Sprintf("txHash %s not found in ledger %d (scanned %d txs)",
+			e.TxHash, e.LedgerInfo.Seq, e.TxsScanned)
 	case ErrTypeFalsePositiveCompound:
-		return fmt.Sprintf("txHash %s not found in any of ledgers %v", e.TxHash, e.LedgerSeqs)
+		seqs := make([]uint32, len(e.LedgerInfos))
+		for i, info := range e.LedgerInfos {
+			seqs[i] = info.Seq
+		}
+		return fmt.Sprintf("txHash %s not found in any of ledgers %v", e.TxHash, seqs)
 	case ErrTypeFalsePositivePartial:
-		return fmt.Sprintf("txHash %s found in ledger %d but false positives in %v", e.TxHash, e.SuccessLedger, e.LedgerSeqs)
+		return fmt.Sprintf("txHash %s found in ledger %d but had false positives",
+			e.TxHash, e.SuccessLedger.Seq)
 	case ErrTypeLedgerInMultipleDBs:
 		return fmt.Sprintf("ledger %d found in multiple DBs: %v", e.LedgerSeq, e.DBNames)
 	case ErrTypeUnforeseen:
@@ -231,20 +291,22 @@ func (e *BenchmarkError) formatDetails() string {
 // =============================================================================
 
 // QueryTiming tracks timing for each step of a single query
+// All durations represent the actual time spent in each phase
 type QueryTiming struct {
-	RecSplitLookup time.Duration // Time spent searching RecSplit indexes
+	RecSplitLookup time.Duration // Time spent searching RecSplit indexes (averaged across parallel batches)
 	RocksDBQuery   time.Duration // Time spent querying RocksDB
 	Decompress     time.Duration // Zstd decompression time
 	Unmarshal      time.Duration // XDR unmarshaling time
 	TxReaderCreate time.Duration // Transaction reader creation
 	TxSearch       time.Duration // Time to find matching hash in ledger
-	TxExtract      time.Duration // Time to extract transaction data
+	TxExtract      time.Duration // Time to extract/marshal transaction data
 	Total          time.Duration // Total end-to-end time
 	TxCount        int           // Number of transactions scanned
 }
 
 // TimingAccumulator accumulates timing data for averaging
 // All durations are stored as totals (not averages) for accurate weighted averaging
+// Final averages are computed by dividing totals by QueryCount
 type TimingAccumulator struct {
 	RecSplitLookup time.Duration
 	RocksDBQuery   time.Duration
@@ -305,18 +367,21 @@ func (a *TimingAccumulator) Average() QueryTiming {
 }
 
 // WorkerStats holds statistics for a single worker
+// Each worker maintains its own stats to avoid lock contention
+// Stats are merged into GlobalStats after each batch
 type WorkerStats struct {
 	Success               TimingAccumulator
 	RecSplitNotFound      TimingAccumulator
 	LedgerNotFound        TimingAccumulator
 	FalsePositiveNormal   TimingAccumulator
 	FalsePositiveCompound TimingAccumulator
-	FalsePositivePartial  TimingAccumulator // Counted as success, but tracked separately
+	FalsePositivePartial  TimingAccumulator // Counted as success, but tracked separately for analysis
 	LedgerInMultipleDBs   TimingAccumulator
 	Unforeseen            TimingAccumulator
 }
 
 // GlobalStats holds aggregated statistics across all workers
+// Protected by mutex for thread-safe updates from multiple workers
 type GlobalStats struct {
 	mu sync.RWMutex
 	WorkerStats
@@ -343,7 +408,8 @@ func (g *GlobalStats) Merge(w *WorkerStats) {
 	g.Unforeseen.Merge(&w.Unforeseen)
 
 	// Update counters
-	// Success includes FalsePositivePartial (it's a successful lookup)
+	// Note: FALSE_POSITIVE_PARTIAL is counted as success (tx was found)
+	// but also tracked separately for analysis
 	successCount := w.Success.QueryCount + w.FalsePositivePartial.QueryCount
 	failedCount := w.RecSplitNotFound.QueryCount + w.LedgerNotFound.QueryCount +
 		w.FalsePositiveNormal.QueryCount + w.FalsePositiveCompound.QueryCount +
@@ -355,6 +421,7 @@ func (g *GlobalStats) Merge(w *WorkerStats) {
 }
 
 // Snapshot returns a copy of current stats for reporting
+// Uses RLock to allow concurrent reads during progress reporting
 func (g *GlobalStats) Snapshot() GlobalStats {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -373,6 +440,7 @@ func (g *GlobalStats) Snapshot() GlobalStats {
 // =============================================================================
 
 // RocksDBStore wraps a RocksDB instance with its ledger range
+// The range is determined at startup by scanning first/last keys
 type RocksDBStore struct {
 	DB        *grocksdb.DB
 	Path      string
@@ -382,14 +450,18 @@ type RocksDBStore struct {
 }
 
 // RocksDBStoreManager manages multiple RocksDB stores with shared resources
+// The shared block cache is the key optimization - it allows frequently accessed
+// blocks from any store to be cached, improving hit rates across all stores
 type RocksDBStoreManager struct {
 	Stores     []*RocksDBStore
 	ReadOpts   *grocksdb.ReadOptions
 	BlockCache *grocksdb.Cache
 	Options    *grocksdb.Options
+	BBTOptions *grocksdb.BlockBasedTableOptions
 }
 
 // FindStoreForLedger finds the RocksDB store that contains the given ledger
+// Uses the pre-computed range to do O(n) lookup where n is number of stores
 // Returns nil if no store contains the ledger
 func (m *RocksDBStoreManager) FindStoreForLedger(ledgerSeq uint32) *RocksDBStore {
 	for _, store := range m.Stores {
@@ -402,6 +474,7 @@ func (m *RocksDBStoreManager) FindStoreForLedger(ledgerSeq uint32) *RocksDBStore
 
 // FindAllStoresForLedger finds ALL stores that claim to contain the ledger
 // Used to detect data inconsistency (ledger in multiple DBs)
+// In normal operation, this should return at most 1 store
 func (m *RocksDBStoreManager) FindAllStoresForLedger(ledgerSeq uint32) []*RocksDBStore {
 	var stores []*RocksDBStore
 	for _, store := range m.Stores {
@@ -420,10 +493,13 @@ func (m *RocksDBStoreManager) Close() {
 	if m.ReadOpts != nil {
 		m.ReadOpts.Destroy()
 	}
+	if m.BBTOptions != nil {
+		m.BBTOptions.Destroy()
+	}
 	if m.Options != nil {
 		m.Options.Destroy()
 	}
-	// Note: BlockCache is destroyed when Options is destroyed
+	// Note: BlockCache is destroyed when BBTOptions is destroyed
 }
 
 // =============================================================================
@@ -431,6 +507,7 @@ func (m *RocksDBStoreManager) Close() {
 // =============================================================================
 
 // RecSplitIndex wraps a RecSplit index with its reader
+// The Reader is thread-safe and can be used concurrently by multiple goroutines
 type RecSplitIndex struct {
 	Index  *recsplit.Index
 	Reader *recsplit.IndexReader
@@ -441,6 +518,12 @@ type RecSplitIndex struct {
 // RecSplitManager manages multiple RecSplit indexes
 type RecSplitManager struct {
 	Indexes []*RecSplitIndex
+
+	// MmapSizeMB is a placeholder for future memory management
+	// Currently, the erigon RecSplit library mmaps the entire file
+	// This field is reserved for future optimization where we might
+	// implement partial mmap or memory budgeting across indexes
+	MmapSizeMB int
 }
 
 // Close closes all indexes
@@ -449,6 +532,38 @@ func (m *RecSplitManager) Close() {
 		idx.Reader.Close()
 		idx.Index.Close()
 	}
+}
+
+// =============================================================================
+// RECSPLIT LOOKUP RESULT
+// =============================================================================
+
+// RecSplitLookupResult holds the result of a single RecSplit lookup
+type RecSplitLookupResult struct {
+	IndexName string
+	IndexIdx  int           // Index position in the manager's list
+	LedgerSeq uint32        // The ledger sequence returned (only valid if Found)
+	Found     bool          // Whether the lookup returned a match
+	Duration  time.Duration // Time taken for this lookup
+}
+
+// =============================================================================
+// LEDGER LOOKUP RESULT
+// =============================================================================
+
+// LedgerLookupResult holds the result of looking up and parsing a ledger
+type LedgerLookupResult struct {
+	Found         bool          // Whether the transaction was found in this ledger
+	LedgerInfo    LedgerInfo    // Ledger sequence and close time
+	TxsScanned    int           // Number of transactions scanned
+	RocksDBTime   time.Duration // Time for RocksDB query
+	DecompTime    time.Duration // Time for decompression
+	UnmarshalTime time.Duration // Time for XDR unmarshal
+	TxReaderTime  time.Duration // Time for tx reader creation
+	TxSearchTime  time.Duration // Time for searching transactions
+	TxExtractTime time.Duration // Time for extracting tx data (only if found)
+	Error         error         // Any error that occurred
+	DBNames       []string      // For multiple DB detection
 }
 
 // =============================================================================
@@ -478,28 +593,29 @@ type BenchmarkContext struct {
 	RocksDBMgr  *RocksDBStoreManager
 
 	// Configuration
-	NetworkPassphrase string
-	Parallelism       int
+	NetworkPassphrase     string
+	Parallelism           int
+	RecSplitParallelBatch int // Number of RecSplit files to search in parallel
 
-	// Channels
-	WorkChan   chan []WorkItem  // Batches of work items
-	ResultChan chan BatchResult // Results from workers
+	// Channels for producer-consumer pattern
+	WorkChan   chan []WorkItem  // Batches of work items from producer to workers
+	ResultChan chan BatchResult // Results from workers to stats aggregator
 
 	// Global state
 	Stats        *GlobalStats
-	TotalTxCount int64 // Total transactions in input file (for progress)
+	TotalTxCount int64 // Total transactions in input file (for progress reporting)
 	StartTime    time.Time
 
 	// Synchronization
 	Ctx        context.Context
 	Cancel     context.CancelFunc
-	WG         sync.WaitGroup
-	ShutdownWG sync.WaitGroup // For graceful shutdown
+	WG         sync.WaitGroup // Tracks worker goroutines
+	ShutdownWG sync.WaitGroup // Tracks stats aggregator for graceful shutdown
 
 	// Logging
 	Logger    *log.Logger
 	ErrorFile *bufio.Writer
-	ErrorMu   sync.Mutex // Protects ErrorFile writes
+	ErrorMu   sync.Mutex // Protects ErrorFile writes (though only aggregator writes)
 }
 
 // =============================================================================
@@ -507,19 +623,41 @@ type BenchmarkContext struct {
 // =============================================================================
 
 // OpenRecSplitIndexes opens all RecSplit index files
-func OpenRecSplitIndexes(paths []string) (*RecSplitManager, time.Duration, error) {
+// The indexes use mmap internally (handled by the erigon library)
+//
+// Future optimization opportunity (--recsplit-mmap-size-mb):
+// The erigon RecSplit library mmaps the entire file. For very large indexes
+// (2B+ keys), this could cause memory pressure. Future versions could:
+// 1. Implement a custom RecSplit reader with partial mmap support
+// 2. Use madvise() hints to control page residency
+// 3. Implement an LRU-based page manager across all indexes
+//
+// For now, we rely on the OS virtual memory manager to handle paging.
+func OpenRecSplitIndexes(paths []string, mmapSizeMB int) (*RecSplitManager, time.Duration, error) {
 	start := time.Now()
 	manager := &RecSplitManager{
-		Indexes: make([]*RecSplitIndex, 0, len(paths)),
+		Indexes:    make([]*RecSplitIndex, 0, len(paths)),
+		MmapSizeMB: mmapSizeMB, // Stored for future use
 	}
 
+	// TODO: Future optimization - implement memory budgeting across indexes
+	// When mmapSizeMB is set, we could:
+	// 1. Track total mapped memory across all indexes
+	// 2. Prioritize keeping hash structures + fuse filters in memory
+	// 3. Use madvise(MADV_DONTNEED) to release pages when over budget
+
 	for _, path := range paths {
+		// OpenIndex uses mmap internally
+		// The entire file is mapped into virtual memory
+		// Actual physical memory usage depends on access patterns
 		idx, err := recsplit.OpenIndex(path)
 		if err != nil {
 			manager.Close()
 			return nil, 0, fmt.Errorf("failed to open RecSplit index %s: %w", path, err)
 		}
 
+		// IndexReader wraps the index for lookups
+		// It's thread-safe and can be used by multiple goroutines
 		reader := recsplit.NewIndexReader(idx)
 
 		manager.Indexes = append(manager.Indexes, &RecSplitIndex{
@@ -534,25 +672,38 @@ func OpenRecSplitIndexes(paths []string) (*RecSplitManager, time.Duration, error
 }
 
 // OpenRocksDBStores opens all RocksDB stores with shared block cache
+//
+// IMPORTANT: Shared Block Cache Implementation
+// We create a SINGLE LRU cache and use it across ALL RocksDB instances.
+// This is done by:
+// 1. Creating one LRUCache with the total size budget
+// 2. Creating one BlockBasedTableOptions that references this cache
+// 3. Creating one Options that uses these table options
+// 4. Opening each DB with the SAME Options object
+//
+// This means all DBs compete for the same cache space, which is optimal
+// because frequently accessed blocks from ANY store will be cached.
 func OpenRocksDBStores(paths []string, blockCacheSizeMB int) (*RocksDBStoreManager, time.Duration, error) {
 	start := time.Now()
 
-	// Create shared block cache
-	// This is the recommended way to share memory across multiple RocksDB instances
+	// Step 1: Create shared block cache
+	// This single cache will be shared across ALL RocksDB instances
+	// The cache uses LRU eviction - least recently used blocks are evicted first
 	cache := grocksdb.NewLRUCache(uint64(blockCacheSizeMB) * 1024 * 1024)
 
-	// Create shared options
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetCreateIfMissing(false)
-
-	// Configure block-based table options with shared cache
+	// Step 2: Create block-based table options with shared cache
+	// These options configure how data blocks are stored and cached
 	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetBlockCache(cache)
-	bbto.SetFilterPolicy(grocksdb.NewBloomFilter(10))
-	bbto.SetCacheIndexAndFilterBlocks(true)
-	opts.SetBlockBasedTableFactory(bbto)
+	bbto.SetBlockCache(cache)                         // <-- This is the key line for cache sharing
+	bbto.SetFilterPolicy(grocksdb.NewBloomFilter(10)) // 10 bits per key bloom filter
+	bbto.SetCacheIndexAndFilterBlocks(true)           // Cache index/filter blocks in the shared cache
 
-	// Create read options (shared across all stores)
+	// Step 3: Create database options using the table options
+	opts := grocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(false)       // Fail if DB doesn't exist
+	opts.SetBlockBasedTableFactory(bbto) // <-- Uses the shared cache via bbto
+
+	// Step 4: Create read options (shared across all reads)
 	readOpts := grocksdb.NewDefaultReadOptions()
 
 	manager := &RocksDBStoreManager{
@@ -560,10 +711,14 @@ func OpenRocksDBStores(paths []string, blockCacheSizeMB int) (*RocksDBStoreManag
 		ReadOpts:   readOpts,
 		BlockCache: cache,
 		Options:    opts,
+		BBTOptions: bbto,
 	}
 
+	// Step 5: Open each database with the SAME opts object
+	// This ensures they all share the same block cache
 	for _, path := range paths {
-		// Open in read-only mode
+		// Open in read-only mode (second param false = don't error if no write lock)
+		// All instances share the same opts, and therefore the same block cache
 		db, err := grocksdb.OpenDbForReadOnly(opts, path, false)
 		if err != nil {
 			manager.Close()
@@ -571,6 +726,7 @@ func OpenRocksDBStores(paths []string, blockCacheSizeMB int) (*RocksDBStoreManag
 		}
 
 		// Determine ledger range using SeekToFirst and SeekToLast
+		// This is done once at startup for efficient range-based store selection
 		minLedger, maxLedger, err := getLedgerRange(db, readOpts)
 		if err != nil {
 			db.Close()
@@ -587,7 +743,8 @@ func OpenRocksDBStores(paths []string, blockCacheSizeMB int) (*RocksDBStoreManag
 		})
 	}
 
-	// Sort stores by MinLedger for efficient range searching
+	// Sort stores by MinLedger for potentially more efficient searching
+	// (though we do linear scan, having them sorted helps debugging)
 	sort.Slice(manager.Stores, func(i, j int) bool {
 		return manager.Stores[i].MinLedger < manager.Stores[j].MinLedger
 	})
@@ -596,11 +753,12 @@ func OpenRocksDBStores(paths []string, blockCacheSizeMB int) (*RocksDBStoreManag
 }
 
 // getLedgerRange determines the min and max ledger sequence in a RocksDB store
+// by seeking to the first and last keys
 func getLedgerRange(db *grocksdb.DB, readOpts *grocksdb.ReadOptions) (uint32, uint32, error) {
 	iter := db.NewIterator(readOpts)
 	defer iter.Close()
 
-	// Get minimum ledger
+	// Get minimum ledger (first key)
 	iter.SeekToFirst()
 	if !iter.Valid() {
 		return 0, 0, fmt.Errorf("empty database or iteration error")
@@ -613,7 +771,7 @@ func getLedgerRange(db *grocksdb.DB, readOpts *grocksdb.ReadOptions) (uint32, ui
 	minLedger := binary.BigEndian.Uint32(minKey.Data())
 	minKey.Free()
 
-	// Get maximum ledger
+	// Get maximum ledger (last key)
 	iter.SeekToLast()
 	if !iter.Valid() {
 		return 0, 0, fmt.Errorf("iteration error on SeekToLast")
@@ -630,7 +788,7 @@ func getLedgerRange(db *grocksdb.DB, readOpts *grocksdb.ReadOptions) (uint32, ui
 }
 
 // CountInputTransactions counts the total number of valid transactions in the input file
-// This is used for progress reporting
+// This is used for progress reporting and ETA calculation
 func CountInputTransactions(inputPath string) (int64, error) {
 	file, err := os.Open(inputPath)
 	if err != nil {
@@ -642,6 +800,7 @@ func CountInputTransactions(inputPath string) (int64, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		// Only count lines that are valid 64-character hex strings
 		if len(line) == 64 && isValidHex(line) {
 			count++
 		}
@@ -665,10 +824,13 @@ func isValidHex(s string) bool {
 // =============================================================================
 
 // Worker processes batches of transaction hashes
+// Each worker has its own zstd decoder to avoid contention
+// Workers pull batches from WorkChan, process them, and send results to ResultChan
 func Worker(ctx *BenchmarkContext, workerID int) {
 	defer ctx.WG.Done()
 
-	// Create dedicated zstd decoder for this worker (avoids contention)
+	// Create dedicated zstd decoder for this worker
+	// This avoids contention on a shared decoder
 	zstdDecoder, err := zstd.NewReader(nil)
 	if err != nil {
 		ctx.Logger.Printf("Worker %d: Failed to create zstd decoder: %v", workerID, err)
@@ -679,12 +841,15 @@ func Worker(ctx *BenchmarkContext, workerID int) {
 	for {
 		select {
 		case <-ctx.Ctx.Done():
+			// Context cancelled (e.g., Ctrl+C), exit gracefully
 			return
 		case batch, ok := <-ctx.WorkChan:
 			if !ok {
-				return // Channel closed, exit
+				// Channel closed, no more work
+				return
 			}
 
+			// Process the batch and send results
 			result := processBatch(ctx, zstdDecoder, batch)
 
 			select {
@@ -703,7 +868,7 @@ func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []Work
 	}
 
 	for _, item := range batch {
-		// Validate input
+		// Validate input - skip invalid hex strings silently
 		if len(item.TxHashHex) != 64 || !isValidHex(item.TxHashHex) {
 			result.InvalidCount++
 			continue
@@ -711,11 +876,14 @@ func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []Work
 
 		timing, benchErr := processTransaction(ctx, zstdDecoder, item.TxHashHex)
 
-		// Update stats based on result
+		// Update stats based on result type
 		if benchErr == nil {
+			// Clean success - no errors at all
 			result.Stats.Success.Add(timing)
 		} else {
+			// Add error to list for logging
 			result.Errors = append(result.Errors, benchErr)
+
 			switch benchErr.Type {
 			case ErrTypeRecSplitNotFound:
 				result.Stats.RecSplitNotFound.Add(timing)
@@ -726,9 +894,9 @@ func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []Work
 			case ErrTypeFalsePositiveCompound:
 				result.Stats.FalsePositiveCompound.Add(timing)
 			case ErrTypeFalsePositivePartial:
-				// This is actually a success, but we track it separately
+				// FALSE_POSITIVE_PARTIAL means we DID find the transaction
+				// We track it separately for analysis, but also count as success
 				result.Stats.FalsePositivePartial.Add(timing)
-				result.Stats.Success.Add(timing) // Also count in success
 			case ErrTypeLedgerInMultipleDBs:
 				result.Stats.LedgerInMultipleDBs.Add(timing)
 			case ErrTypeUnforeseen:
@@ -740,13 +908,29 @@ func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []Work
 	return result
 }
 
-// processTransaction processes a single transaction hash
-// Returns timing information and an error if the lookup failed
+// =============================================================================
+// TRANSACTION PROCESSING - MAIN LOOKUP LOGIC
+// =============================================================================
+
+// processTransaction processes a single transaction hash using lazy sequential search
+//
+// ALGORITHM:
+// 1. Search RecSplit indexes in parallel batches (default batch size: 4)
+// 2. For each batch, wait for all lookups to complete
+// 3. For any matches found, try to find the transaction in the corresponding ledger
+// 4. If transaction found -> SUCCESS, return immediately (early termination)
+// 5. If false positive -> continue to next match or next batch
+// 6. If all batches exhausted with no success -> determine error type
+//
+// TIMING CALCULATION:
+//   - RecSplit time = average of batch averages
+//     (each batch average = sum of lookup times in batch / batch size)
+//   - Other timings are summed across all ledger lookups attempted
 func processTransaction(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHashHex string) (QueryTiming, *BenchmarkError) {
 	timing := QueryTiming{}
 	totalStart := time.Now()
 
-	// Parse transaction hash
+	// Parse transaction hash from hex to bytes
 	txHashBytes, err := hex.DecodeString(txHashHex)
 	if err != nil {
 		timing.Total = time.Since(totalStart)
@@ -754,265 +938,372 @@ func processTransaction(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHash
 			Type:            ErrTypeUnforeseen,
 			TxHash:          txHashHex,
 			TotalDuration:   timing.Total,
-			UnderlyingError: err,
+			UnderlyingError: fmt.Errorf("hex decode error: %w", err),
 		}
 	}
 
-	// Step 1: Search RecSplit indexes sequentially
-	// Collect all potential matches (for false positive handling)
-	t1 := time.Now()
-	var candidateLedgers []uint32
-	var candidateIndexes []string
+	// Track all RecSplit batch timings for averaging
+	var recSplitBatchAvgs []time.Duration
 
-	for _, idx := range ctx.RecSplitMgr.Indexes {
-		ledgerSeqU64, found := idx.Reader.Lookup(txHashBytes)
-		if found {
-			candidateLedgers = append(candidateLedgers, uint32(ledgerSeqU64))
-			candidateIndexes = append(candidateIndexes, idx.Name)
-		}
-	}
-	timing.RecSplitLookup = time.Since(t1)
+	// Track all ledger lookups for error reporting (with ClosedAt times)
+	var allLedgerInfos []LedgerInfo
+	var totalTxsScanned int
 
-	// No matches found in any RecSplit index
-	if len(candidateLedgers) == 0 {
-		timing.Total = time.Since(totalStart)
-		return timing, &BenchmarkError{
-			Type:          ErrTypeRecSplitNotFound,
-			TxHash:        txHashHex,
-			TotalDuration: timing.Total,
-		}
-	}
-
-	// Step 2: For each candidate ledger, try to find the transaction
-	// Track which lookups succeeded and which were false positives
-	var successLedger uint32
-	var successTiming QueryTiming
-	var falsePosLedgers []uint32
+	// Track timing for ledger operations (accumulated across all lookups)
 	var totalRocksDBTime, totalDecompTime, totalUnmarshalTime time.Duration
 	var totalTxReaderTime, totalTxSearchTime, totalTxExtractTime time.Duration
-	var totalTxCount int
 
-	for i, ledgerSeq := range candidateLedgers {
-		// Find the RocksDB store for this ledger
-		stores := ctx.RocksDBMgr.FindAllStoresForLedger(ledgerSeq)
+	// Process RecSplit indexes in batches
+	indexes := ctx.RecSplitMgr.Indexes
+	batchSize := ctx.RecSplitParallelBatch
 
-		if len(stores) == 0 {
-			// Ledger not found in any store - this is unusual
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:          ErrTypeLedgerNotFound,
-				TxHash:        txHashHex,
-				LedgerSeq:     ledgerSeq,
-				TotalDuration: timing.Total,
+	for batchStart := 0; batchStart < len(indexes); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(indexes) {
+			batchEnd = len(indexes)
+		}
+
+		// Search this batch of RecSplit indexes in parallel
+		batchResults := searchRecSplitBatch(indexes[batchStart:batchEnd], txHashBytes, batchStart)
+
+		// Calculate batch average time
+		batchAvg := calculateBatchAverage(batchResults)
+		recSplitBatchAvgs = append(recSplitBatchAvgs, batchAvg)
+
+		// Collect matches from this batch
+		var matches []RecSplitLookupResult
+		for _, r := range batchResults {
+			if r.Found {
+				matches = append(matches, r)
 			}
 		}
 
-		if len(stores) > 1 {
-			// Data inconsistency: ledger in multiple stores
-			dbNames := make([]string, len(stores))
-			for j, s := range stores {
-				dbNames[j] = s.Name
-			}
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:          ErrTypeLedgerInMultipleDBs,
-				TxHash:        txHashHex,
-				LedgerSeq:     ledgerSeq,
-				DBNames:       dbNames,
-				TotalDuration: timing.Total,
-			}
-		}
+		// Process matches in order (by index position for determinism)
+		sort.Slice(matches, func(i, j int) bool {
+			return matches[i].IndexIdx < matches[j].IndexIdx
+		})
 
-		store := stores[0]
+		for _, match := range matches {
+			// Try to find the transaction in this ledger
+			ledgerResult := lookupLedger(ctx, zstdDecoder, txHashHex, match.LedgerSeq)
 
-		// Query RocksDB
-		ledgerKey := make([]byte, 4)
-		binary.BigEndian.PutUint32(ledgerKey, ledgerSeq)
+			// Accumulate timing regardless of result
+			totalRocksDBTime += ledgerResult.RocksDBTime
+			totalDecompTime += ledgerResult.DecompTime
+			totalUnmarshalTime += ledgerResult.UnmarshalTime
+			totalTxReaderTime += ledgerResult.TxReaderTime
+			totalTxSearchTime += ledgerResult.TxSearchTime
+			totalTxExtractTime += ledgerResult.TxExtractTime
+			totalTxsScanned += ledgerResult.TxsScanned
 
-		t2 := time.Now()
-		slice, err := store.DB.Get(ctx.RocksDBMgr.ReadOpts, ledgerKey)
-		rocksDBTime := time.Since(t2)
-		totalRocksDBTime += rocksDBTime
+			// Handle errors from ledger lookup
+			if ledgerResult.Error != nil {
+				// Check for "ledger in multiple DBs" error
+				if len(ledgerResult.DBNames) > 0 {
+					timing.RecSplitLookup = calculateOverallRecSplitTime(recSplitBatchAvgs)
+					timing.RocksDBQuery = totalRocksDBTime
+					timing.Total = time.Since(totalStart)
+					return timing, &BenchmarkError{
+						Type:          ErrTypeLedgerInMultipleDBs,
+						TxHash:        txHashHex,
+						LedgerSeq:     match.LedgerSeq,
+						DBNames:       ledgerResult.DBNames,
+						TotalDuration: timing.Total,
+					}
+				}
 
-		if err != nil {
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:            ErrTypeUnforeseen,
-				TxHash:          txHashHex,
-				TotalDuration:   timing.Total,
-				UnderlyingError: fmt.Errorf("RocksDB error: %w", err),
-			}
-		}
+				// Check if it's a "ledger not found" type error
+				if ledgerResult.LedgerInfo.Seq == 0 {
+					// Ledger doesn't exist in any RocksDB store
+					timing.RecSplitLookup = calculateOverallRecSplitTime(recSplitBatchAvgs)
+					timing.RocksDBQuery = totalRocksDBTime
+					timing.Total = time.Since(totalStart)
+					return timing, &BenchmarkError{
+						Type:          ErrTypeLedgerNotFound,
+						TxHash:        txHashHex,
+						LedgerSeq:     match.LedgerSeq,
+						TotalDuration: timing.Total,
+					}
+				}
 
-		if !slice.Exists() {
-			slice.Free()
-			// Key doesn't exist despite being in range - treat as ledger not found
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:          ErrTypeLedgerNotFound,
-				TxHash:        txHashHex,
-				LedgerSeq:     ledgerSeq,
-				TotalDuration: timing.Total,
-			}
-		}
-
-		// Copy compressed data
-		compressedLCM := make([]byte, len(slice.Data()))
-		copy(compressedLCM, slice.Data())
-		slice.Free()
-
-		// Decompress
-		t3 := time.Now()
-		uncompressedLCM, err := zstdDecoder.DecodeAll(compressedLCM, nil)
-		decompTime := time.Since(t3)
-		totalDecompTime += decompTime
-
-		if err != nil {
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:            ErrTypeUnforeseen,
-				TxHash:          txHashHex,
-				TotalDuration:   timing.Total,
-				UnderlyingError: fmt.Errorf("zstd decompress error: %w", err),
-			}
-		}
-
-		// Unmarshal XDR
-		t4 := time.Now()
-		var lcm xdr.LedgerCloseMeta
-		err = lcm.UnmarshalBinary(uncompressedLCM)
-		unmarshalTime := time.Since(t4)
-		totalUnmarshalTime += unmarshalTime
-
-		if err != nil {
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:            ErrTypeUnforeseen,
-				TxHash:          txHashHex,
-				TotalDuration:   timing.Total,
-				UnderlyingError: fmt.Errorf("XDR unmarshal error: %w", err),
-			}
-		}
-
-		// Create transaction reader
-		t5 := time.Now()
-		txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(ctx.NetworkPassphrase, lcm)
-		txReaderTime := time.Since(t5)
-		totalTxReaderTime += txReaderTime
-
-		if err != nil {
-			timing.Total = time.Since(totalStart)
-			return timing, &BenchmarkError{
-				Type:            ErrTypeUnforeseen,
-				TxHash:          txHashHex,
-				TotalDuration:   timing.Total,
-				UnderlyingError: fmt.Errorf("tx reader error: %w", err),
-			}
-		}
-
-		// Search for transaction
-		t6 := time.Now()
-		var found bool
-		txCount := 0
-		txHashLower := strings.ToLower(txHashHex)
-
-		for {
-			tx, err := txReader.Read()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				txReader.Close()
+				// Other unforeseen error
+				timing.RecSplitLookup = calculateOverallRecSplitTime(recSplitBatchAvgs)
+				timing.RocksDBQuery = totalRocksDBTime
+				timing.Decompress = totalDecompTime
+				timing.Unmarshal = totalUnmarshalTime
+				timing.TxReaderCreate = totalTxReaderTime
+				timing.TxSearch = totalTxSearchTime
 				timing.Total = time.Since(totalStart)
+
 				return timing, &BenchmarkError{
 					Type:            ErrTypeUnforeseen,
 					TxHash:          txHashHex,
 					TotalDuration:   timing.Total,
-					UnderlyingError: fmt.Errorf("tx read error: %w", err),
+					UnderlyingError: ledgerResult.Error,
 				}
 			}
-			txCount++
-			if tx.Hash.HexString() == txHashLower {
-				found = true
-				// Extract transaction data timing
-				t7 := time.Now()
-				// We don't actually need the data, just measure the extraction time
-				_, _ = tx.Envelope.MarshalBinary()
-				_, _ = tx.Result.MarshalBinary()
-				_, _ = tx.UnsafeMeta.MarshalBinary()
-				totalTxExtractTime += time.Since(t7)
-				break
-			}
-		}
-		txReader.Close()
 
-		txSearchTime := time.Since(t6)
-		totalTxSearchTime += txSearchTime
-		totalTxCount += txCount
+			// Track this ledger for potential error reporting (includes ClosedAt)
+			allLedgerInfos = append(allLedgerInfos, ledgerResult.LedgerInfo)
 
-		if found {
-			successLedger = ledgerSeq
-			successTiming = QueryTiming{
-				RecSplitLookup: timing.RecSplitLookup / time.Duration(i+1), // Amortize over lookups so far
-				RocksDBQuery:   rocksDBTime,
-				Decompress:     decompTime,
-				Unmarshal:      unmarshalTime,
-				TxReaderCreate: txReaderTime,
-				TxSearch:       txSearchTime,
-				TxExtract:      totalTxExtractTime,
-				TxCount:        txCount,
+			if ledgerResult.Found {
+				// SUCCESS! Transaction found
+				timing.RecSplitLookup = calculateOverallRecSplitTime(recSplitBatchAvgs)
+				timing.RocksDBQuery = totalRocksDBTime
+				timing.Decompress = totalDecompTime
+				timing.Unmarshal = totalUnmarshalTime
+				timing.TxReaderCreate = totalTxReaderTime
+				timing.TxSearch = totalTxSearchTime
+				timing.TxExtract = totalTxExtractTime
+				timing.TxCount = totalTxsScanned
+				timing.Total = time.Since(totalStart)
+
+				// Check if we had any false positives before this success
+				if len(allLedgerInfos) > 1 {
+					// FALSE_POSITIVE_PARTIAL - found in this ledger, but had false positives
+					return timing, &BenchmarkError{
+						Type:          ErrTypeFalsePositivePartial,
+						TxHash:        txHashHex,
+						SuccessLedger: ledgerResult.LedgerInfo,
+						LedgerInfos:   allLedgerInfos,
+						TotalDuration: timing.Total,
+					}
+				}
+
+				// Clean success - no false positives
+				return timing, nil
 			}
-		} else {
-			falsePosLedgers = append(falsePosLedgers, ledgerSeq)
+
+			// False positive - transaction not in this ledger
+			// Continue to next match or next batch
 		}
 	}
 
-	// Determine result based on what we found
-	timing.RecSplitLookup = timing.RecSplitLookup // Already set
+	// Exhausted all RecSplit indexes
+	timing.RecSplitLookup = calculateOverallRecSplitTime(recSplitBatchAvgs)
 	timing.RocksDBQuery = totalRocksDBTime
 	timing.Decompress = totalDecompTime
 	timing.Unmarshal = totalUnmarshalTime
 	timing.TxReaderCreate = totalTxReaderTime
 	timing.TxSearch = totalTxSearchTime
-	timing.TxExtract = totalTxExtractTime
-	timing.TxCount = totalTxCount
+	timing.TxCount = totalTxsScanned
 	timing.Total = time.Since(totalStart)
 
-	// Case 1: Found transaction (possibly with false positives from other indexes)
-	if successLedger > 0 {
-		if len(falsePosLedgers) > 0 {
-			// FALSE_POSITIVE_PARTIAL: Found in one, false positives in others
-			return timing, &BenchmarkError{
-				Type:          ErrTypeFalsePositivePartial,
-				TxHash:        txHashHex,
-				SuccessLedger: successLedger,
-				LedgerSeqs:    append([]uint32{successLedger}, falsePosLedgers...),
-				TotalDuration: timing.Total,
-			}
+	// Determine the type of failure
+	if len(allLedgerInfos) == 0 {
+		// No RecSplit index returned a match
+		return timing, &BenchmarkError{
+			Type:          ErrTypeRecSplitNotFound,
+			TxHash:        txHashHex,
+			TotalDuration: timing.Total,
 		}
-		// Clean success
-		return timing, nil
-	}
-
-	// Case 2: No success, all were false positives
-	if len(candidateLedgers) == 1 {
-		// FALSE_POSITIVE_NORMAL: Single false positive
+	} else if len(allLedgerInfos) == 1 {
+		// Single false positive
 		return timing, &BenchmarkError{
 			Type:          ErrTypeFalsePositiveNormal,
 			TxHash:        txHashHex,
-			LedgerSeq:     candidateLedgers[0],
-			TxsScanned:    totalTxCount,
+			LedgerInfo:    allLedgerInfos[0],
+			TxsScanned:    totalTxsScanned,
+			TotalDuration: timing.Total,
+		}
+	} else {
+		// Multiple false positives (compound)
+		return timing, &BenchmarkError{
+			Type:          ErrTypeFalsePositiveCompound,
+			TxHash:        txHashHex,
+			LedgerInfos:   allLedgerInfos,
 			TotalDuration: timing.Total,
 		}
 	}
+}
 
-	// FALSE_POSITIVE_COMPOUND: Multiple false positives
-	return timing, &BenchmarkError{
-		Type:          ErrTypeFalsePositiveCompound,
-		TxHash:        txHashHex,
-		LedgerSeqs:    candidateLedgers,
-		TotalDuration: timing.Total,
+// searchRecSplitBatch searches a batch of RecSplit indexes in parallel
+// Returns results for all indexes in the batch
+// Each goroutine uses the shared, thread-safe IndexReader
+func searchRecSplitBatch(indexes []*RecSplitIndex, txHashBytes []byte, startIdx int) []RecSplitLookupResult {
+	results := make([]RecSplitLookupResult, len(indexes))
+	var wg sync.WaitGroup
+
+	for i, idx := range indexes {
+		wg.Add(1)
+		go func(i int, idx *RecSplitIndex) {
+			defer wg.Done()
+
+			start := time.Now()
+			ledgerSeqU64, found := idx.Reader.Lookup(txHashBytes)
+			duration := time.Since(start)
+
+			results[i] = RecSplitLookupResult{
+				IndexName: idx.Name,
+				IndexIdx:  startIdx + i,
+				LedgerSeq: uint32(ledgerSeqU64),
+				Found:     found,
+				Duration:  duration,
+			}
+		}(i, idx)
 	}
+
+	wg.Wait()
+	return results
+}
+
+// calculateBatchAverage calculates the average lookup time for a batch
+// This is step 1 of the timing calculation: average within each batch
+func calculateBatchAverage(results []RecSplitLookupResult) time.Duration {
+	if len(results) == 0 {
+		return 0
+	}
+
+	var total time.Duration
+	for _, r := range results {
+		total += r.Duration
+	}
+
+	return total / time.Duration(len(results))
+}
+
+// calculateOverallRecSplitTime calculates the overall RecSplit time
+// as the average of batch averages
+// This is step 2 of the timing calculation: average across all batches
+func calculateOverallRecSplitTime(batchAvgs []time.Duration) time.Duration {
+	if len(batchAvgs) == 0 {
+		return 0
+	}
+
+	var total time.Duration
+	for _, avg := range batchAvgs {
+		total += avg
+	}
+
+	return total / time.Duration(len(batchAvgs))
+}
+
+// lookupLedger looks up a ledger in RocksDB, decompresses it, and searches for the transaction
+// Returns detailed timing and result information
+func lookupLedger(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHashHex string, ledgerSeq uint32) LedgerLookupResult {
+	result := LedgerLookupResult{}
+
+	// Find the RocksDB store(s) for this ledger
+	stores := ctx.RocksDBMgr.FindAllStoresForLedger(ledgerSeq)
+
+	if len(stores) == 0 {
+		// Ledger not found in any store
+		result.Error = fmt.Errorf("ledger %d not found in any RocksDB store", ledgerSeq)
+		return result
+	}
+
+	if len(stores) > 1 {
+		// Data inconsistency: ledger in multiple stores
+		dbNames := make([]string, len(stores))
+		for i, s := range stores {
+			dbNames[i] = s.Name
+		}
+		result.Error = fmt.Errorf("ledger %d found in multiple DBs: %v", ledgerSeq, dbNames)
+		result.DBNames = dbNames
+		result.LedgerInfo.Seq = ledgerSeq // Set seq so caller knows this isn't "not found"
+		return result
+	}
+
+	store := stores[0]
+
+	// Query RocksDB
+	ledgerKey := make([]byte, 4)
+	binary.BigEndian.PutUint32(ledgerKey, ledgerSeq)
+
+	t1 := time.Now()
+	slice, err := store.DB.Get(ctx.RocksDBMgr.ReadOpts, ledgerKey)
+	result.RocksDBTime = time.Since(t1)
+
+	if err != nil {
+		result.Error = fmt.Errorf("RocksDB error for ledger %d: %w", ledgerSeq, err)
+		return result
+	}
+
+	if !slice.Exists() {
+		slice.Free()
+		result.Error = fmt.Errorf("ledger %d key not found in RocksDB (within range but missing)", ledgerSeq)
+		return result
+	}
+
+	// Copy compressed data (slice is only valid until Free)
+	compressedLCM := make([]byte, len(slice.Data()))
+	copy(compressedLCM, slice.Data())
+	slice.Free()
+
+	// Decompress
+	t2 := time.Now()
+	uncompressedLCM, err := zstdDecoder.DecodeAll(compressedLCM, nil)
+	result.DecompTime = time.Since(t2)
+
+	if err != nil {
+		result.Error = fmt.Errorf("zstd decompress error for ledger %d: %w", ledgerSeq, err)
+		return result
+	}
+
+	// Unmarshal XDR
+	t3 := time.Now()
+	var lcm xdr.LedgerCloseMeta
+	err = lcm.UnmarshalBinary(uncompressedLCM)
+	result.UnmarshalTime = time.Since(t3)
+
+	if err != nil {
+		result.Error = fmt.Errorf("XDR unmarshal error for ledger %d: %w", ledgerSeq, err)
+		return result
+	}
+
+	// Set ledger info now that we have ClosedAt from the LedgerCloseMeta
+	result.LedgerInfo = LedgerInfo{
+		Seq:      ledgerSeq,
+		ClosedAt: lcm.ClosedAt(), // This is the key call to get close time
+	}
+
+	// Create transaction reader
+	t4 := time.Now()
+	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(ctx.NetworkPassphrase, lcm)
+	result.TxReaderTime = time.Since(t4)
+
+	if err != nil {
+		result.Error = fmt.Errorf("tx reader error for ledger %d: %w", ledgerSeq, err)
+		return result
+	}
+	defer txReader.Close()
+
+	// Search for transaction
+	t5 := time.Now()
+	txHashLower := strings.ToLower(txHashHex)
+
+	for {
+		tx, err := txReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			result.TxSearchTime = time.Since(t5)
+			result.Error = fmt.Errorf("tx read error in ledger %d: %w", ledgerSeq, err)
+			return result
+		}
+
+		result.TxsScanned++
+
+		if tx.Hash.HexString() == txHashLower {
+			// Found the transaction!
+			result.TxSearchTime = time.Since(t5)
+
+			// Extract transaction data (measure time even though we don't use the data)
+			t6 := time.Now()
+			_, _ = tx.Envelope.MarshalBinary()
+			_, _ = tx.Result.MarshalBinary()
+			_, _ = tx.UnsafeMeta.MarshalBinary()
+			result.TxExtractTime = time.Since(t6)
+
+			result.Found = true
+			return result
+		}
+	}
+
+	result.TxSearchTime = time.Since(t5)
+	// Transaction not found in this ledger (false positive)
+	return result
 }
 
 // =============================================================================
@@ -1020,6 +1311,7 @@ func processTransaction(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHash
 // =============================================================================
 
 // Producer reads transaction hashes from the input file and sends them to workers
+// It batches transactions into WorkerBatchSize chunks for efficient processing
 func Producer(ctx *BenchmarkContext, inputPath string) {
 	defer close(ctx.WorkChan)
 
@@ -1042,11 +1334,12 @@ func Producer(ctx *BenchmarkContext, inputPath string) {
 
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
-			continue
+			continue // Skip empty lines
 		}
 
 		batch = append(batch, WorkItem{TxHashHex: line})
 
+		// Send batch when full
 		if len(batch) >= WorkerBatchSize {
 			select {
 			case ctx.WorkChan <- batch:
@@ -1075,17 +1368,22 @@ func Producer(ctx *BenchmarkContext, inputPath string) {
 // =============================================================================
 
 // StatsAggregator collects results from workers and reports progress
+// This runs as a single goroutine to avoid lock contention
+// It's the only goroutine that writes to the error file and log
 func StatsAggregator(ctx *BenchmarkContext) {
 	defer ctx.ShutdownWG.Done()
 
+	// Calculate progress report interval (approximately 1%)
 	lastReportCount := int64(0)
-	reportInterval := ctx.TotalTxCount / 100 // ~1%
+	reportInterval := ctx.TotalTxCount / 100
 	if reportInterval < 1 {
 		reportInterval = 1
 	}
 
+	// Buffer errors for efficient file I/O
 	errorBuffer := make([]*BenchmarkError, 0, ErrorFileFlushInterval)
 
+	// Helper function to flush error buffer to file
 	flushErrors := func() {
 		if len(errorBuffer) == 0 {
 			return
@@ -1108,17 +1406,17 @@ func StatsAggregator(ctx *BenchmarkContext) {
 				return
 			}
 
-			// Merge stats
+			// Merge worker stats into global stats (thread-safe)
 			ctx.Stats.Merge(&result.Stats)
 			atomic.AddInt64(&ctx.Stats.InvalidInputs, result.InvalidCount)
 
-			// Buffer errors
+			// Buffer errors for batch writing
 			errorBuffer = append(errorBuffer, result.Errors...)
 			if len(errorBuffer) >= ErrorFileFlushInterval {
 				flushErrors()
 			}
 
-			// Check if we should report progress
+			// Check if we should report progress (approximately every 1%)
 			currentCount := atomic.LoadInt64(&ctx.Stats.TotalProcessed)
 			if currentCount-lastReportCount >= reportInterval {
 				printProgress(ctx)
@@ -1126,7 +1424,7 @@ func StatsAggregator(ctx *BenchmarkContext) {
 			}
 
 		case <-ctx.Ctx.Done():
-			// Graceful shutdown - drain remaining results
+			// Graceful shutdown - drain remaining results from channel
 			for result := range ctx.ResultChan {
 				ctx.Stats.Merge(&result.Stats)
 				atomic.AddInt64(&ctx.Stats.InvalidInputs, result.InvalidCount)
@@ -1142,16 +1440,17 @@ func StatsAggregator(ctx *BenchmarkContext) {
 // PROGRESS REPORTING
 // =============================================================================
 
+// printProgress prints current progress statistics to the log
 func printProgress(ctx *BenchmarkContext) {
 	stats := ctx.Stats.Snapshot()
 	elapsed := time.Since(ctx.StartTime)
 
-	// Calculate progress
+	// Calculate progress percentage
 	processed := stats.TotalProcessed
 	total := ctx.TotalTxCount
 	percentage := float64(processed) / float64(total) * 100
 
-	// Calculate ETA
+	// Calculate ETA based on current throughput
 	var eta time.Duration
 	if processed > 0 {
 		avgPerTx := elapsed / time.Duration(processed)
@@ -1159,27 +1458,29 @@ func printProgress(ctx *BenchmarkContext) {
 		eta = avgPerTx * time.Duration(remaining)
 	}
 
-	// Calculate throughput
+	// Calculate throughput (transactions per second)
 	throughput := float64(processed) / elapsed.Seconds()
 
-	// Format timestamp
+	// Format timestamp for log entries
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
+	// Print main progress line
 	ctx.Logger.Printf("%s | Progress: %s/%s (%.2f%%) | Elapsed: %s | ETA: %s",
 		timestamp,
 		helpers.FormatNumber(processed),
 		helpers.FormatNumber(total),
 		percentage,
-		helpers.FormatDuration(elapsed),
-		helpers.FormatDuration(eta))
+		formatDurationShort(elapsed),
+		formatDurationShort(eta))
 
+	// Print throughput and success/fail counts
 	ctx.Logger.Printf("%s | Throughput: %.2f/s | Success: %s | Failed: %s",
 		timestamp,
 		throughput,
 		helpers.FormatNumber(stats.TotalSuccess),
 		helpers.FormatNumber(stats.TotalFailed))
 
-	// Print successful query breakdown
+	// Print successful query timing breakdown
 	if stats.Success.QueryCount > 0 {
 		avg := stats.Success.Average()
 		ctx.Logger.Printf("%s | Avg Successful Query Breakdown:", timestamp)
@@ -1198,7 +1499,7 @@ func printProgress(ctx *BenchmarkContext) {
 			helpers.FormatDuration(avg.Total))
 	}
 
-	// Print failed query breakdown
+	// Print failed query breakdown by type
 	if stats.TotalFailed > 0 {
 		ctx.Logger.Printf("%s | Avg Failed Query Breakdown:", timestamp)
 		printFailureStats(ctx.Logger, timestamp, "RECSPLIT_NOT_FOUND", &stats.RecSplitNotFound)
@@ -1209,7 +1510,7 @@ func printProgress(ctx *BenchmarkContext) {
 		printFailureStats(ctx.Logger, timestamp, "UNFORESEEN", &stats.Unforeseen)
 	}
 
-	// Note about FALSE_POSITIVE_PARTIAL (logged but counted as success)
+	// Note about FALSE_POSITIVE_PARTIAL (logged separately since it's counted as success)
 	if stats.FalsePositivePartial.QueryCount > 0 {
 		ctx.Logger.Printf("%s | Note: %d FALSE_POSITIVE_PARTIAL (counted in success, avg %s)",
 			timestamp,
@@ -1220,6 +1521,7 @@ func printProgress(ctx *BenchmarkContext) {
 	ctx.Logger.Println()
 }
 
+// printFailureStats prints stats for a specific failure type
 func printFailureStats(logger *log.Logger, timestamp, name string, acc *TimingAccumulator) {
 	if acc.QueryCount > 0 {
 		avg := acc.Average()
@@ -1228,29 +1530,36 @@ func printFailureStats(logger *log.Logger, timestamp, name string, acc *TimingAc
 	}
 }
 
+// formatDurationShort formats a duration in a compact human-readable format
+func formatDurationShort(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh %dm %ds", int(d.Hours()), int(d.Minutes())%60, int(d.Seconds())%60)
+}
+
 // =============================================================================
 // FINAL SUMMARY
 // =============================================================================
 
-// FinalSummary holds the final benchmark results
+// FinalSummary holds the final benchmark results for JSON output
 type FinalSummary struct {
-	// Basic stats
-	TotalTransactions int64         `json:"total_transactions"`
-	TotalSuccess      int64         `json:"total_success"`
-	TotalFailed       int64         `json:"total_failed"`
-	InvalidInputs     int64         `json:"invalid_inputs"`
-	WallClockTime     time.Duration `json:"wall_clock_time_ns"`
-	WallClockTimeStr  string        `json:"wall_clock_time"`
-	Throughput        float64       `json:"throughput_per_second"`
-
-	// Success breakdown
-	SuccessAvg           QueryTimingJSON `json:"success_avg"`
-	FalsePositivePartial QueryTimingJSON `json:"false_positive_partial_avg,omitempty"`
-
-	// Failure breakdown
-	Failures map[string]FailureStats `json:"failures"`
+	TotalTransactions    int64                   `json:"total_transactions"`
+	TotalSuccess         int64                   `json:"total_success"`
+	TotalFailed          int64                   `json:"total_failed"`
+	InvalidInputs        int64                   `json:"invalid_inputs"`
+	WallClockTime        time.Duration           `json:"wall_clock_time_ns"`
+	WallClockTimeStr     string                  `json:"wall_clock_time"`
+	Throughput           float64                 `json:"throughput_per_second"`
+	SuccessAvg           QueryTimingJSON         `json:"success_avg"`
+	FalsePositivePartial QueryTimingJSON         `json:"false_positive_partial_avg,omitempty"`
+	Failures             map[string]FailureStats `json:"failures"`
 }
 
+// QueryTimingJSON is the JSON-serializable version of QueryTiming
 type QueryTimingJSON struct {
 	RecSplitLookup string `json:"recsplit_lookup"`
 	RocksDBQuery   string `json:"rocksdb_query"`
@@ -1263,11 +1572,13 @@ type QueryTimingJSON struct {
 	AvgTxScanned   int    `json:"avg_tx_scanned"`
 }
 
+// FailureStats holds statistics for a failure type
 type FailureStats struct {
 	Count   int64  `json:"count"`
 	AvgTime string `json:"avg_time"`
 }
 
+// timingToJSON converts a QueryTiming to its JSON representation
 func timingToJSON(t QueryTiming) QueryTimingJSON {
 	return QueryTimingJSON{
 		RecSplitLookup: helpers.FormatDuration(t.RecSplitLookup),
@@ -1282,6 +1593,7 @@ func timingToJSON(t QueryTiming) QueryTimingJSON {
 	}
 }
 
+// printFinalSummary prints the final benchmark summary to the log
 func printFinalSummary(ctx *BenchmarkContext) {
 	stats := ctx.Stats.Snapshot()
 	elapsed := time.Since(ctx.StartTime)
@@ -1294,17 +1606,21 @@ func printFinalSummary(ctx *BenchmarkContext) {
 
 	// Basic statistics
 	ctx.Logger.Printf("Total Transactions:    %s", helpers.FormatNumber(stats.TotalProcessed))
-	ctx.Logger.Printf("  Successful:          %s (%.2f%%)",
-		helpers.FormatNumber(stats.TotalSuccess),
-		float64(stats.TotalSuccess)/float64(stats.TotalProcessed)*100)
-	ctx.Logger.Printf("  Failed:              %s (%.2f%%)",
-		helpers.FormatNumber(stats.TotalFailed),
-		float64(stats.TotalFailed)/float64(stats.TotalProcessed)*100)
+	if stats.TotalProcessed > 0 {
+		ctx.Logger.Printf("  Successful:          %s (%.2f%%)",
+			helpers.FormatNumber(stats.TotalSuccess),
+			float64(stats.TotalSuccess)/float64(stats.TotalProcessed)*100)
+		ctx.Logger.Printf("  Failed:              %s (%.2f%%)",
+			helpers.FormatNumber(stats.TotalFailed),
+			float64(stats.TotalFailed)/float64(stats.TotalProcessed)*100)
+	}
 	ctx.Logger.Printf("  Invalid (skipped):   %s", helpers.FormatNumber(stats.InvalidInputs))
 	ctx.Logger.Println()
 
 	ctx.Logger.Printf("Wall Clock Time:       %s", helpers.FormatDuration(elapsed))
-	ctx.Logger.Printf("Throughput:            %.2f tx/s", float64(stats.TotalProcessed)/elapsed.Seconds())
+	if elapsed.Seconds() > 0 {
+		ctx.Logger.Printf("Throughput:            %.2f tx/s", float64(stats.TotalProcessed)/elapsed.Seconds())
+	}
 	ctx.Logger.Println()
 
 	// Successful queries breakdown
@@ -1350,7 +1666,7 @@ func printFinalSummary(ctx *BenchmarkContext) {
 
 	ctx.Logger.Println("================================================================================")
 
-	// JSON Summary
+	// JSON Summary (appended to same log file as requested)
 	summary := buildJSONSummary(stats, elapsed)
 	jsonBytes, err := json.MarshalIndent(summary, "", "  ")
 	if err == nil {
@@ -1362,6 +1678,7 @@ func printFinalSummary(ctx *BenchmarkContext) {
 	ctx.Logger.Println("================================================================================")
 }
 
+// printFinalFailureStats prints detailed stats for a failure type in the final summary
 func printFinalFailureStats(logger *log.Logger, name string, acc *TimingAccumulator) {
 	if acc.QueryCount > 0 {
 		avg := acc.Average()
@@ -1371,6 +1688,7 @@ func printFinalFailureStats(logger *log.Logger, name string, acc *TimingAccumula
 	}
 }
 
+// buildJSONSummary builds the JSON summary structure
 func buildJSONSummary(stats GlobalStats, elapsed time.Duration) FinalSummary {
 	summary := FinalSummary{
 		TotalTransactions: stats.TotalProcessed,
@@ -1379,8 +1697,11 @@ func buildJSONSummary(stats GlobalStats, elapsed time.Duration) FinalSummary {
 		InvalidInputs:     stats.InvalidInputs,
 		WallClockTime:     elapsed,
 		WallClockTimeStr:  helpers.FormatDuration(elapsed),
-		Throughput:        float64(stats.TotalProcessed) / elapsed.Seconds(),
 		Failures:          make(map[string]FailureStats),
+	}
+
+	if elapsed.Seconds() > 0 {
+		summary.Throughput = float64(stats.TotalProcessed) / elapsed.Seconds()
 	}
 
 	if stats.Success.QueryCount > 0 {
@@ -1391,6 +1712,7 @@ func buildJSONSummary(stats GlobalStats, elapsed time.Duration) FinalSummary {
 		summary.FalsePositivePartial = timingToJSON(stats.FalsePositivePartial.Average())
 	}
 
+	// Add failure stats
 	addFailureStat := func(name string, acc *TimingAccumulator) {
 		if acc.QueryCount > 0 {
 			summary.Failures[name] = FailureStats{
@@ -1410,6 +1732,7 @@ func buildJSONSummary(stats GlobalStats, elapsed time.Duration) FinalSummary {
 	return summary
 }
 
+// printMemStats prints memory statistics to the log
 func printMemStats(logger *log.Logger) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -1424,6 +1747,7 @@ func printMemStats(logger *log.Logger) {
 // INITIALIZATION SUMMARY
 // =============================================================================
 
+// printInitSummary prints the initialization summary before starting the benchmark
 func printInitSummary(
 	logger *log.Logger,
 	rsMgr *RecSplitManager, rsLoadTime time.Duration,
@@ -1437,7 +1761,7 @@ func printInitSummary(
 	logger.Println("================================================================================")
 	logger.Println()
 
-	// RecSplit indexes
+	// RecSplit indexes summary
 	logger.Printf("RecSplit Indexes (%d files):", len(rsMgr.Indexes))
 	logger.Printf("  Load time:           %s", helpers.FormatDuration(rsLoadTime))
 	var totalKeys uint64
@@ -1449,29 +1773,35 @@ func printInitSummary(
 			helpers.FormatBytes(idx.Index.Size()))
 	}
 	logger.Printf("  Total keys:          %s", helpers.FormatNumber(int64(totalKeys)))
-	logger.Println()
-
-	// RocksDB stores
-	logger.Printf("RocksDB Stores (%d databases):", len(dbMgr.Stores))
-	logger.Printf("  Load time:           %s", helpers.FormatDuration(dbLoadTime))
-	logger.Printf("  Shared cache:        %d MB", config.ReadBufferMB)
-	for _, store := range dbMgr.Stores {
-		logger.Printf("  - %s: ledgers %d - %d",
-			store.Name, store.MinLedger, store.MaxLedger)
+	if config.RecSplitMmapSizeMB > 0 {
+		logger.Printf("  Mmap size limit:     %d MB (placeholder - not yet implemented)", config.RecSplitMmapSizeMB)
 	}
 	logger.Println()
 
-	// Input file
+	// RocksDB stores summary
+	logger.Printf("RocksDB Stores (%d databases):", len(dbMgr.Stores))
+	logger.Printf("  Load time:           %s", helpers.FormatDuration(dbLoadTime))
+	logger.Printf("  Shared block cache:  %d MB", config.ReadBufferMB)
+	for _, store := range dbMgr.Stores {
+		logger.Printf("  - %s: ledgers %s - %s",
+			store.Name,
+			helpers.FormatNumber(int64(store.MinLedger)),
+			helpers.FormatNumber(int64(store.MaxLedger)))
+	}
+	logger.Println()
+
+	// Input file summary
 	logger.Printf("Input File:")
 	logger.Printf("  Path:                %s", config.InputFile)
 	logger.Printf("  Transaction count:   %s", helpers.FormatNumber(totalTxCount))
 	logger.Printf("  Count time:          %s", helpers.FormatDuration(countTime))
 	logger.Println()
 
-	// Configuration
+	// Configuration summary
 	logger.Printf("Configuration:")
 	logger.Printf("  Parallelism:         %d workers", config.Parallelism)
-	logger.Printf("  Worker batch size:   %d", WorkerBatchSize)
+	logger.Printf("  RecSplit batch:      %d files in parallel", config.RecSplitParallelBatch)
+	logger.Printf("  Worker batch size:   %d txs", WorkerBatchSize)
 	logger.Printf("  Network passphrase:  %s", config.NetworkPassphrase)
 	logger.Println()
 
@@ -1483,27 +1813,33 @@ func printInitSummary(
 // CONFIG AND MAIN
 // =============================================================================
 
+// Config holds all configuration options for the benchmark
 type Config struct {
-	InputFile         string
-	RecSplitFiles     []string
-	RocksDBPaths      []string
-	ErrorFile         string
-	LogFile           string
-	ReadBufferMB      int
-	Parallelism       int
-	NetworkPassphrase string
+	InputFile             string
+	RecSplitFiles         []string
+	RocksDBPaths          []string
+	ErrorFile             string
+	LogFile               string
+	ReadBufferMB          int
+	Parallelism           int
+	RecSplitParallelBatch int
+	RecSplitMmapSizeMB    int // Placeholder for future memory management
+	NetworkPassphrase     string
 }
 
+// parseFlags parses command-line flags and validates configuration
 func parseFlags() (*Config, error) {
 	var (
-		inputFile         string
-		recsplitFiles     string
-		rocksdbPaths      string
-		errorFile         string
-		logFile           string
-		readBufferMB      int
-		parallelism       int
-		networkPassphrase string
+		inputFile             string
+		recsplitFiles         string
+		rocksdbPaths          string
+		errorFile             string
+		logFile               string
+		readBufferMB          int
+		parallelism           int
+		recsplitParallelBatch int
+		recsplitMmapSizeMB    int
+		networkPassphrase     string
 	)
 
 	flag.StringVar(&inputFile, "input-file", "",
@@ -1520,6 +1856,10 @@ func parseFlags() (*Config, error) {
 		"Shared RocksDB block cache size in MB")
 	flag.IntVar(&parallelism, "parallelism", 16,
 		"Number of parallel worker goroutines")
+	flag.IntVar(&recsplitParallelBatch, "recsplit-parallel-batch", 4,
+		"Number of RecSplit files to search in parallel per transaction")
+	flag.IntVar(&recsplitMmapSizeMB, "recsplit-mmap-size-mb", 0,
+		"Placeholder for future RecSplit memory management (not yet implemented)")
 	flag.StringVar(&networkPassphrase, "network-passphrase", network.PublicNetworkPassphrase,
 		"Stellar network passphrase")
 
@@ -1544,12 +1884,15 @@ func parseFlags() (*Config, error) {
 	if readBufferMB < 1 {
 		return nil, fmt.Errorf("--read-buffer-mb must be at least 1")
 	}
+	if recsplitParallelBatch < 1 {
+		return nil, fmt.Errorf("--recsplit-parallel-batch must be at least 1")
+	}
 
-	// Parse file lists
+	// Parse file lists (comma-separated)
 	rsFiles := strings.Split(recsplitFiles, ",")
 	dbPaths := strings.Split(rocksdbPaths, ",")
 
-	// Trim whitespace
+	// Trim whitespace from paths
 	for i := range rsFiles {
 		rsFiles[i] = strings.TrimSpace(rsFiles[i])
 	}
@@ -1557,7 +1900,7 @@ func parseFlags() (*Config, error) {
 		dbPaths[i] = strings.TrimSpace(dbPaths[i])
 	}
 
-	// Validate files exist
+	// Validate all files exist before proceeding
 	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
 		return nil, fmt.Errorf("input file does not exist: %s", inputFile)
 	}
@@ -1573,24 +1916,27 @@ func parseFlags() (*Config, error) {
 	}
 
 	return &Config{
-		InputFile:         inputFile,
-		RecSplitFiles:     rsFiles,
-		RocksDBPaths:      dbPaths,
-		ErrorFile:         errorFile,
-		LogFile:           logFile,
-		ReadBufferMB:      readBufferMB,
-		Parallelism:       parallelism,
-		NetworkPassphrase: networkPassphrase,
+		InputFile:             inputFile,
+		RecSplitFiles:         rsFiles,
+		RocksDBPaths:          dbPaths,
+		ErrorFile:             errorFile,
+		LogFile:               logFile,
+		ReadBufferMB:          readBufferMB,
+		Parallelism:           parallelism,
+		RecSplitParallelBatch: recsplitParallelBatch,
+		RecSplitMmapSizeMB:    recsplitMmapSizeMB,
+		NetworkPassphrase:     networkPassphrase,
 	}, nil
 }
 
 func main() {
+	// Parse and validate configuration
 	config, err := parseFlags()
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
 	}
 
-	// Set up logger
+	// Set up logger (to file or stdout)
 	var logger *log.Logger
 	if config.LogFile != "" {
 		logFile, err := os.Create(config.LogFile)
@@ -1603,7 +1949,7 @@ func main() {
 		logger = log.New(os.Stdout, "", 0)
 	}
 
-	// Set up error file
+	// Set up error file (required)
 	errorFile, err := os.Create(config.ErrorFile)
 	if err != nil {
 		log.Fatalf("Failed to create error file: %v", err)
@@ -1612,7 +1958,7 @@ func main() {
 	errorWriter := bufio.NewWriter(errorFile)
 	defer errorWriter.Flush()
 
-	// Set up signal handling for graceful shutdown
+	// Set up signal handling for graceful shutdown (Ctrl+C)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1621,13 +1967,13 @@ func main() {
 
 	// Open RecSplit indexes
 	logger.Println("Opening RecSplit indexes...")
-	rsMgr, rsLoadTime, err := OpenRecSplitIndexes(config.RecSplitFiles)
+	rsMgr, rsLoadTime, err := OpenRecSplitIndexes(config.RecSplitFiles, config.RecSplitMmapSizeMB)
 	if err != nil {
 		log.Fatalf("Failed to open RecSplit indexes: %v", err)
 	}
 	defer rsMgr.Close()
 
-	// Open RocksDB stores
+	// Open RocksDB stores with shared block cache
 	logger.Println("Opening RocksDB stores...")
 	dbMgr, dbLoadTime, err := OpenRocksDBStores(config.RocksDBPaths, config.ReadBufferMB)
 	if err != nil {
@@ -1635,7 +1981,7 @@ func main() {
 	}
 	defer dbMgr.Close()
 
-	// Count input transactions
+	// Count input transactions for progress reporting
 	logger.Println("Counting input transactions...")
 	countStart := time.Now()
 	totalTxCount, err := CountInputTransactions(config.InputFile)
@@ -1651,30 +1997,32 @@ func main() {
 	// Print initialization summary
 	printInitSummary(logger, rsMgr, rsLoadTime, dbMgr, dbLoadTime, totalTxCount, countTime, config)
 
-	// Create benchmark context
+	// Create benchmark context with all shared resources
 	benchCtx := &BenchmarkContext{
-		RecSplitMgr:       rsMgr,
-		RocksDBMgr:        dbMgr,
-		NetworkPassphrase: config.NetworkPassphrase,
-		Parallelism:       config.Parallelism,
-		WorkChan:          make(chan []WorkItem, config.Parallelism*ChannelBufferMultiplier),
-		ResultChan:        make(chan BatchResult, config.Parallelism*ChannelBufferMultiplier),
-		Stats:             &GlobalStats{},
-		TotalTxCount:      totalTxCount,
-		Ctx:               ctx,
-		Cancel:            cancel,
-		Logger:            logger,
-		ErrorFile:         errorWriter,
+		RecSplitMgr:           rsMgr,
+		RocksDBMgr:            dbMgr,
+		NetworkPassphrase:     config.NetworkPassphrase,
+		Parallelism:           config.Parallelism,
+		RecSplitParallelBatch: config.RecSplitParallelBatch,
+		WorkChan:              make(chan []WorkItem, config.Parallelism*ChannelBufferMultiplier),
+		ResultChan:            make(chan BatchResult, config.Parallelism*ChannelBufferMultiplier),
+		Stats:                 &GlobalStats{},
+		TotalTxCount:          totalTxCount,
+		Ctx:                   ctx,
+		Cancel:                cancel,
+		Logger:                logger,
+		ErrorFile:             errorWriter,
 	}
 
-	// Start workers
-	logger.Printf("Starting %d workers...", config.Parallelism)
+	// Start worker goroutines
+	logger.Printf("Starting %d workers (each with up to %d parallel RecSplit lookups)...",
+		config.Parallelism, config.RecSplitParallelBatch)
 	for i := 0; i < config.Parallelism; i++ {
 		benchCtx.WG.Add(1)
 		go Worker(benchCtx, i)
 	}
 
-	// Start stats aggregator
+	// Start stats aggregator goroutine
 	benchCtx.ShutdownWG.Add(1)
 	go StatsAggregator(benchCtx)
 
@@ -1684,7 +2032,7 @@ func main() {
 	logger.Printf("Benchmark started at %s", benchCtx.StartTime.Format("2006-01-02 15:04:05"))
 	logger.Println()
 
-	// Handle signals in a separate goroutine
+	// Handle signals (Ctrl+C) in a separate goroutine
 	go func() {
 		select {
 		case <-sigChan:
@@ -1698,10 +2046,10 @@ func main() {
 	// Start producer (blocks until done or cancelled)
 	Producer(benchCtx, config.InputFile)
 
-	// Wait for workers to finish
+	// Wait for all workers to finish
 	benchCtx.WG.Wait()
 
-	// Close result channel to signal stats aggregator
+	// Close result channel to signal stats aggregator to finish
 	close(benchCtx.ResultChan)
 
 	// Wait for stats aggregator to finish
