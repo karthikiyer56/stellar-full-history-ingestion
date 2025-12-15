@@ -1,7 +1,7 @@
 package main
 
 // =============================================================================
-// benchmark.go - Stellar Transaction Hash Lookup Benchmark Tool
+// Stellar Transaction Hash Lookup Benchmark Tool
 // =============================================================================
 //
 // PURPOSE:
@@ -32,12 +32,38 @@ package main
 //   - Repeat until success or all files exhausted
 //
 // FALSE POSITIVE HANDLING:
-//   RecSplit is a Minimal Perfect Hash Function that can return false positives.
+//   RecSplit's Perfect Hash Function can return false positives.
 //   This tool handles multiple scenarios:
 //   - FALSE_POSITIVE_NORMAL: Single RecSplit returns wrong ledger
 //   - FALSE_POSITIVE_COMPOUND: Multiple RecSplits return wrong ledgers (all false)
 //   - FALSE_POSITIVE_PARTIAL: Found in one, false positive in others (counts as success)
 //
+//		Explanation with examples:
+//			Premise:
+//				I have 10 recsplit index files
+//				and correspondingly 10 rocksdb compressed lcm stores - one for each year since 2016.
+//				I am searching for txHash - abc123
+//
+//			FALSE_POSITIVE_NORMAL:
+//				I found abc123 in "exactly one recsplit file out of 10", and it returned ledger 555
+//				I parsed all transactions in 555 and concluded that abc123 doesnt exist irl.
+//				I call this a single(normal) false positive.
+//
+//			FALSE_POSITIVE_COMPOUND:
+//				I found abc123 in "3 out of 10 recsplit files". they returned, 555, 666, 777 respectively
+//				I parsed all transactions in each of the 3 ledgers, and concluded that abc123 doesnt exist irl
+//				I call this a rather expensive(compound) false positive
+//
+//			FALSE_POSITIVE_PARTIAL:
+//				I found abc123 in "3 out of 10 recsplit files". they returned, 555, 666, 777 respectively.
+//				I parsed all transactions in 555, 666 and concluded that abc123 doesnt exist in them.
+//				However, abc123 does exist in 777. This qualifies as a succesful qgit addqqqqlookup, as in, txHash exists irl
+//				I MUST CHECK all ledgers that are returned by the recsplit lookups.
+//				If I fail at the first false positive, I might never find the txHash if it really does exist in some other index
+//				Even though, this is a successful lookup, I am logging this in the error case as well, to gather logs to see how many of such things show up.
+//				Couldnt come up with an appropriate name. Hence the _PARTIAL suffix.
+//
+
 // TIMING CALCULATION FOR PARALLEL BATCHES:
 //   When searching RecSplit files in parallel batches:
 //   - Each batch's time = average of individual lookup times in that batch
