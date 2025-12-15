@@ -1129,8 +1129,12 @@ func searchRecSplitBatch(indexes []*RecSplitIndex, txHashBytes []byte, startIdx 
 		go func(i int, idx *RecSplitIndex) {
 			defer wg.Done()
 
+			// Create a NEW IndexReader for this goroutine (thread-safe)
+			reader := recsplit.NewIndexReader(idx.Index)
+			defer reader.Close()
+
 			start := time.Now()
-			ledgerSeqU64, found := idx.Reader.Lookup(txHashBytes)
+			ledgerSeqU64, found := reader.Lookup(txHashBytes)
 			duration := time.Since(start)
 
 			results[i] = RecSplitLookupResult{
