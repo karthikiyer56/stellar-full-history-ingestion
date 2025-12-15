@@ -48,20 +48,28 @@ package main
 //				I found abc123 in "exactly one recsplit file out of 10", and it returned ledger 555
 //				I parsed all transactions in 555 and concluded that abc123 doesnt exist irl.
 //				I call this a single(normal) false positive.
+//				This will accrue almost the same timing as a "successfully found" lookup, since you end up doing - rockdb lookup + uncompress + parse etc.
 //
 //			FALSE_POSITIVE_COMPOUND:
-//				I found abc123 in "3 out of 10 recsplit files". they returned, 555, 666, 777 respectively
-//				I parsed all transactions in each of the 3 ledgers, and concluded that abc123 doesnt exist irl
+//				I found abc123 in "2 out of 10 recsplit files". they returned - 555, 666 respectively
+//				I parsed all transactions in each of the 2 ledgers, and concluded that abc123 doesnt exist irl
 //				I call this a rather expensive(compound) false positive
+//				This will take atleast 2x the time as a "successfully found lookup",
+//				assuming that you find the same tx in 2 stores on average when this particular flavor of error arises.
+//				If you are out of luck, it could also appear in 3 or 4 ledgers :shrug:
 //
 //			FALSE_POSITIVE_PARTIAL:
-//				I found abc123 in "3 out of 10 recsplit files". they returned, 555, 666, 777 respectively.
-//				I parsed all transactions in 555, 666 and concluded that abc123 doesnt exist in them.
-//				However, abc123 does exist in 777. This qualifies as a succesful qgit addqqqqlookup, as in, txHash exists irl
-//				I MUST CHECK all ledgers that are returned by the recsplit lookups.
+//				I found abc123 in "2 out of 10 recsplit files". they returned - 555, 666 respectively.
+//				I parsed all transactions in 555 and concluded that abc123 doesnt exist in it.
+//				However, abc123 does exist in 666. So, overall, this qualifies as a successful lookup. As in, txHash exists irl
+//				To deduce that it is truly successful though, I MUST CHECK all ledgers that are returned by the recsplit lookups.
 //				If I fail at the first false positive, I might never find the txHash if it really does exist in some other index
 //				Even though, this is a successful lookup, I am logging this in the error case as well, to gather logs to see how many of such things show up.
 //				Couldnt come up with an appropriate name. Hence the _PARTIAL suffix.
+//				This will take atleast 2x the time as a "successfully found lookup",
+//				assuming that you find the same tx in 2 stores on average when this particular flavor arises - one for truly successful tx and one for false positive
+//				If you are out of luck, it could also appear in 3 or 4 ledgers :shrug:
+
 //
 
 // TIMING CALCULATION FOR PARALLEL BATCHES:
