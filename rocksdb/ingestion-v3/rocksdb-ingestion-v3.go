@@ -274,7 +274,15 @@ func main() {
 	log.Printf("")
 
 	compactionStart := time.Now()
-	outputDB.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+
+	// Create CompactRangeOptions with KForce to ensure all data is compacted
+	// even if it's already in the bottommost level
+	compactOpts := grocksdb.NewCompactRangeOptions()
+	defer compactOpts.Destroy()
+	compactOpts.SetBottommostLevelCompaction(grocksdb.KForce)
+	compactOpts.SetExclusiveManualCompaction(true)
+
+	outputDB.CompactRangeOpt(grocksdb.Range{Start: nil, Limit: nil}, compactOpts)
 	compactionDuration := time.Since(compactionStart)
 
 	log.Printf("✓ Compaction completed in %s", helpers.FormatDuration(compactionDuration))
@@ -486,7 +494,16 @@ func runCompactOnly(config *Config) {
 	log.Printf("")
 
 	compactionStart := time.Now()
-	db.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+
+	// Create CompactRangeOptions with KForce to force bottommost level compaction
+	// This is critical - without KForce, RocksDB may skip recompacting files that
+	// are already in the bottommost level, even if they don't match the target size
+	compactOpts := grocksdb.NewCompactRangeOptions()
+	defer compactOpts.Destroy()
+	compactOpts.SetBottommostLevelCompaction(grocksdb.KForce)
+	compactOpts.SetExclusiveManualCompaction(true)
+
+	db.CompactRangeOpt(grocksdb.Range{Start: nil, Limit: nil}, compactOpts)
 	compactionDuration := time.Since(compactionStart)
 
 	log.Printf("✓ Compaction completed in %s", helpers.FormatDuration(compactionDuration))
