@@ -47,6 +47,9 @@ const (
 
 	// Default batch size
 	DefaultBatchSize = 10000
+
+	// Default target file size for compact-only mode
+	DefaultTargetFileSizeMB = 4096
 )
 
 // =============================================================================
@@ -59,8 +62,14 @@ type Config struct {
 	OutputPath string
 
 	// Mode
-	IsBackfill  bool
-	IsStreaming bool
+	IsBackfill    bool
+	IsStreaming   bool
+	IsCompactOnly bool
+
+	// Compact-only settings
+	CompactTargetFileSizeMB       int
+	CompactMaxBytesForLevelBaseMB int
+	CompactMaxBackgroundJobs      int
 
 	// Batch size
 	BatchSize int
@@ -168,6 +177,12 @@ func main() {
 	// Validate configuration
 	if err := validateConfig(config); err != nil {
 		log.Fatalf("ERROR: %v", err)
+	}
+
+	// Handle compact-only mode
+	if config.IsCompactOnly {
+		runCompactOnly(config)
+		return
 	}
 
 	// Print configuration summary
@@ -285,22 +300,51 @@ func main() {
 
 func parseArgs() (*Config, error) {
 	var (
-		inputPath  string
-		outputPath string
-		backfill   bool
-		streaming  bool
-		batchSize  int
+		inputPath        string
+		outputPath       string
+		backfill         bool
+		streaming        bool
+		compactOnly      bool
+		batchSize        int
+		targetFileSizeMB int
+		levelBaseMB      int
+		backgroundJobs   int
 	)
 
-	flag.StringVar(&inputPath, "input", "", "Path to input RocksDB store (required)")
-	flag.StringVar(&outputPath, "output", "", "Path to output RocksDB store (required)")
+	flag.StringVar(&inputPath, "input", "", "Path to input RocksDB store (required for copy modes)")
+	flag.StringVar(&outputPath, "output", "", "Path to output RocksDB store (required for copy modes, or path to compact for --compact-only)")
 	flag.BoolVar(&backfill, "backfill", false, "Use backfill mode (high throughput, compaction at end)")
 	flag.BoolVar(&streaming, "streaming", false, "Use streaming mode (low memory, continuous compaction)")
-	flag.IntVar(&batchSize, "batch-size", DefaultBatchSize, "Number of keys per batch")
+	flag.BoolVar(&compactOnly, "compact-only", false, "Only compact an existing store (use with --output to specify store path)")
+	flag.IntVar(&batchSize, "batch-size", DefaultBatchSize, "Number of keys per batch (copy modes only)")
+	flag.IntVar(&targetFileSizeMB, "target-file-size-mb", DefaultTargetFileSizeMB, "Target SST file size in MB (used in --compact-only mode)")
+	flag.IntVar(&levelBaseMB, "max-bytes-for-level-base-mb", 40960, "Max bytes for L1 in MB (used in --compact-only mode)")
+	flag.IntVar(&backgroundJobs, "max-background-jobs", 8, "Max background compaction jobs (used in --compact-only mode)")
 
 	flag.Parse()
 
-	// Validate required args
+	// Handle compact-only mode
+	if compactOnly {
+		if outputPath == "" {
+			return nil, fmt.Errorf("--output is required for --compact-only mode (path to store to compact)")
+		}
+		if backfill || streaming {
+			return nil, fmt.Errorf("--compact-only cannot be combined with --backfill or --streaming")
+		}
+		if inputPath != "" {
+			return nil, fmt.Errorf("--input is not used in --compact-only mode")
+		}
+
+		return &Config{
+			OutputPath:                    outputPath,
+			IsCompactOnly:                 true,
+			CompactTargetFileSizeMB:       targetFileSizeMB,
+			CompactMaxBytesForLevelBaseMB: levelBaseMB,
+			CompactMaxBackgroundJobs:      backgroundJobs,
+		}, nil
+	}
+
+	// Validate required args for copy modes
 	if inputPath == "" {
 		return nil, fmt.Errorf("--input is required")
 	}
@@ -310,7 +354,7 @@ func parseArgs() (*Config, error) {
 
 	// Validate mode selection
 	if !backfill && !streaming {
-		return nil, fmt.Errorf("either --backfill or --streaming must be specified")
+		return nil, fmt.Errorf("either --backfill, --streaming, or --compact-only must be specified")
 	}
 	if backfill && streaming {
 		return nil, fmt.Errorf("cannot specify both --backfill and --streaming")
@@ -343,6 +387,28 @@ func parseArgs() (*Config, error) {
 // =============================================================================
 
 func validateConfig(config *Config) error {
+	// Compact-only mode validation
+	if config.IsCompactOnly {
+		// Check path exists
+		if _, err := os.Stat(config.OutputPath); os.IsNotExist(err) {
+			return fmt.Errorf("store path does not exist: %s", config.OutputPath)
+		}
+
+		// Check if it's a valid RocksDB store
+		currentFile := filepath.Join(config.OutputPath, "CURRENT")
+		if _, err := os.Stat(currentFile); os.IsNotExist(err) {
+			return fmt.Errorf("path is not a valid RocksDB store (no CURRENT file): %s", config.OutputPath)
+		}
+
+		// Validate target file size
+		if config.CompactTargetFileSizeMB <= 0 {
+			return fmt.Errorf("target-file-size-mb must be positive")
+		}
+
+		return nil
+	}
+
+	// Copy mode validation
 	// Check input path exists
 	if _, err := os.Stat(config.InputPath); os.IsNotExist(err) {
 		return fmt.Errorf("input path does not exist: %s", config.InputPath)
@@ -365,6 +431,183 @@ func validateConfig(config *Config) error {
 	}
 
 	return nil
+}
+
+// =============================================================================
+// Compact-Only Mode
+// =============================================================================
+
+func runCompactOnly(config *Config) {
+	log.Printf("")
+	log.Printf("================================================================================")
+	log.Printf("                     ROCKSDB COMPACT-ONLY MODE")
+	log.Printf("================================================================================")
+	log.Printf("")
+	log.Printf("STORE PATH:            %s", config.OutputPath)
+	log.Printf("")
+	log.Printf("COMPACTION SETTINGS:")
+	log.Printf("  target_file_size_mb:          %d MB", config.CompactTargetFileSizeMB)
+	log.Printf("  max_bytes_for_level_base_mb:  %d MB", config.CompactMaxBytesForLevelBaseMB)
+	log.Printf("  max_background_jobs:          %d", config.CompactMaxBackgroundJobs)
+	log.Printf("")
+	log.Printf("================================================================================")
+	log.Printf("")
+
+	// Open the store with new compaction settings
+	log.Printf("Opening store with new compaction settings...")
+	db, opts, err := openStoreForCompaction(config)
+	if err != nil {
+		log.Fatalf("ERROR: Failed to open store: %v", err)
+	}
+	defer db.Close()
+	defer opts.Destroy()
+	log.Printf("✓ Store opened successfully")
+	log.Printf("")
+
+	// Show pre-compaction stats
+	log.Printf("================================================================================")
+	log.Printf("                       PRE-COMPACTION STATISTICS")
+	log.Printf("================================================================================")
+	log.Printf("")
+	printStoreStats(db, "Store (before compaction)")
+	printCompactionStatus(db)
+
+	// Count files before
+	fileCountBefore := countSSTFiles(config.OutputPath)
+	sizeBefore := getRocksDBSSTSize(db)
+
+	// Perform compaction
+	log.Printf("")
+	log.Printf("================================================================================")
+	log.Printf("                         PERFORMING COMPACTION")
+	log.Printf("================================================================================")
+	log.Printf("")
+	log.Printf("Compacting with target_file_size = %d MB...", config.CompactTargetFileSizeMB)
+	log.Printf("")
+
+	compactionStart := time.Now()
+	db.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+	compactionDuration := time.Since(compactionStart)
+
+	log.Printf("✓ Compaction completed in %s", helpers.FormatDuration(compactionDuration))
+	log.Printf("")
+
+	// Wait for any background operations to finish
+	waitForBackgroundOperations(db)
+
+	// Show post-compaction stats
+	log.Printf("================================================================================")
+	log.Printf("                       POST-COMPACTION STATISTICS")
+	log.Printf("================================================================================")
+	log.Printf("")
+	printStoreStats(db, "Store (after compaction)")
+
+	// Count files after
+	fileCountAfter := countSSTFiles(config.OutputPath)
+	sizeAfter := getRocksDBSSTSize(db)
+
+	// Print summary
+	log.Printf("")
+	log.Printf("################################################################################")
+	log.Printf("                              COMPACTION SUMMARY")
+	log.Printf("################################################################################")
+	log.Printf("")
+	log.Printf("  Compaction time:         %s", helpers.FormatDuration(compactionDuration))
+	log.Printf("")
+	log.Printf("  SST files before:        %d", fileCountBefore)
+	log.Printf("  SST files after:         %d", fileCountAfter)
+	log.Printf("  Files reduced by:        %d (%.1f%%)",
+		fileCountBefore-fileCountAfter,
+		float64(fileCountBefore-fileCountAfter)/float64(fileCountBefore)*100)
+	log.Printf("")
+	log.Printf("  Store size before:       %s", helpers.FormatBytes(sizeBefore))
+	log.Printf("  Store size after:        %s", helpers.FormatBytes(sizeAfter))
+	log.Printf("  Size change:             %s (%.2f%%)",
+		helpers.FormatBytes(sizeAfter-sizeBefore),
+		float64(sizeAfter-sizeBefore)/float64(sizeBefore)*100)
+	log.Printf("")
+	log.Printf("  Target file size:        %d MB", config.CompactTargetFileSizeMB)
+	if fileCountAfter > 0 {
+		avgFileSize := sizeAfter / int64(fileCountAfter)
+		log.Printf("  Average file size:       %s", helpers.FormatBytes(avgFileSize))
+	}
+	log.Printf("")
+	log.Printf("################################################################################")
+	log.Printf("")
+	log.Printf("✅ Compaction completed successfully!")
+}
+
+func openStoreForCompaction(config *Config) (*grocksdb.DB, *grocksdb.Options, error) {
+	opts := grocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(false)
+
+	// Set the new compaction settings
+	opts.SetTargetFileSizeBase(uint64(config.CompactTargetFileSizeMB * MB))
+	opts.SetTargetFileSizeMultiplier(1)
+	opts.SetMaxBytesForLevelBase(uint64(config.CompactMaxBytesForLevelBaseMB * MB))
+	opts.SetMaxBytesForLevelMultiplier(10)
+	opts.SetMaxBackgroundJobs(config.CompactMaxBackgroundJobs)
+	opts.SetLevelCompactionDynamicLevelBytes(false)
+
+	// Disable auto-compaction (we'll trigger manually)
+	opts.SetDisableAutoCompactions(true)
+
+	// Use level compaction
+	opts.SetCompactionStyle(grocksdb.LevelCompactionStyle)
+
+	// No compression (data is already compressed)
+	opts.SetCompression(grocksdb.NoCompression)
+
+	// File resources
+	opts.SetMaxOpenFiles(10000)
+
+	// Logging
+	opts.SetInfoLogLevel(grocksdb.WarnInfoLogLevel)
+
+	db, err := grocksdb.OpenDb(opts, config.OutputPath)
+	if err != nil {
+		opts.Destroy()
+		return nil, nil, fmt.Errorf("failed to open RocksDB: %w", err)
+	}
+
+	return db, opts, nil
+}
+
+func countSSTFiles(path string) int {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".sst") {
+			count++
+		}
+	}
+	return count
+}
+
+func waitForBackgroundOperations(db *grocksdb.DB) {
+	// Poll until no background operations are running
+	maxWait := 60 * time.Second
+	pollInterval := 500 * time.Millisecond
+	waited := time.Duration(0)
+
+	for waited < maxWait {
+		runningCompactions := db.GetProperty("rocksdb.num-running-compactions")
+		runningFlushes := db.GetProperty("rocksdb.num-running-flushes")
+		pendingCompaction := db.GetProperty("rocksdb.compaction-pending")
+
+		if runningCompactions == "0" && runningFlushes == "0" && pendingCompaction == "0" {
+			return
+		}
+
+		time.Sleep(pollInterval)
+		waited += pollInterval
+	}
+
+	log.Printf("⚠️  Warning: Background operations still running after %s", helpers.FormatDuration(maxWait))
 }
 
 // =============================================================================
