@@ -31,9 +31,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/linxGnu/grocksdb"
 	"github.com/pkg/errors"
-	"github.com/stellar/go/ingest"
-	"github.com/stellar/go/network"
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/ingest"
+	"github.com/stellar/go-stellar-sdk/network"
+	"github.com/stellar/go-stellar-sdk/xdr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

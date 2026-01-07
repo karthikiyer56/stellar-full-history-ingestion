@@ -281,10 +281,8 @@ github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/spaolacci/murmur3 v1.1.0 h1:7c1g84S4BPRrfL5Xrdp6fOJ206sU9y293DDHaoy0bLI=
 github.com/spaolacci/murmur3 v1.1.0/go.mod h1:JwIasOWyU6f++ZhiEuf87xNszmSA2myDM2Kzu9HwQUA=
-github.com/stellar/go v0.0.0-20251104133942-0bd7280d08e8 h1:44lILQyRZ2atQ8czkNMgLfAXDZqc0nwZ5QReuMrbyuc=
-github.com/stellar/go v0.0.0-20251104133942-0bd7280d08e8/go.mod h1:WPmvC2UlESKdl1W/+FJi4Vm9+iF/X9QFUPW9k3v90eY=
-github.com/stellar/go-xdr v0.0.0-20231122183749-b53fb00bcac2 h1:OzCVd0SV5qE3ZcDeSFCmOWLZfEWZ3Oe8KtmSOYKEVWE=
-github.com/stellar/go-xdr v0.0.0-20231122183749-b53fb00bcac2/go.mod h1:yoxyU/M8nl9LKeWIoBrbDPQ7Cy+4jxRcWcOayZ4BMps=
+github.com/stellar/go-xdr v0.0.0-20260107152832-fd2fce26d128 h1:JFpRPZ9JJP/tJaYVYsZ7idJ5gvF1unCyTxEDyzH7baQ=
+github.com/stellar/go-xdr v0.0.0-20260107152832-fd2fce26d128/go.mod h1:ZSIhPj0Ya41YoY0K4msNqwEQyJW/kCzjNAcZJH+uQO0=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
 github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=

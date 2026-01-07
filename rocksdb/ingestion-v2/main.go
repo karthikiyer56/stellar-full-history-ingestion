@@ -36,8 +36,8 @@ import (
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/pkg/errors"
-	"github.com/stellar/go/ingest/ledgerbackend"
-	"github.com/stellar/go/support/datastore"
+	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
+	"github.com/stellar/go-stellar-sdk/support/datastore"
 )
 
 func main() {

@@ -60,9 +60,9 @@ import (
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/klauspost/compress/zstd"
 	"github.com/linxGnu/grocksdb"
-	"github.com/stellar/go/ingest"
-	"github.com/stellar/go/network"
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/ingest"
+	"github.com/stellar/go-stellar-sdk/network"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // =============================================================================

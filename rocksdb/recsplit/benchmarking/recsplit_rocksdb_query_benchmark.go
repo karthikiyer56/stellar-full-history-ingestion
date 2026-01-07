@@ -117,9 +117,10 @@ import (
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/klauspost/compress/zstd"
 	"github.com/linxGnu/grocksdb"
-	"github.com/stellar/go/ingest"
-	"github.com/stellar/go/network"
-	"github.com/stellar/go/xdr"
+	"github.com/stellar/go-stellar-sdk/ingest"
+	"github.com/stellar/go-stellar-sdk/network"
+	"github.com/stellar/go-stellar-sdk/xdr"
+	xdr3 "github.com/stellar/go-xdr/xdr3"
 )
 
 // =============================================================================
@@ -857,20 +858,13 @@ func isValidHex(s string) bool {
 // WORKER FUNCTION
 // =============================================================================
 
-// Worker processes batches of transaction hashes
+// Work processes batches of transaction hashes
 // Each worker has its own zstd decoder to avoid contention
 // Workers pull batches from WorkChan, process them, and send results to ResultChan
-func Worker(ctx *BenchmarkContext, workerID int) {
+func (worker Worker) Work(ctx *BenchmarkContext) {
 	defer ctx.WG.Done()
 
-	// Create dedicated zstd decoder for this worker
-	// This avoids contention on a shared decoder
-	zstdDecoder, err := zstd.NewReader(nil)
-	if err != nil {
-		ctx.Logger.Printf("Worker %d: Failed to create zstd decoder: %v", workerID, err)
-		return
-	}
-	defer zstdDecoder.Close()
+	defer worker.ZstdDecoder.Close()
 
 	for {
 		select {
@@ -884,7 +878,7 @@ func Worker(ctx *BenchmarkContext, workerID int) {
 			}
 
 			// Process the batch and send results
-			result := processBatch(ctx, zstdDecoder, batch)
+			result := worker.processBatch(ctx, batch)
 
 			select {
 			case ctx.ResultChan <- result:
@@ -896,7 +890,7 @@ func Worker(ctx *BenchmarkContext, workerID int) {
 }
 
 // processBatch processes a batch of transaction hashes and returns results
-func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []WorkItem) BatchResult {
+func (worker Worker) processBatch(ctx *BenchmarkContext, batch []WorkItem) BatchResult {
 	result := BatchResult{
 		Errors: make([]*BenchmarkError, 0),
 	}
@@ -908,7 +902,7 @@ func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []Work
 			continue
 		}
 
-		timing, benchErr := processTransaction(ctx, zstdDecoder, item.TxHashHex)
+		timing, benchErr := worker.processTransaction(ctx, item.TxHashHex)
 
 		// Update stats based on result type
 		if benchErr == nil {
@@ -960,7 +954,7 @@ func processBatch(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, batch []Work
 //   - RecSplit time = average of batch averages
 //     (each batch average = sum of lookup times in batch / batch size)
 //   - Other timings are summed across all ledger lookups attempted
-func processTransaction(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHashHex string) (QueryTiming, *BenchmarkError) {
+func (worker Worker) processTransaction(ctx *BenchmarkContext, txHashHex string) (QueryTiming, *BenchmarkError) {
 	timing := QueryTiming{}
 	totalStart := time.Now()
 
@@ -1019,7 +1013,7 @@ func processTransaction(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHash
 
 		for _, match := range matches {
 			// Try to find the transaction in this ledger
-			ledgerResult := lookupLedger(ctx, zstdDecoder, txHashHex, match.LedgerSeq)
+			ledgerResult := worker.lookupLedger(ctx, txHashHex, match.LedgerSeq)
 
 			// Accumulate timing regardless of result
 			totalRocksDBTime += ledgerResult.RocksDBTime
@@ -1214,7 +1208,7 @@ func calculateOverallRecSplitTime(batchAvgs []time.Duration) time.Duration {
 
 // lookupLedger looks up a ledger in RocksDB, decompresses it, and searches for the transaction
 // Returns detailed timing and result information
-func lookupLedger(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHashHex string, ledgerSeq uint32) LedgerLookupResult {
+func (worker Worker) lookupLedger(ctx *BenchmarkContext, txHashHex string, ledgerSeq uint32) LedgerLookupResult {
 	result := LedgerLookupResult{}
 
 	// Find the RocksDB store(s) for this ledger
@@ -1266,7 +1260,7 @@ func lookupLedger(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHashHex st
 
 	// Decompress
 	t2 := time.Now()
-	uncompressedLCM, err := zstdDecoder.DecodeAll(compressedLCM, nil)
+	uncompressedLCM, err := worker.ZstdDecoder.DecodeAll(compressedLCM, nil)
 	result.DecompTime = time.Since(t2)
 
 	if err != nil {
@@ -1276,8 +1270,11 @@ func lookupLedger(ctx *BenchmarkContext, zstdDecoder *zstd.Decoder, txHashHex st
 
 	// Unmarshal XDR
 	t3 := time.Now()
-	var lcm xdr.LedgerCloseMeta
-	err = lcm.UnmarshalBinary(uncompressedLCM)
+	decoder := worker.XdrDecoder
+	lcm := worker.reusableLcm
+	decoder.Reset(uncompressedLCM)
+	_, err = lcm.DecodeFrom(decoder, decoder.MaxDepth())
+
 	result.UnmarshalTime = time.Since(t3)
 
 	if err != nil {
@@ -1963,6 +1960,13 @@ func parseFlags() (*Config, error) {
 	}, nil
 }
 
+type Worker struct {
+	Id          int
+	ZstdDecoder *zstd.Decoder
+	XdrDecoder  *xdr3.Decoder
+	reusableLcm xdr.LedgerCloseMeta
+}
+
 func main() {
 	// Parse and validate configuration
 	config, err := parseFlags()
@@ -2052,8 +2056,22 @@ func main() {
 	logger.Printf("Starting %d workers (each with up to %d parallel RecSplit lookups)...",
 		config.Parallelism, config.RecSplitParallelBatch)
 	for i := 0; i < config.Parallelism; i++ {
+
+		// Create dedicated zstd decoder for this worker
+		// This avoids contention on a shared decoder
+		zstdDecoder, err := zstd.NewReader(nil)
+		if err != nil {
+			benchCtx.Logger.Printf("Worker %d: Failed to create zstd decoder: %v", i, err)
+			return
+		}
+		worker := Worker{
+			Id:          i,
+			reusableLcm: xdr.LedgerCloseMeta{},
+			ZstdDecoder: zstdDecoder,
+			XdrDecoder:  xdr3.NewDecoder([]byte{}),
+		}
 		benchCtx.WG.Add(1)
-		go Worker(benchCtx, i)
+		go worker.Work(benchCtx)
 	}
 
 	// Start stats aggregator goroutine
