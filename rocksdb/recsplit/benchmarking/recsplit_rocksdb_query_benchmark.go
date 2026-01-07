@@ -1270,17 +1270,22 @@ func (worker Worker) lookupLedger(ctx *BenchmarkContext, txHashHex string, ledge
 
 	// Unmarshal XDR
 	t3 := time.Now()
-	decoder := worker.XdrDecoder
-	lcm := worker.reusableLcm
-	decoder.Reset(uncompressedLCM)
-	_, err = lcm.DecodeFrom(decoder, decoder.MaxDepth())
+	/*
+		decoder := worker.XdrDecoder
+		lcm := worker.reusableLcm
+		decoder.Reset(uncompressedLCM)
+		_, err = lcm.DecodeFrom(decoder, decoder.MaxDepth())
+	*/
 
-	result.UnmarshalTime = time.Since(t3)
-
+	lcm := worker.XdrDecoderPool.Get()
+	defer worker.XdrDecoderPool.Put(lcm)
+	err = xdr.SafeUnmarshal(uncompressedLCM, lcm)
 	if err != nil {
-		result.Error = fmt.Errorf("XDR unmarshal error for ledger %d: %w", ledgerSeq, err)
+		result.Error = fmt.Errorf("xdr decompress error for ledger %d: %w", ledgerSeq, err)
 		return result
 	}
+
+	result.UnmarshalTime = time.Since(t3)
 
 	// Set ledger info now that we have ClosedAt from the LedgerCloseMeta
 	result.LedgerInfo = LedgerInfo{
@@ -1290,7 +1295,7 @@ func (worker Worker) lookupLedger(ctx *BenchmarkContext, txHashHex string, ledge
 
 	// Create transaction reader
 	t4 := time.Now()
-	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(ctx.NetworkPassphrase, lcm)
+	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(ctx.NetworkPassphrase, *lcm)
 	result.TxReaderTime = time.Since(t4)
 
 	if err != nil {
@@ -1961,10 +1966,11 @@ func parseFlags() (*Config, error) {
 }
 
 type Worker struct {
-	Id          int
-	ZstdDecoder *zstd.Decoder
-	XdrDecoder  *xdr3.Decoder
-	reusableLcm xdr.LedgerCloseMeta
+	Id             int
+	ZstdDecoder    *zstd.Decoder
+	XdrDecoder     *xdr3.Decoder
+	reusableLcm    xdr.LedgerCloseMeta
+	XdrDecoderPool *xdr.Pool[xdr.LedgerCloseMeta]
 }
 
 func main() {
@@ -2065,10 +2071,11 @@ func main() {
 			return
 		}
 		worker := Worker{
-			Id:          i,
-			reusableLcm: xdr.LedgerCloseMeta{},
-			ZstdDecoder: zstdDecoder,
-			XdrDecoder:  xdr3.NewDecoder([]byte{}),
+			Id:             i,
+			reusableLcm:    xdr.LedgerCloseMeta{},
+			ZstdDecoder:    zstdDecoder,
+			XdrDecoder:     xdr3.NewDecoder([]byte{}),
+			XdrDecoderPool: xdr.NewPool[xdr.LedgerCloseMeta](),
 		}
 		benchCtx.WG.Add(1)
 		go worker.Work(benchCtx)
