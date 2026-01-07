@@ -12,7 +12,7 @@ require (
 	github.com/linxGnu/grocksdb v1.10.3
 	github.com/pkg/errors v0.9.1
 	github.com/stellar/go-stellar-sdk v0.1.0
-	github.com/stellar/go-xdr v0.0.0-20260107152832-fd2fce26d128
+	github.com/stellar/go-xdr v0.0.0-20260106211653-82e681bfd3f3
 	golang.org/x/sys v0.38.0
 	google.golang.org/protobuf v1.36.10
 )
