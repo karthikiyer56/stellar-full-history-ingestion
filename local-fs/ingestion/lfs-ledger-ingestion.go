@@ -918,39 +918,104 @@ func runGetLedger(dataDir string, ledgerSeq uint32, iterations int, noOutput boo
 	log.Printf("No Output:         %v", noOutput)
 	log.Printf("")
 
+	// Track total timing
 	var totalDuration time.Duration
-	var minDuration time.Duration = time.Hour // Start with a large value
+	var minDuration time.Duration = time.Hour
 	var maxDuration time.Duration
+
+	// Track granular timing
+	var totalIndexLookupTime time.Duration
+	var totalDataReadTime time.Duration
+	var totalDecompressTime time.Duration
+	var totalUnmarshalTime time.Duration
+
+	var minIndexLookupTime time.Duration = time.Hour
+	var maxIndexLookupTime time.Duration
+	var minDataReadTime time.Duration = time.Hour
+	var maxDataReadTime time.Duration
+	var minDecompressTime time.Duration = time.Hour
+	var maxDecompressTime time.Duration
+	var minUnmarshalTime time.Duration = time.Hour
+	var maxUnmarshalTime time.Duration
+
+	var minFetchTime time.Duration = time.Hour
+	var maxFetchTime time.Duration
+	var totalFetchTime time.Duration
+
 	var lcmBytes []byte
-	durations := make([]time.Duration, 0, iterations)
 
 	for i := 0; i < iterations; i++ {
-		start := time.Now()
-		lcm, err := ReadLedger(absDataDir, ledgerSeq)
-		elapsed := time.Since(start)
-
-		durations = append(durations, elapsed)
-		totalDuration += elapsed
-
-		if elapsed < minDuration {
-			minDuration = elapsed
+		// Create a fresh iterator for each iteration to measure full lookup
+		iterator, err := NewLedgerIterator(absDataDir, ledgerSeq, ledgerSeq)
+		if err != nil {
+			return fmt.Errorf("failed to create iterator: %w", err)
 		}
-		if elapsed > maxDuration {
-			maxDuration = elapsed
-		}
+
+		lcm, _, timing, ok, err := iterator.Next()
+		iterator.Close()
 
 		if err != nil {
 			return fmt.Errorf("failed to read ledger %d: %w", ledgerSeq, err)
 		}
+		if !ok {
+			return fmt.Errorf("ledger %d not found", ledgerSeq)
+		}
 
-		// Only marshal on the last iteration (for output)
-		if i == iterations-1 && !noOutput {
-			lcmBytes, err = lcm.MarshalBinary()
-			if err != nil {
-				return fmt.Errorf("failed to marshal ledger %d: %w", ledgerSeq, err)
-			}
-		} else if i == iterations-1 {
-			// Still get size for stats
+		// Track total timing
+		totalDuration += timing.TotalTime
+		if timing.TotalTime < minDuration {
+			minDuration = timing.TotalTime
+		}
+		if timing.TotalTime > maxDuration {
+			maxDuration = timing.TotalTime
+		}
+
+		// Track granular timing
+		totalIndexLookupTime += timing.IndexLookupTime
+		totalDataReadTime += timing.DataReadTime
+		totalDecompressTime += timing.DecompressTime
+		totalUnmarshalTime += timing.UnmarshalTime
+
+		fetchTime := timing.IndexLookupTime + timing.DataReadTime
+		totalFetchTime += fetchTime
+
+		if timing.IndexLookupTime < minIndexLookupTime {
+			minIndexLookupTime = timing.IndexLookupTime
+		}
+		if timing.IndexLookupTime > maxIndexLookupTime {
+			maxIndexLookupTime = timing.IndexLookupTime
+		}
+
+		if timing.DataReadTime < minDataReadTime {
+			minDataReadTime = timing.DataReadTime
+		}
+		if timing.DataReadTime > maxDataReadTime {
+			maxDataReadTime = timing.DataReadTime
+		}
+
+		if timing.DecompressTime < minDecompressTime {
+			minDecompressTime = timing.DecompressTime
+		}
+		if timing.DecompressTime > maxDecompressTime {
+			maxDecompressTime = timing.DecompressTime
+		}
+
+		if timing.UnmarshalTime < minUnmarshalTime {
+			minUnmarshalTime = timing.UnmarshalTime
+		}
+		if timing.UnmarshalTime > maxUnmarshalTime {
+			maxUnmarshalTime = timing.UnmarshalTime
+		}
+
+		if fetchTime < minFetchTime {
+			minFetchTime = fetchTime
+		}
+		if fetchTime > maxFetchTime {
+			maxFetchTime = fetchTime
+		}
+
+		// Marshal on the last iteration for output/size
+		if i == iterations-1 {
 			lcmBytes, err = lcm.MarshalBinary()
 			if err != nil {
 				return fmt.Errorf("failed to marshal ledger %d: %w", ledgerSeq, err)
@@ -958,13 +1023,63 @@ func runGetLedger(dataDir string, ledgerSeq uint32, iterations int, noOutput boo
 		}
 	}
 
+	// Calculate averages
 	avgDuration := totalDuration / time.Duration(iterations)
+	avgIndexLookupTime := totalIndexLookupTime / time.Duration(iterations)
+	avgDataReadTime := totalDataReadTime / time.Duration(iterations)
+	avgDecompressTime := totalDecompressTime / time.Duration(iterations)
+	avgUnmarshalTime := totalUnmarshalTime / time.Duration(iterations)
+	avgFetchTime := totalFetchTime / time.Duration(iterations)
 
-	log.Printf("TIMING:")
-	log.Printf("  Total Time:      %s", helpers.FormatDuration(totalDuration))
-	log.Printf("  Min Time:        %s", helpers.FormatDuration(minDuration))
-	log.Printf("  Max Time:        %s", helpers.FormatDuration(maxDuration))
-	log.Printf("  Avg Time:        %s", helpers.FormatDuration(avgDuration))
+	log.Printf("================================================================================")
+	log.Printf("                              TIMING RESULTS")
+	log.Printf("================================================================================")
+	log.Printf("")
+	log.Printf("TOTAL TIME:")
+	log.Printf("  Min:             %s", helpers.FormatDuration(minDuration))
+	log.Printf("  Max:             %s", helpers.FormatDuration(maxDuration))
+	log.Printf("  Avg:             %s", helpers.FormatDuration(avgDuration))
+	log.Printf("")
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("GRANULAR BREAKDOWN (averaged over %d iterations):", iterations)
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("")
+	log.Printf("FETCH FROM STORAGE (Index Lookup + Data Read):")
+	log.Printf("  Min:             %s", helpers.FormatDuration(minFetchTime))
+	log.Printf("  Max:             %s", helpers.FormatDuration(maxFetchTime))
+	log.Printf("  Avg:             %s  <-- COMPARE THIS TO ROCKSDB", helpers.FormatDuration(avgFetchTime))
+	log.Printf("")
+	log.Printf("  Breakdown:")
+	log.Printf("    Index Lookup:  min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minIndexLookupTime),
+		helpers.FormatDuration(maxIndexLookupTime),
+		helpers.FormatDuration(avgIndexLookupTime))
+	log.Printf("    Data Read:     min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minDataReadTime),
+		helpers.FormatDuration(maxDataReadTime),
+		helpers.FormatDuration(avgDataReadTime))
+	log.Printf("")
+	log.Printf("POST-FETCH PROCESSING:")
+	log.Printf("  Decompress:      min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minDecompressTime),
+		helpers.FormatDuration(maxDecompressTime),
+		helpers.FormatDuration(avgDecompressTime))
+	log.Printf("  Unmarshal:       min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minUnmarshalTime),
+		helpers.FormatDuration(maxUnmarshalTime),
+		helpers.FormatDuration(avgUnmarshalTime))
+	log.Printf("")
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("SUMMARY:")
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("  Fetch (storage): %s", helpers.FormatDuration(avgFetchTime))
+	log.Printf("  Decompress:      %s", helpers.FormatDuration(avgDecompressTime))
+	log.Printf("  Unmarshal:       %s", helpers.FormatDuration(avgUnmarshalTime))
+	log.Printf("  ─────────────────────")
+	log.Printf("  TOTAL:           %s", helpers.FormatDuration(avgFetchTime+avgDecompressTime+avgUnmarshalTime))
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("")
+	log.Printf("DATA:")
 	log.Printf("  Ledger Size:     %s", helpers.FormatBytes(int64(len(lcmBytes))))
 	log.Printf("")
 
@@ -1013,15 +1128,31 @@ func runGetLedgerRange(dataDir string, startSeq, endSeq uint32, iterations int, 
 	log.Printf("No Output:         %v", noOutput)
 	log.Printf("")
 
-	// Track per-ledger timings across all iterations
+	// Track per-iteration timings across all iterations
 	var totalIterationDuration time.Duration
 	var minIterationDuration time.Duration = time.Hour
 	var maxIterationDuration time.Duration
 
-	// Track per-ledger stats
-	var minLedgerTime time.Duration = time.Hour
-	var maxLedgerTime time.Duration
-	var totalLedgerTime time.Duration
+	// Track granular timing stats (aggregated across all iterations)
+	var totalIndexLookupTime time.Duration
+	var totalDataReadTime time.Duration
+	var totalDecompressTime time.Duration
+	var totalUnmarshalTime time.Duration
+
+	var minIndexLookupTime time.Duration = time.Hour
+	var maxIndexLookupTime time.Duration
+	var minDataReadTime time.Duration = time.Hour
+	var maxDataReadTime time.Duration
+	var minDecompressTime time.Duration = time.Hour
+	var maxDecompressTime time.Duration
+	var minUnmarshalTime time.Duration = time.Hour
+	var maxUnmarshalTime time.Duration
+
+	// Combined "fetch from storage" time (index + data read)
+	var minFetchTime time.Duration = time.Hour
+	var maxFetchTime time.Duration
+	var totalFetchTime time.Duration
+
 	var ledgerTimeCount int64
 
 	var allLcmBytes [][]byte
@@ -1044,9 +1175,7 @@ func runGetLedgerRange(dataDir string, startSeq, endSeq uint32, iterations int, 
 		}
 
 		for {
-			ledgerStart := time.Now()
-			lcm, ledgerSeq, ok, err := iterator.Next()
-			ledgerElapsed := time.Since(ledgerStart)
+			lcm, ledgerSeq, timing, ok, err := iterator.Next()
 
 			if err != nil {
 				iterator.Close()
@@ -1057,15 +1186,50 @@ func runGetLedgerRange(dataDir string, startSeq, endSeq uint32, iterations int, 
 				break // End of range
 			}
 
-			// Track per-ledger timing
-			totalLedgerTime += ledgerElapsed
+			// Track granular timing
 			ledgerTimeCount++
 
-			if ledgerElapsed < minLedgerTime {
-				minLedgerTime = ledgerElapsed
+			totalIndexLookupTime += timing.IndexLookupTime
+			totalDataReadTime += timing.DataReadTime
+			totalDecompressTime += timing.DecompressTime
+			totalUnmarshalTime += timing.UnmarshalTime
+
+			fetchTime := timing.IndexLookupTime + timing.DataReadTime
+			totalFetchTime += fetchTime
+
+			if timing.IndexLookupTime < minIndexLookupTime {
+				minIndexLookupTime = timing.IndexLookupTime
 			}
-			if ledgerElapsed > maxLedgerTime {
-				maxLedgerTime = ledgerElapsed
+			if timing.IndexLookupTime > maxIndexLookupTime {
+				maxIndexLookupTime = timing.IndexLookupTime
+			}
+
+			if timing.DataReadTime < minDataReadTime {
+				minDataReadTime = timing.DataReadTime
+			}
+			if timing.DataReadTime > maxDataReadTime {
+				maxDataReadTime = timing.DataReadTime
+			}
+
+			if timing.DecompressTime < minDecompressTime {
+				minDecompressTime = timing.DecompressTime
+			}
+			if timing.DecompressTime > maxDecompressTime {
+				maxDecompressTime = timing.DecompressTime
+			}
+
+			if timing.UnmarshalTime < minUnmarshalTime {
+				minUnmarshalTime = timing.UnmarshalTime
+			}
+			if timing.UnmarshalTime > maxUnmarshalTime {
+				maxUnmarshalTime = timing.UnmarshalTime
+			}
+
+			if fetchTime < minFetchTime {
+				minFetchTime = fetchTime
+			}
+			if fetchTime > maxFetchTime {
+				maxFetchTime = fetchTime
 			}
 
 			if collectBytes {
@@ -1101,19 +1265,63 @@ func runGetLedgerRange(dataDir string, startSeq, endSeq uint32, iterations int, 
 	}
 
 	avgIterationDuration := totalIterationDuration / time.Duration(iterations)
-	avgLedgerTime := totalLedgerTime / time.Duration(ledgerTimeCount)
 
-	log.Printf("TIMING (per iteration - full range):")
+	// Calculate averages
+	avgIndexLookupTime := totalIndexLookupTime / time.Duration(ledgerTimeCount)
+	avgDataReadTime := totalDataReadTime / time.Duration(ledgerTimeCount)
+	avgDecompressTime := totalDecompressTime / time.Duration(ledgerTimeCount)
+	avgUnmarshalTime := totalUnmarshalTime / time.Duration(ledgerTimeCount)
+	avgFetchTime := totalFetchTime / time.Duration(ledgerTimeCount)
+
+	log.Printf("================================================================================")
+	log.Printf("                              TIMING RESULTS")
+	log.Printf("================================================================================")
+	log.Printf("")
+	log.Printf("PER ITERATION (full range of %d ledgers):", ledgerCount)
 	log.Printf("  Total Time:      %s (for %d iterations)", helpers.FormatDuration(totalIterationDuration), iterations)
 	log.Printf("  Min Iteration:   %s", helpers.FormatDuration(minIterationDuration))
 	log.Printf("  Max Iteration:   %s", helpers.FormatDuration(maxIterationDuration))
 	log.Printf("  Avg Iteration:   %s", helpers.FormatDuration(avgIterationDuration))
-	log.Printf("")
-	log.Printf("TIMING (per ledger):")
-	log.Printf("  Min Ledger:      %s", helpers.FormatDuration(minLedgerTime))
-	log.Printf("  Max Ledger:      %s", helpers.FormatDuration(maxLedgerTime))
-	log.Printf("  Avg Ledger:      %s", helpers.FormatDuration(avgLedgerTime))
 	log.Printf("  Throughput:      %.2f ledgers/sec", float64(ledgerCount)/avgIterationDuration.Seconds())
+	log.Printf("")
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("GRANULAR BREAKDOWN (per ledger, averaged over %d samples):", ledgerTimeCount)
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("")
+	log.Printf("FETCH FROM STORAGE (Index Lookup + Data Read):")
+	log.Printf("  Min:             %s", helpers.FormatDuration(minFetchTime))
+	log.Printf("  Max:             %s", helpers.FormatDuration(maxFetchTime))
+	log.Printf("  Avg:             %s  <-- COMPARE THIS TO ROCKSDB", helpers.FormatDuration(avgFetchTime))
+	log.Printf("")
+	log.Printf("  Breakdown:")
+	log.Printf("    Index Lookup:  min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minIndexLookupTime),
+		helpers.FormatDuration(maxIndexLookupTime),
+		helpers.FormatDuration(avgIndexLookupTime))
+	log.Printf("    Data Read:     min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minDataReadTime),
+		helpers.FormatDuration(maxDataReadTime),
+		helpers.FormatDuration(avgDataReadTime))
+	log.Printf("")
+	log.Printf("POST-FETCH PROCESSING:")
+	log.Printf("  Decompress:      min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minDecompressTime),
+		helpers.FormatDuration(maxDecompressTime),
+		helpers.FormatDuration(avgDecompressTime))
+	log.Printf("  Unmarshal:       min=%s  max=%s  avg=%s",
+		helpers.FormatDuration(minUnmarshalTime),
+		helpers.FormatDuration(maxUnmarshalTime),
+		helpers.FormatDuration(avgUnmarshalTime))
+	log.Printf("")
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("SUMMARY (per ledger averages):")
+	log.Printf("--------------------------------------------------------------------------------")
+	log.Printf("  Fetch (storage): %s", helpers.FormatDuration(avgFetchTime))
+	log.Printf("  Decompress:      %s", helpers.FormatDuration(avgDecompressTime))
+	log.Printf("  Unmarshal:       %s", helpers.FormatDuration(avgUnmarshalTime))
+	log.Printf("  ─────────────────────")
+	log.Printf("  TOTAL:           %s", helpers.FormatDuration(avgFetchTime+avgDecompressTime+avgUnmarshalTime))
+	log.Printf("--------------------------------------------------------------------------------")
 	log.Printf("")
 	log.Printf("DATA:")
 	log.Printf("  Total Size:      %s", helpers.FormatBytes(totalBytes))
@@ -1180,54 +1388,73 @@ func NewLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LedgerIterator
 	}, nil
 }
 
+// LedgerTiming holds granular timing for reading a single ledger
+type LedgerTiming struct {
+	IndexLookupTime time.Duration // Time to read offsets from index file
+	DataReadTime    time.Duration // Time to read compressed data from data file
+	DecompressTime  time.Duration // Time to decompress
+	UnmarshalTime   time.Duration // Time to unmarshal XDR
+	TotalTime       time.Duration // Total time
+}
+
 // Next returns the next ledger in the range.
-// Returns (lcm, ledgerSeq, true, nil) for each ledger.
-// Returns (empty, 0, false, nil) when iteration is complete.
-// Returns (empty, seq, false, err) on error.
-func (it *LedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, bool, error) {
+// Returns (lcm, ledgerSeq, timing, true, nil) for each ledger.
+// Returns (empty, 0, timing, false, nil) when iteration is complete.
+// Returns (empty, seq, timing, false, err) on error.
+func (it *LedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, LedgerTiming, bool, error) {
 	var lcm xdr.LedgerCloseMeta
+	var timing LedgerTiming
+	totalStart := time.Now()
 
 	if it.currentSeq > it.endSeq {
-		return lcm, 0, false, nil
+		return lcm, 0, timing, false, nil
 	}
 
 	ledgerSeq := it.currentSeq
 	chunkID := ledgerToChunkID(ledgerSeq)
 
-	// Load new chunk if needed
+	// Load new chunk if needed (this includes reading all offsets)
 	if chunkID != it.currentChunkID {
 		if err := it.loadChunk(chunkID); err != nil {
-			return lcm, ledgerSeq, false, err
+			return lcm, ledgerSeq, timing, false, err
 		}
 	}
 
-	// Read ledger from current chunk
+	// Index lookup - get offsets for this ledger
+	indexStart := time.Now()
 	localIndex := ledgerToLocalIndex(ledgerSeq)
-
-	// Get offsets for this ledger
 	startOffset := it.offsets[localIndex]
 	endOffset := it.offsets[localIndex+1]
 	recordSize := endOffset - startOffset
+	timing.IndexLookupTime = time.Since(indexStart)
 
-	// Read compressed data
+	// Data read - read compressed data
+	dataReadStart := time.Now()
 	compressed := make([]byte, recordSize)
 	if _, err := it.dataFile.ReadAt(compressed, int64(startOffset)); err != nil {
-		return lcm, ledgerSeq, false, fmt.Errorf("failed to read data for ledger %d: %w", ledgerSeq, err)
+		return lcm, ledgerSeq, timing, false, fmt.Errorf("failed to read data for ledger %d: %w", ledgerSeq, err)
 	}
+	timing.DataReadTime = time.Since(dataReadStart)
 
 	// Decompress
+	decompressStart := time.Now()
 	uncompressed, err := it.decoder.DecodeAll(compressed, nil)
 	if err != nil {
-		return lcm, ledgerSeq, false, fmt.Errorf("failed to decompress ledger %d: %w", ledgerSeq, err)
+		return lcm, ledgerSeq, timing, false, fmt.Errorf("failed to decompress ledger %d: %w", ledgerSeq, err)
 	}
+	timing.DecompressTime = time.Since(decompressStart)
 
 	// Unmarshal
+	unmarshalStart := time.Now()
 	if err := lcm.UnmarshalBinary(uncompressed); err != nil {
-		return lcm, ledgerSeq, false, fmt.Errorf("failed to unmarshal ledger %d: %w", ledgerSeq, err)
+		return lcm, ledgerSeq, timing, false, fmt.Errorf("failed to unmarshal ledger %d: %w", ledgerSeq, err)
 	}
+	timing.UnmarshalTime = time.Since(unmarshalStart)
+
+	timing.TotalTime = time.Since(totalStart)
 
 	it.currentSeq++
-	return lcm, ledgerSeq, true, nil
+	return lcm, ledgerSeq, timing, true, nil
 }
 
 // loadChunk loads a new chunk's index and opens its data file
