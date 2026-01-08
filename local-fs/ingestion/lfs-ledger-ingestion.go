@@ -128,10 +128,24 @@ func main() {
 	)
 
 	flag.StringVar(&dataDir, "data-dir", "", "Root directory for ledger storage (required)")
-	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence (must be chunk boundary)")
-	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence (must be chunk boundary)")
+	flag.UintVar(&startLedger, "start-ledger", 0, "Starting ledger sequence (must be chunk boundary for ingestion)")
+	flag.UintVar(&endLedger, "end-ledger", 0, "Ending ledger sequence (must be chunk boundary for ingestion)")
 	flag.BoolVar(&forceOverwrite, "force", false, "Overwrite existing chunks")
 	flag.BoolVar(&showChunks, "show-chunks", false, "Show chunk boundaries for the given range and exit")
+
+	// Query flags
+	var (
+		getLedger       uint
+		getLedgerStart  uint
+		getLedgerEnd    uint
+		queryIterations int
+		noOutput        bool
+	)
+	flag.UintVar(&getLedger, "get-ledger", 0, "Retrieve a single ledger and output hex to console")
+	flag.UintVar(&getLedgerStart, "get-ledger-range-start", 0, "Start of ledger range to retrieve")
+	flag.UintVar(&getLedgerEnd, "get-ledger-range-end", 0, "End of ledger range to retrieve")
+	flag.IntVar(&queryIterations, "iterations", 1, "Number of times to repeat the query (for timing)")
+	flag.BoolVar(&noOutput, "no-output", false, "Skip hex output, show timing stats only (for benchmarking)")
 
 	flag.Parse()
 
@@ -139,8 +153,25 @@ func main() {
 	if dataDir == "" {
 		log.Fatal("ERROR: --data-dir is required")
 	}
+
+	// Handle query modes first
+	if getLedger > 0 {
+		if err := runGetLedger(dataDir, uint32(getLedger), queryIterations, noOutput); err != nil {
+			log.Fatalf("ERROR: %v", err)
+		}
+		return
+	}
+
+	if getLedgerStart > 0 && getLedgerEnd > 0 {
+		if err := runGetLedgerRange(dataDir, uint32(getLedgerStart), uint32(getLedgerEnd), queryIterations, noOutput); err != nil {
+			log.Fatalf("ERROR: %v", err)
+		}
+		return
+	}
+
+	// For ingestion mode, start-ledger and end-ledger are required
 	if startLedger == 0 || endLedger == 0 {
-		log.Fatal("ERROR: --start-ledger and --end-ledger are required")
+		log.Fatal("ERROR: --start-ledger and --end-ledger are required for ingestion mode")
 	}
 
 	// Handle --show-chunks mode
@@ -652,6 +683,93 @@ func writeIndexFile(path string, offsets []uint64) error {
 }
 
 // =============================================================================
+// Reading Functions (for verification/future use)
+// =============================================================================
+
+// ReadLedger reads a single ledger from the file-based storage
+func ReadLedger(dataDir string, ledgerSeq uint32) (xdr.LedgerCloseMeta, error) {
+	var lcm xdr.LedgerCloseMeta
+
+	chunkID := ledgerToChunkID(ledgerSeq)
+	localIndex := ledgerToLocalIndex(ledgerSeq)
+
+	// Read index file header
+	indexPath := getIndexPath(dataDir, chunkID)
+	indexFile, err := os.Open(indexPath)
+	if err != nil {
+		return lcm, errors.Wrap(err, "failed to open index file")
+	}
+	defer indexFile.Close()
+
+	// Read header
+	header := make([]byte, IndexHeaderSize)
+	if _, err := indexFile.ReadAt(header, 0); err != nil {
+		return lcm, errors.Wrap(err, "failed to read index header")
+	}
+
+	version := header[0]
+	offsetSize := header[1]
+
+	if version != IndexVersion {
+		return lcm, fmt.Errorf("unsupported index version: %d", version)
+	}
+
+	if offsetSize != 4 && offsetSize != 8 {
+		return lcm, fmt.Errorf("invalid offset size: %d", offsetSize)
+	}
+
+	// Read two adjacent offsets
+	entryPos := int64(IndexHeaderSize) + int64(localIndex)*int64(offsetSize)
+	offsetBuf := make([]byte, offsetSize*2)
+	if _, err := indexFile.ReadAt(offsetBuf, entryPos); err != nil {
+		return lcm, errors.Wrap(err, "failed to read offsets from index")
+	}
+
+	var startOffset, endOffset uint64
+	if offsetSize == 4 {
+		startOffset = uint64(binary.LittleEndian.Uint32(offsetBuf[0:4]))
+		endOffset = uint64(binary.LittleEndian.Uint32(offsetBuf[4:8]))
+	} else {
+		startOffset = binary.LittleEndian.Uint64(offsetBuf[0:8])
+		endOffset = binary.LittleEndian.Uint64(offsetBuf[8:16])
+	}
+
+	recordSize := endOffset - startOffset
+
+	// Read compressed data from data file
+	dataPath := getDataPath(dataDir, chunkID)
+	dataFile, err := os.Open(dataPath)
+	if err != nil {
+		return lcm, errors.Wrap(err, "failed to open data file")
+	}
+	defer dataFile.Close()
+
+	compressed := make([]byte, recordSize)
+	if _, err := dataFile.ReadAt(compressed, int64(startOffset)); err != nil {
+		return lcm, errors.Wrap(err, "failed to read compressed data")
+	}
+
+	// Decompress
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return lcm, errors.Wrap(err, "failed to create zstd decoder")
+	}
+	defer decoder.Close()
+
+	uncompressed, err := decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		return lcm, errors.Wrap(err, "failed to decompress data")
+	}
+
+	// Unmarshal XDR
+	if err := lcm.UnmarshalBinary(uncompressed); err != nil {
+		return lcm, errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
+	}
+
+	return lcm, nil
+}
+
+// =============================================================================
 // Logging Functions
 // =============================================================================
 
@@ -778,88 +896,428 @@ func logFinalSummary(stats *GlobalStats, config *IngestionConfig, chunksProcesse
 }
 
 // =============================================================================
-// Reading Functions (for verification/future use)
+// Query Functions
 // =============================================================================
 
-// ReadLedger reads a single ledger from the file-based storage
-func ReadLedger(dataDir string, ledgerSeq uint32) (xdr.LedgerCloseMeta, error) {
+// runGetLedger retrieves a single ledger and outputs it as hex
+func runGetLedger(dataDir string, ledgerSeq uint32, iterations int, noOutput bool) error {
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	log.Printf("")
+	log.Printf("================================================================================")
+	log.Printf("                         GET LEDGER: %d", ledgerSeq)
+	log.Printf("================================================================================")
+	log.Printf("")
+	log.Printf("Data Directory:    %s", absDataDir)
+	log.Printf("Chunk ID:          %d", ledgerToChunkID(ledgerSeq))
+	log.Printf("Local Index:       %d", ledgerToLocalIndex(ledgerSeq))
+	log.Printf("Iterations:        %d", iterations)
+	log.Printf("No Output:         %v", noOutput)
+	log.Printf("")
+
+	var totalDuration time.Duration
+	var minDuration time.Duration = time.Hour // Start with a large value
+	var maxDuration time.Duration
+	var lcmBytes []byte
+	durations := make([]time.Duration, 0, iterations)
+
+	for i := 0; i < iterations; i++ {
+		start := time.Now()
+		lcm, err := ReadLedger(absDataDir, ledgerSeq)
+		elapsed := time.Since(start)
+
+		durations = append(durations, elapsed)
+		totalDuration += elapsed
+
+		if elapsed < minDuration {
+			minDuration = elapsed
+		}
+		if elapsed > maxDuration {
+			maxDuration = elapsed
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to read ledger %d: %w", ledgerSeq, err)
+		}
+
+		// Only marshal on the last iteration (for output)
+		if i == iterations-1 && !noOutput {
+			lcmBytes, err = lcm.MarshalBinary()
+			if err != nil {
+				return fmt.Errorf("failed to marshal ledger %d: %w", ledgerSeq, err)
+			}
+		} else if i == iterations-1 {
+			// Still get size for stats
+			lcmBytes, err = lcm.MarshalBinary()
+			if err != nil {
+				return fmt.Errorf("failed to marshal ledger %d: %w", ledgerSeq, err)
+			}
+		}
+	}
+
+	avgDuration := totalDuration / time.Duration(iterations)
+
+	log.Printf("TIMING:")
+	log.Printf("  Total Time:      %s", helpers.FormatDuration(totalDuration))
+	log.Printf("  Min Time:        %s", helpers.FormatDuration(minDuration))
+	log.Printf("  Max Time:        %s", helpers.FormatDuration(maxDuration))
+	log.Printf("  Avg Time:        %s", helpers.FormatDuration(avgDuration))
+	log.Printf("  Ledger Size:     %s", helpers.FormatBytes(int64(len(lcmBytes))))
+	log.Printf("")
+
+	if !noOutput {
+		log.Printf("OUTPUT (hex):")
+		log.Printf("--------------------------------------------------------------------------------")
+		fmt.Printf("%s\n", helpers.BytesToHexString(lcmBytes))
+		log.Printf("--------------------------------------------------------------------------------")
+		log.Printf("")
+	}
+
+	return nil
+}
+
+// runGetLedgerRange retrieves a range of ledgers using an iterator pattern
+func runGetLedgerRange(dataDir string, startSeq, endSeq uint32, iterations int, noOutput bool) error {
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	if startSeq > endSeq {
+		return fmt.Errorf("start sequence (%d) must be <= end sequence (%d)", startSeq, endSeq)
+	}
+
+	if startSeq < FirstLedgerSequence {
+		return fmt.Errorf("start sequence must be >= %d", FirstLedgerSequence)
+	}
+
+	ledgerCount := endSeq - startSeq + 1
+	startChunk := ledgerToChunkID(startSeq)
+	endChunk := ledgerToChunkID(endSeq)
+	chunkCount := endChunk - startChunk + 1
+
+	log.Printf("")
+	log.Printf("================================================================================")
+	log.Printf("                    GET LEDGER RANGE: %d - %d", startSeq, endSeq)
+	log.Printf("================================================================================")
+	log.Printf("")
+	log.Printf("Data Directory:    %s", absDataDir)
+	log.Printf("Ledger Count:      %d", ledgerCount)
+	log.Printf("Chunk Count:       %d (chunks %d to %d)", chunkCount, startChunk, endChunk)
+	log.Printf("Start Chunk:       %d (local index %d)", startChunk, ledgerToLocalIndex(startSeq))
+	log.Printf("End Chunk:         %d (local index %d)", endChunk, ledgerToLocalIndex(endSeq))
+	log.Printf("Iterations:        %d", iterations)
+	log.Printf("No Output:         %v", noOutput)
+	log.Printf("")
+
+	// Track per-ledger timings across all iterations
+	var totalIterationDuration time.Duration
+	var minIterationDuration time.Duration = time.Hour
+	var maxIterationDuration time.Duration
+
+	// Track per-ledger stats
+	var minLedgerTime time.Duration = time.Hour
+	var maxLedgerTime time.Duration
+	var totalLedgerTime time.Duration
+	var ledgerTimeCount int64
+
+	var allLcmBytes [][]byte
+	var totalBytes int64
+
+	for iter := 0; iter < iterations; iter++ {
+		iterStart := time.Now()
+
+		// Create iterator for this range
+		iterator, err := NewLedgerIterator(absDataDir, startSeq, endSeq)
+		if err != nil {
+			return fmt.Errorf("failed to create iterator: %w", err)
+		}
+
+		// Only collect bytes on last iteration if we need output
+		collectBytes := (iter == iterations-1) && !noOutput
+
+		if collectBytes {
+			allLcmBytes = make([][]byte, 0, ledgerCount)
+		}
+
+		for {
+			ledgerStart := time.Now()
+			lcm, ledgerSeq, ok, err := iterator.Next()
+			ledgerElapsed := time.Since(ledgerStart)
+
+			if err != nil {
+				iterator.Close()
+				return fmt.Errorf("failed to read ledger %d: %w", ledgerSeq, err)
+			}
+
+			if !ok {
+				break // End of range
+			}
+
+			// Track per-ledger timing
+			totalLedgerTime += ledgerElapsed
+			ledgerTimeCount++
+
+			if ledgerElapsed < minLedgerTime {
+				minLedgerTime = ledgerElapsed
+			}
+			if ledgerElapsed > maxLedgerTime {
+				maxLedgerTime = ledgerElapsed
+			}
+
+			if collectBytes {
+				lcmBytes, err := lcm.MarshalBinary()
+				if err != nil {
+					iterator.Close()
+					return fmt.Errorf("failed to marshal ledger %d: %w", ledgerSeq, err)
+				}
+				allLcmBytes = append(allLcmBytes, lcmBytes)
+				totalBytes += int64(len(lcmBytes))
+			} else if iter == iterations-1 {
+				// Still calculate size for stats on last iteration
+				lcmBytes, err := lcm.MarshalBinary()
+				if err != nil {
+					iterator.Close()
+					return fmt.Errorf("failed to marshal ledger %d: %w", ledgerSeq, err)
+				}
+				totalBytes += int64(len(lcmBytes))
+			}
+		}
+
+		iterator.Close()
+
+		iterElapsed := time.Since(iterStart)
+		totalIterationDuration += iterElapsed
+
+		if iterElapsed < minIterationDuration {
+			minIterationDuration = iterElapsed
+		}
+		if iterElapsed > maxIterationDuration {
+			maxIterationDuration = iterElapsed
+		}
+	}
+
+	avgIterationDuration := totalIterationDuration / time.Duration(iterations)
+	avgLedgerTime := totalLedgerTime / time.Duration(ledgerTimeCount)
+
+	log.Printf("TIMING (per iteration - full range):")
+	log.Printf("  Total Time:      %s (for %d iterations)", helpers.FormatDuration(totalIterationDuration), iterations)
+	log.Printf("  Min Iteration:   %s", helpers.FormatDuration(minIterationDuration))
+	log.Printf("  Max Iteration:   %s", helpers.FormatDuration(maxIterationDuration))
+	log.Printf("  Avg Iteration:   %s", helpers.FormatDuration(avgIterationDuration))
+	log.Printf("")
+	log.Printf("TIMING (per ledger):")
+	log.Printf("  Min Ledger:      %s", helpers.FormatDuration(minLedgerTime))
+	log.Printf("  Max Ledger:      %s", helpers.FormatDuration(maxLedgerTime))
+	log.Printf("  Avg Ledger:      %s", helpers.FormatDuration(avgLedgerTime))
+	log.Printf("  Throughput:      %.2f ledgers/sec", float64(ledgerCount)/avgIterationDuration.Seconds())
+	log.Printf("")
+	log.Printf("DATA:")
+	log.Printf("  Total Size:      %s", helpers.FormatBytes(totalBytes))
+	log.Printf("  Avg Ledger Size: %.2f KB", float64(totalBytes)/float64(ledgerCount)/1024)
+	log.Printf("")
+
+	if !noOutput && len(allLcmBytes) > 0 {
+		log.Printf("OUTPUT (hex, one ledger per line):")
+		log.Printf("--------------------------------------------------------------------------------")
+
+		for i, lcmBytes := range allLcmBytes {
+			seq := startSeq + uint32(i)
+			fmt.Printf("# Ledger %d (%s)\n", seq, helpers.FormatBytes(int64(len(lcmBytes))))
+			fmt.Printf("%s\n", helpers.BytesToHexString(lcmBytes))
+		}
+
+		log.Printf("--------------------------------------------------------------------------------")
+		log.Printf("")
+	}
+
+	return nil
+}
+
+// =============================================================================
+// Ledger Iterator (Efficient Range Reads)
+// =============================================================================
+
+// LedgerIterator efficiently iterates over a range of ledgers,
+// minimizing file I/O by keeping chunk files open while reading
+// ledgers from the same chunk.
+type LedgerIterator struct {
+	dataDir    string
+	startSeq   uint32
+	endSeq     uint32
+	currentSeq uint32
+
+	// Current chunk state
+	currentChunkID uint32
+	indexFile      *os.File
+	dataFile       *os.File
+	offsets        []uint64
+	offsetSize     uint8
+	chunkStartSeq  uint32
+	chunkEndSeq    uint32
+
+	// Decoder (reused)
+	decoder *zstd.Decoder
+}
+
+// NewLedgerIterator creates a new iterator for the given range
+func NewLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LedgerIterator, error) {
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+	}
+
+	return &LedgerIterator{
+		dataDir:        dataDir,
+		startSeq:       startSeq,
+		endSeq:         endSeq,
+		currentSeq:     startSeq,
+		currentChunkID: ^uint32(0), // Invalid chunk ID to force initial load
+		decoder:        decoder,
+	}, nil
+}
+
+// Next returns the next ledger in the range.
+// Returns (lcm, ledgerSeq, true, nil) for each ledger.
+// Returns (empty, 0, false, nil) when iteration is complete.
+// Returns (empty, seq, false, err) on error.
+func (it *LedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, bool, error) {
 	var lcm xdr.LedgerCloseMeta
 
+	if it.currentSeq > it.endSeq {
+		return lcm, 0, false, nil
+	}
+
+	ledgerSeq := it.currentSeq
 	chunkID := ledgerToChunkID(ledgerSeq)
+
+	// Load new chunk if needed
+	if chunkID != it.currentChunkID {
+		if err := it.loadChunk(chunkID); err != nil {
+			return lcm, ledgerSeq, false, err
+		}
+	}
+
+	// Read ledger from current chunk
 	localIndex := ledgerToLocalIndex(ledgerSeq)
 
-	// Read index file header
-	indexPath := getIndexPath(dataDir, chunkID)
+	// Get offsets for this ledger
+	startOffset := it.offsets[localIndex]
+	endOffset := it.offsets[localIndex+1]
+	recordSize := endOffset - startOffset
+
+	// Read compressed data
+	compressed := make([]byte, recordSize)
+	if _, err := it.dataFile.ReadAt(compressed, int64(startOffset)); err != nil {
+		return lcm, ledgerSeq, false, fmt.Errorf("failed to read data for ledger %d: %w", ledgerSeq, err)
+	}
+
+	// Decompress
+	uncompressed, err := it.decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		return lcm, ledgerSeq, false, fmt.Errorf("failed to decompress ledger %d: %w", ledgerSeq, err)
+	}
+
+	// Unmarshal
+	if err := lcm.UnmarshalBinary(uncompressed); err != nil {
+		return lcm, ledgerSeq, false, fmt.Errorf("failed to unmarshal ledger %d: %w", ledgerSeq, err)
+	}
+
+	it.currentSeq++
+	return lcm, ledgerSeq, true, nil
+}
+
+// loadChunk loads a new chunk's index and opens its data file
+func (it *LedgerIterator) loadChunk(chunkID uint32) error {
+	// Close previous chunk files if open
+	it.closeChunkFiles()
+
+	// Open index file
+	indexPath := getIndexPath(it.dataDir, chunkID)
 	indexFile, err := os.Open(indexPath)
 	if err != nil {
-		return lcm, errors.Wrap(err, "failed to open index file")
+		return fmt.Errorf("failed to open index file for chunk %d: %w", chunkID, err)
 	}
-	defer indexFile.Close()
+	it.indexFile = indexFile
 
 	// Read header
 	header := make([]byte, IndexHeaderSize)
 	if _, err := indexFile.ReadAt(header, 0); err != nil {
-		return lcm, errors.Wrap(err, "failed to read index header")
+		return fmt.Errorf("failed to read index header for chunk %d: %w", chunkID, err)
 	}
 
 	version := header[0]
-	offsetSize := header[1]
+	it.offsetSize = header[1]
 
 	if version != IndexVersion {
-		return lcm, fmt.Errorf("unsupported index version: %d", version)
+		return fmt.Errorf("unsupported index version %d for chunk %d", version, chunkID)
 	}
 
-	if offsetSize != 4 && offsetSize != 8 {
-		return lcm, fmt.Errorf("invalid offset size: %d", offsetSize)
+	if it.offsetSize != 4 && it.offsetSize != 8 {
+		return fmt.Errorf("invalid offset size %d for chunk %d", it.offsetSize, chunkID)
 	}
 
-	// Read two adjacent offsets
-	entryPos := int64(IndexHeaderSize) + int64(localIndex)*int64(offsetSize)
-	offsetBuf := make([]byte, offsetSize*2)
-	if _, err := indexFile.ReadAt(offsetBuf, entryPos); err != nil {
-		return lcm, errors.Wrap(err, "failed to read offsets from index")
+	// Get file size to determine number of offsets
+	fileInfo, err := indexFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat index file for chunk %d: %w", chunkID, err)
 	}
 
-	var startOffset, endOffset uint64
-	if offsetSize == 4 {
-		startOffset = uint64(binary.LittleEndian.Uint32(offsetBuf[0:4]))
-		endOffset = uint64(binary.LittleEndian.Uint32(offsetBuf[4:8]))
-	} else {
-		startOffset = binary.LittleEndian.Uint64(offsetBuf[0:8])
-		endOffset = binary.LittleEndian.Uint64(offsetBuf[8:16])
+	numOffsets := (fileInfo.Size() - IndexHeaderSize) / int64(it.offsetSize)
+
+	// Read all offsets for this chunk
+	offsetsData := make([]byte, numOffsets*int64(it.offsetSize))
+	if _, err := indexFile.ReadAt(offsetsData, IndexHeaderSize); err != nil {
+		return fmt.Errorf("failed to read offsets for chunk %d: %w", chunkID, err)
 	}
 
-	recordSize := endOffset - startOffset
+	// Parse offsets
+	it.offsets = make([]uint64, numOffsets)
+	for i := int64(0); i < numOffsets; i++ {
+		if it.offsetSize == 4 {
+			it.offsets[i] = uint64(binary.LittleEndian.Uint32(offsetsData[i*4 : i*4+4]))
+		} else {
+			it.offsets[i] = binary.LittleEndian.Uint64(offsetsData[i*8 : i*8+8])
+		}
+	}
 
-	// Read compressed data from data file
-	dataPath := getDataPath(dataDir, chunkID)
+	// Open data file
+	dataPath := getDataPath(it.dataDir, chunkID)
 	dataFile, err := os.Open(dataPath)
 	if err != nil {
-		return lcm, errors.Wrap(err, "failed to open data file")
+		return fmt.Errorf("failed to open data file for chunk %d: %w", chunkID, err)
 	}
-	defer dataFile.Close()
+	it.dataFile = dataFile
 
-	compressed := make([]byte, recordSize)
-	if _, err := dataFile.ReadAt(compressed, int64(startOffset)); err != nil {
-		return lcm, errors.Wrap(err, "failed to read compressed data")
+	// Update chunk state
+	it.currentChunkID = chunkID
+	it.chunkStartSeq = chunkFirstLedger(chunkID)
+	it.chunkEndSeq = chunkLastLedger(chunkID)
+
+	return nil
+}
+
+// closeChunkFiles closes the current chunk's files
+func (it *LedgerIterator) closeChunkFiles() {
+	if it.indexFile != nil {
+		it.indexFile.Close()
+		it.indexFile = nil
 	}
-
-	// Decompress
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return lcm, errors.Wrap(err, "failed to create zstd decoder")
+	if it.dataFile != nil {
+		it.dataFile.Close()
+		it.dataFile = nil
 	}
-	defer decoder.Close()
+	it.offsets = nil
+}
 
-	uncompressed, err := decoder.DecodeAll(compressed, nil)
-	if err != nil {
-		return lcm, errors.Wrap(err, "failed to decompress data")
+// Close closes the iterator and releases resources
+func (it *LedgerIterator) Close() {
+	it.closeChunkFiles()
+	if it.decoder != nil {
+		it.decoder.Close()
+		it.decoder = nil
 	}
-
-	// Unmarshal XDR
-	if err := lcm.UnmarshalBinary(uncompressed); err != nil {
-		return lcm, errors.Wrap(err, "failed to unmarshal LedgerCloseMeta")
-	}
-
-	return lcm, nil
 }
