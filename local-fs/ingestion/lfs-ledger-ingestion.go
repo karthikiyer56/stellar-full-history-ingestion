@@ -1,4 +1,3 @@
-// main.go
 // =============================================================================
 // File-Based Ledger Storage Ingestion Tool
 // =============================================================================
@@ -18,13 +17,32 @@
 //   <data_dir>/chunks/XXXX/YYYYYY.index
 //   Where: XXXX = chunk_id / 1000, YYYYYY = chunk_id
 //
-// USAGE:
+//
+//
+// INGESTION USAGE:
 // ======
 // ./file_based_ingestion \
 //     --data-dir /path/to/storage \
 //     --start-ledger 2 \
 //     --end-ledger 5000001 \
 //     [--force]
+//
+//
+// QUERY USAGE:
+//
+// Get Single Ledger
+//
+// ./file_based_ingestion \
+//		--data-dir /data/ledgers \
+//		--get-ledger 1000000 --iterations 100 --no-output
+//
+// Get Ledger Range:
+//
+// ./file_based_ingestion \
+//		--data-dir /data/ledgers \
+//		--get-ledger-range-start 1000000 \
+//		--get-ledger-range-end 1001000 \
+//		--iterations 5 --no-output
 //
 // =============================================================================
 
