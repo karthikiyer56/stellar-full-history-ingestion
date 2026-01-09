@@ -41,33 +41,34 @@ func FormatBytesWithPrecision(bytes int64, precision int) string {
 
 // FormatDuration formats duration into human-readable format
 func FormatDuration(d time.Duration) string {
+	if d < time.Microsecond {
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	}
 	if d < time.Millisecond {
-		return fmt.Sprintf("%dµs", d.Microseconds())
+		return fmt.Sprintf("%.3fµs", float64(d.Nanoseconds())/1000)
 	}
 	if d < time.Second {
-		return fmt.Sprintf("%.3fms", float64(d.Microseconds())/1000.0)
+		return fmt.Sprintf("%.3fms", float64(d.Microseconds())/1000)
 	}
 	if d < time.Minute {
 		return fmt.Sprintf("%.3fs", d.Seconds())
 	}
-
-	d = d.Round(time.Second)
-	h := d / time.Hour
-	d -= h * time.Hour
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm%ds", mins, secs)
 	}
-	return fmt.Sprintf("%ds", s)
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) % 60
+	secs := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dh%dm%ds", hours, mins, secs)
 }
 
 // FormatNumber formats a number with commas for readability
 func FormatNumber(n int64) string {
+	if n < 0 {
+		return "-" + FormatNumber(-n)
+	}
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
 	}
