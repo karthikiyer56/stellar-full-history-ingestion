@@ -107,6 +107,12 @@ const (
 
 	// invalidChunkID is used to force initial chunk load
 	invalidChunkID = ^uint32(0)
+
+	// batchReadSize is the number of ledgers to read ahead in a single syscall
+	batchReadSize = 64
+
+	// maxBatchBytes limits batch read buffer size (64 ledgers * ~150KB = ~10MB)
+	maxBatchBytes = 10 * 1024 * 1024
 )
 
 // =============================================================================
@@ -691,7 +697,7 @@ func writeIndexFile(path string, offsets []uint64) error {
 	buf[1] = uint8(offsetSize) // offset_size
 	// bytes 2-7 are reserved (already zero)
 
-	// Write offsets (little-endian)
+	// Write offsets (little-endian) - branch outside loop for better performance
 	pos := IndexHeaderSize
 	if offsetSize == 4 {
 		for _, offset := range offsets {
@@ -732,9 +738,9 @@ func ReadLedgerWithTiming(dataDir string, ledgerSeq uint32, decoder *zstd.Decode
 	}
 	defer indexFile.Close()
 
-	// Read header
-	header := make([]byte, IndexHeaderSize)
-	if _, err := indexFile.ReadAt(header, 0); err != nil {
+	// Read header - use stack-allocated array to avoid heap allocation
+	var header [IndexHeaderSize]byte
+	if _, err := indexFile.ReadAt(header[:], 0); err != nil {
 		return lcm, timing, errors.Wrap(err, "failed to read index header")
 	}
 
@@ -749,10 +755,10 @@ func ReadLedgerWithTiming(dataDir string, ledgerSeq uint32, decoder *zstd.Decode
 		return lcm, timing, fmt.Errorf("invalid offset size: %d", offsetSize)
 	}
 
-	// Read two adjacent offsets
+	// Read two adjacent offsets - use stack-allocated array
 	entryPos := int64(IndexHeaderSize) + int64(localIndex)*int64(offsetSize)
-	offsetBuf := make([]byte, offsetSize*2)
-	if _, err := indexFile.ReadAt(offsetBuf, entryPos); err != nil {
+	var offsetBuf [16]byte // Max size: 2 * 8 bytes for u64 offsets
+	if _, err := indexFile.ReadAt(offsetBuf[:offsetSize*2], entryPos); err != nil {
 		return lcm, timing, errors.Wrap(err, "failed to read offsets from index")
 	}
 
@@ -1399,8 +1405,10 @@ type LedgerIterator struct {
 	offsets        []uint64
 	offsetSize     uint8
 
-	// Reusable buffer to reduce allocations
-	compressedBuf []byte
+	// Batch read buffer for sequential reads within a chunk
+	batchBuf      []byte
+	batchBufStart uint64 // Start offset of data currently in batchBuf
+	batchBufEnd   uint64 // End offset of data currently in batchBuf
 
 	// Track chunk load time to amortize across ledgers
 	lastChunkLoadTime time.Duration
@@ -1476,22 +1484,72 @@ func (it *LedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, LedgerTiming, boo
 	// Amortize chunk load time across ledgers in this chunk
 	timing.IndexLookupTime = offsetLookupTime + (it.lastChunkLoadTime / time.Duration(it.ledgersInChunk))
 
-	// Data read - read compressed data
-	dataReadStart := time.Now()
-	// Reuse or grow buffer to reduce allocations
-	if cap(it.compressedBuf) < int(recordSize) {
-		it.compressedBuf = make([]byte, recordSize)
+	// Data read - use batch buffer if possible
+	var compressed []byte
+
+	// Check if data is already in batch buffer
+	if it.batchBuf != nil && startOffset >= it.batchBufStart && endOffset <= it.batchBufEnd {
+		// Cache hit - extract from batch buffer (no I/O, so no DataReadTime)
+		bufStart := startOffset - it.batchBufStart
+		bufEnd := endOffset - it.batchBufStart
+		compressed = it.batchBuf[bufStart:bufEnd]
 	} else {
-		it.compressedBuf = it.compressedBuf[:recordSize]
+		// Cache miss - do a batch read ahead
+		dataReadStart := time.Now()
+
+		// Calculate how many ledgers to read ahead (up to batchReadSize or end of range/chunk)
+		endLocalIndex := localIndex + batchReadSize
+		maxLocalIndex := uint32(len(it.offsets) - 1)
+
+		// Also limit by end of requested range
+		if ledgerToChunkID(it.endSeq) == chunkID {
+			endSeqLocalIndex := ledgerToLocalIndex(it.endSeq)
+			if endSeqLocalIndex+1 < maxLocalIndex {
+				maxLocalIndex = endSeqLocalIndex + 1
+			}
+		}
+
+		if endLocalIndex > maxLocalIndex {
+			endLocalIndex = maxLocalIndex
+		}
+
+		batchStartOffset := startOffset
+		batchEndOffset := it.offsets[endLocalIndex] // Always a record boundary
+		batchSize := batchEndOffset - batchStartOffset
+
+		// If batch exceeds max size, reduce number of records (not bytes)
+		// This ensures we never have partial records in the buffer
+		for batchSize > maxBatchBytes && endLocalIndex > localIndex+1 {
+			endLocalIndex--
+			batchEndOffset = it.offsets[endLocalIndex]
+			batchSize = batchEndOffset - batchStartOffset
+		}
+
+		// Read batch into buffer
+		if cap(it.batchBuf) < int(batchSize) {
+			it.batchBuf = make([]byte, batchSize)
+		} else {
+			it.batchBuf = it.batchBuf[:batchSize]
+		}
+
+		if _, err := it.dataFile.ReadAt(it.batchBuf, int64(batchStartOffset)); err != nil {
+			return lcm, ledgerSeq, timing, false, fmt.Errorf("failed to batch read data for ledger %d: %w", ledgerSeq, err)
+		}
+
+		it.batchBufStart = batchStartOffset
+		it.batchBufEnd = batchEndOffset
+
+		// Extract current record from batch buffer
+		compressed = it.batchBuf[:recordSize]
+
+		// Only count actual I/O time, amortized across batch
+		ledgersInBatch := endLocalIndex - localIndex
+		timing.DataReadTime = time.Since(dataReadStart) / time.Duration(ledgersInBatch)
 	}
-	if _, err := it.dataFile.ReadAt(it.compressedBuf, int64(startOffset)); err != nil {
-		return lcm, ledgerSeq, timing, false, fmt.Errorf("failed to read data for ledger %d: %w", ledgerSeq, err)
-	}
-	timing.DataReadTime = time.Since(dataReadStart)
 
 	// Decompress
 	decompressStart := time.Now()
-	uncompressed, err := it.decoder.DecodeAll(it.compressedBuf, nil)
+	uncompressed, err := it.decoder.DecodeAll(compressed, nil)
 	if err != nil {
 		return lcm, ledgerSeq, timing, false, fmt.Errorf("failed to decompress ledger %d: %w", ledgerSeq, err)
 	}
@@ -1554,12 +1612,14 @@ func (it *LedgerIterator) loadChunk(chunkID uint32) error {
 		return fmt.Errorf("failed to read offsets for chunk %d: %w", chunkID, err)
 	}
 
-	// Parse offsets
+	// Parse offsets - branch outside loop for better performance
 	it.offsets = make([]uint64, numOffsets)
-	for i := int64(0); i < numOffsets; i++ {
-		if it.offsetSize == 4 {
+	if it.offsetSize == 4 {
+		for i := int64(0); i < numOffsets; i++ {
 			it.offsets[i] = uint64(binary.LittleEndian.Uint32(offsetsData[i*4 : i*4+4]))
-		} else {
+		}
+	} else {
+		for i := int64(0); i < numOffsets; i++ {
 			it.offsets[i] = binary.LittleEndian.Uint64(offsetsData[i*8 : i*8+8])
 		}
 	}
@@ -1575,6 +1635,11 @@ func (it *LedgerIterator) loadChunk(chunkID uint32) error {
 	// Update chunk state
 	it.currentChunkID = chunkID
 
+	// Reset batch buffer on chunk change
+	it.batchBuf = nil
+	it.batchBufStart = 0
+	it.batchBufEnd = 0
+
 	return nil
 }
 
@@ -1589,7 +1654,7 @@ func (it *LedgerIterator) closeChunkFiles() {
 		it.dataFile = nil
 	}
 	it.offsets = nil
-	it.compressedBuf = nil
+	it.batchBuf = nil
 }
 
 // Close closes the iterator and releases resources
