@@ -41,14 +41,14 @@
 // QUERY USAGE
 // =============================================================================
 //
-// Single ledger lookup (with hex output):
+// Single ledger lookup (with base64 output):
 //   ./file_based_ingestion --data-dir /data/ledgers --get-ledger 1000000
 //
 // Single ledger lookup (timing only, no output):
 //   ./file_based_ingestion --data-dir /data/ledgers --get-ledger 1000000 \
 //       --iterations 100 --no-output
 //
-// Range query (with hex output):
+// Range query (with base64 output):
 //   ./file_based_ingestion --data-dir /data/ledgers \
 //       --get-ledger-range-start 1000000 --get-ledger-range-end 1000100
 //
@@ -64,6 +64,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -173,11 +174,11 @@ func main() {
 		queryIterations int
 		noOutput        bool
 	)
-	flag.UintVar(&getLedger, "get-ledger", 0, "Retrieve a single ledger and output hex to console")
+	flag.UintVar(&getLedger, "get-ledger", 0, "Retrieve a single ledger and output base64 to console")
 	flag.UintVar(&getLedgerStart, "get-ledger-range-start", 0, "Start of ledger range to retrieve")
 	flag.UintVar(&getLedgerEnd, "get-ledger-range-end", 0, "End of ledger range to retrieve")
 	flag.IntVar(&queryIterations, "iterations", 1, "Number of times to repeat the query (for timing)")
-	flag.BoolVar(&noOutput, "no-output", false, "Skip hex output, show timing stats only (for benchmarking)")
+	flag.BoolVar(&noOutput, "no-output", false, "Skip base64 output, show timing stats only (for benchmarking)")
 
 	flag.Parse()
 
@@ -938,7 +939,7 @@ func logFinalSummary(stats *GlobalStats, config *IngestionConfig, chunksProcesse
 // Query Functions
 // =============================================================================
 
-// runGetLedger retrieves a single ledger and outputs it as hex
+// runGetLedger retrieves a single ledger and outputs it as base64
 func runGetLedger(dataDir string, ledgerSeq uint32, iterations int, noOutput bool) error {
 	absDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
@@ -1112,9 +1113,9 @@ func runGetLedger(dataDir string, ledgerSeq uint32, iterations int, noOutput boo
 	log.Printf("")
 
 	if !noOutput {
-		log.Printf("OUTPUT (hex):")
+		log.Printf("OUTPUT (base64):")
 		log.Printf("--------------------------------------------------------------------------------")
-		fmt.Printf("%s\n", helpers.BytesToHexString(lcmBytes))
+		fmt.Printf("%s\n", base64.StdEncoding.EncodeToString(lcmBytes))
 		log.Printf("--------------------------------------------------------------------------------")
 		log.Printf("")
 	}
@@ -1357,13 +1358,13 @@ func runGetLedgerRange(dataDir string, startSeq, endSeq uint32, iterations int, 
 	log.Printf("")
 
 	if !noOutput && len(allLcmBytes) > 0 {
-		log.Printf("OUTPUT (hex, one ledger per line):")
+		log.Printf("OUTPUT (base64, one ledger per line):")
 		log.Printf("--------------------------------------------------------------------------------")
 
 		for i, lcmBytes := range allLcmBytes {
 			seq := startSeq + uint32(i)
 			fmt.Printf("# Ledger %d (%s)\n", seq, helpers.FormatBytes(int64(len(lcmBytes))))
-			fmt.Printf("%s\n", helpers.BytesToHexString(lcmBytes))
+			fmt.Printf("%s\n", base64.StdEncoding.EncodeToString(lcmBytes))
 		}
 
 		log.Printf("--------------------------------------------------------------------------------")
