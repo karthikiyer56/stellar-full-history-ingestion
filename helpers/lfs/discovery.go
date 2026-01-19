@@ -27,8 +27,14 @@ func (r LedgerRange) TotalLedgers() uint32 {
 	return r.EndLedger - r.StartLedger + 1
 }
 
-// DiscoverLedgerRange scans the chunks directory to find available ledger range.
-// It finds the first and last complete chunks and returns the corresponding ledger range.
+// DiscoverLedgerRange efficiently finds the available ledger range in an LFS store.
+//
+// This function is optimized to minimize filesystem operations:
+//   - First chunk is always 0 (Stellar starts at ledger 2, which is in chunk 0)
+//   - Last chunk is found by checking the highest-numbered parent directory
+//     and then finding the highest-numbered chunk file within it
+//
+// This reduces discovery from O(N) file reads to O(1) directory reads.
 func DiscoverLedgerRange(dataDir string) (LedgerRange, error) {
 	var result LedgerRange
 
@@ -37,28 +43,17 @@ func DiscoverLedgerRange(dataDir string) (LedgerRange, error) {
 		return result, fmt.Errorf("chunks directory not found: %s", chunksDir)
 	}
 
-	// Find all chunk IDs by scanning the directory structure
-	chunkIDs, err := findAllChunkIDs(chunksDir)
+	// First chunk is always 0 (ledger 2 starts in chunk 0)
+	// Stellar blockchain starts at ledger 2, and chunk 0 contains ledgers 2-10001
+	if !ChunkExists(dataDir, 0) {
+		return result, fmt.Errorf("first chunk (000000) not found in %s", chunksDir)
+	}
+	firstChunk := uint32(0)
+
+	// Find last chunk efficiently by looking at highest parent dir + highest file
+	lastChunk, err := findLastChunk(dataDir, chunksDir)
 	if err != nil {
 		return result, err
-	}
-
-	if len(chunkIDs) == 0 {
-		return result, fmt.Errorf("no chunks found in: %s", chunksDir)
-	}
-
-	// Sort to find min and max
-	sort.Slice(chunkIDs, func(i, j int) bool { return chunkIDs[i] < chunkIDs[j] })
-
-	// Validate that first and last chunks are complete
-	firstChunk := chunkIDs[0]
-	lastChunk := chunkIDs[len(chunkIDs)-1]
-
-	if !ChunkExists(dataDir, firstChunk) {
-		return result, fmt.Errorf("first chunk %d is incomplete", firstChunk)
-	}
-	if !ChunkExists(dataDir, lastChunk) {
-		return result, fmt.Errorf("last chunk %d is incomplete", lastChunk)
 	}
 
 	result.StartChunk = firstChunk
@@ -68,6 +63,148 @@ func DiscoverLedgerRange(dataDir string) (LedgerRange, error) {
 	result.TotalChunks = lastChunk - firstChunk + 1
 
 	return result, nil
+}
+
+// findLastChunk efficiently finds the highest complete chunk in the store.
+//
+// Algorithm:
+//  1. List parent directories (0000, 0001, ...), find the highest valid one
+//  2. List files in that directory, find the highest chunk ID
+//  3. Verify the chunk is complete (both .data and .index exist)
+//  4. If incomplete, scan backwards to find the last complete chunk
+func findLastChunk(dataDir, chunksDir string) (uint32, error) {
+	// List parent directories
+	parentDirs, err := os.ReadDir(chunksDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read chunks directory: %w", err)
+	}
+
+	// Find highest valid parent directory (4-digit number like "0051")
+	highestParent, highestParentNum := findHighestValidParentDir(parentDirs)
+	if highestParent == "" {
+		return 0, fmt.Errorf("no valid parent directories found in %s", chunksDir)
+	}
+
+	// List files in highest parent directory
+	parentPath := filepath.Join(chunksDir, highestParent)
+	files, err := os.ReadDir(parentPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read parent directory %s: %w", parentPath, err)
+	}
+
+	// Find highest chunk ID in this directory
+	highestChunkID, found := findHighestChunkInDir(files)
+	if !found {
+		// No valid chunks in highest parent dir, try previous parent
+		if highestParentNum == 0 {
+			return 0, fmt.Errorf("no valid chunk files found")
+		}
+		// Fall back to scanning all chunks (rare edge case)
+		return findLastChunkFallback(dataDir, chunksDir)
+	}
+
+	// Verify chunk is complete, scan backwards if not
+	for chunkID := highestChunkID; ; chunkID-- {
+		if ChunkExists(dataDir, chunkID) {
+			return chunkID, nil
+		}
+		if chunkID == 0 {
+			break
+		}
+	}
+
+	return 0, fmt.Errorf("no complete chunks found")
+}
+
+// findHighestValidParentDir finds the highest valid 4-digit parent directory.
+// Returns the directory name and its numeric value.
+func findHighestValidParentDir(entries []os.DirEntry) (string, int) {
+	highestName := ""
+	highestNum := -1
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if len(name) != 4 {
+			continue
+		}
+
+		num, err := strconv.Atoi(name)
+		if err != nil {
+			continue
+		}
+
+		if num > highestNum {
+			highestNum = num
+			highestName = name
+		}
+	}
+
+	return highestName, highestNum
+}
+
+// findHighestChunkInDir finds the highest chunk ID from .data files in a directory.
+// Returns the chunk ID and whether a valid chunk was found.
+func findHighestChunkInDir(entries []os.DirEntry) (uint32, bool) {
+	highestChunkID := uint32(0)
+	found := false
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".data") {
+			continue
+		}
+
+		// Parse chunk ID from filename (NNNNNN.data)
+		baseName := strings.TrimSuffix(name, ".data")
+		if len(baseName) != 6 {
+			continue
+		}
+
+		chunkID, err := strconv.ParseUint(baseName, 10, 32)
+		if err != nil {
+			continue
+		}
+
+		if !found || uint32(chunkID) > highestChunkID {
+			highestChunkID = uint32(chunkID)
+			found = true
+		}
+	}
+
+	return highestChunkID, found
+}
+
+// findLastChunkFallback scans all chunks to find the last complete one.
+// This is used as a fallback when the optimized approach fails.
+func findLastChunkFallback(dataDir, chunksDir string) (uint32, error) {
+	chunkIDs, err := findAllChunkIDs(chunksDir)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(chunkIDs) == 0 {
+		return 0, fmt.Errorf("no chunks found in: %s", chunksDir)
+	}
+
+	// Sort descending to find highest first
+	sort.Slice(chunkIDs, func(i, j int) bool { return chunkIDs[i] > chunkIDs[j] })
+
+	// Find first complete chunk (starting from highest)
+	for _, chunkID := range chunkIDs {
+		if ChunkExists(dataDir, chunkID) {
+			return chunkID, nil
+		}
+	}
+
+	return 0, fmt.Errorf("no complete chunks found")
 }
 
 // findAllChunkIDs scans the chunks directory structure and returns all chunk IDs.
