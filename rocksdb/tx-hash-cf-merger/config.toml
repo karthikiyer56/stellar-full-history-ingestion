@@ -1,0 +1,268 @@
+# =============================================================================
+# TX Hash to Ledger Sequence - Column Family Merger Configuration
+# =============================================================================
+#
+# This tool supports a TWO-PHASE WORKFLOW:
+#
+# PHASE 1 (BULK LOAD) - This configuration
+#   - Merge multiple existing stores into one with 16 column families
+#   - WAL disabled, auto-compaction disabled for maximum write throughput
+#   - One final compaction at the end
+#
+# PHASE 2 (ACTIVE USE) - Generated automatically after merge
+#   - Use the merged store for real-time ingestion + queries
+#   - WAL enabled for crash recovery
+#   - Auto-compaction enabled for balanced performance
+#
+# INPUT SOURCES:
+#   You must choose ONE of the following input sources:
+#   1. input_stores: List of existing tx_hash_to_ledger_seq RocksDB stores
+#   2. lfs_ledger_store_path: Path to LFS ledger store (extract tx hashes from ledgers)
+#
+# MEMORY BUDGET (64GB RAM Target)
+# ===============================
+# Bulk Load:
+#   MemTables:   128 MB x 4 x 16 CFs = 8 GB
+#   Block Cache: 512 MB (minimal, mostly writing)
+#   Total:       ~9 GB
+#
+# Active Use:
+#   MemTables:   64 MB x 4 x 16 CFs = 4 GB
+#   Block Cache: 16 GB (large for read performance)
+#   Total:       ~20 GB + bloom filters on demand
+#
+# COLUMN FAMILY PARTITIONING
+# ==========================
+# Transaction hashes are 32-byte random values. The first hex character
+# (high nibble of the first byte) determines which column family the entry
+# belongs to:
+#
+#   CF "0": Hashes starting with 0x0X (where X is 0-F)
+#   CF "1": Hashes starting with 0x1X
+#   ...
+#   CF "f": Hashes starting with 0xFX
+#
+# This provides:
+# - Even distribution (hashes are random)
+# - Parallel read/write capabilities
+# - Separate compaction per partition
+# - ~1/16th of data per column family
+#
+# =============================================================================
+
+
+# =============================================================================
+# INPUT SOURCE OPTION 1: EXISTING ROCKSDB STORES
+# =============================================================================
+# List of paths to existing tx_hash_to_ledger_seq RocksDB stores.
+# Each store will be read sequentially and merged into the output store.
+#
+# Example: Multiple yearly stores or stores from different ingestion runs
+#
+# MUTUALLY EXCLUSIVE with lfs_ledger_store_path
+# =============================================================================
+input_stores = [
+    "/data/stellar/tx_hash_to_ledger_seq/2020",
+    "/data/stellar/tx_hash_to_ledger_seq/2021",
+    "/data/stellar/tx_hash_to_ledger_seq/2022",
+    "/data/stellar/tx_hash_to_ledger_seq/2023",
+    "/data/stellar/tx_hash_to_ledger_seq/2024",
+]
+
+
+# =============================================================================
+# INPUT SOURCE OPTION 2: LFS (LOCAL FILESYSTEM) LEDGER STORE
+# =============================================================================
+# Path to an LFS ledger store containing compressed LedgerCloseMeta records.
+# The tool will read each ledger, extract transactions, and build the
+# tx_hash → ledger_seq mapping.
+#
+# MUTUALLY EXCLUSIVE with input_stores
+#
+# To use LFS mode, comment out input_stores above and uncomment these:
+# =============================================================================
+# lfs_ledger_store_path = "/data/stellar/ledger-store"
+
+# Ledger range to process. Set to 0 to auto-detect from the store.
+# lfs_start_ledger = 0
+# lfs_end_ledger = 0
+
+# Number of parallel workers for LFS processing.
+# Default: runtime.NumCPU()
+# lfs_workers = 16
+
+# =============================================================================
+# OUTPUT STORE
+# =============================================================================
+# Directory where the merged RocksDB store with column families will be created.
+# Will be created if it doesn't exist.
+# =============================================================================
+output_path = "/data/stellar/tx_hash_to_ledger_seq_merged"
+
+# =============================================================================
+# BATCH SIZE
+# =============================================================================
+# Number of entries to accumulate before writing a batch.
+# Larger batches = better write throughput, more memory usage.
+# Default: 100000
+# =============================================================================
+batch_size = 100000
+
+
+# =============================================================================
+# ROCKSDB SETTINGS FOR BULK LOAD PHASE
+# =============================================================================
+# These settings are optimized for WRITE THROUGHPUT during the merge.
+# They apply to each column family in the output store.
+# =============================================================================
+[rocksdb]
+
+# -------------------------------------------------------------------------
+# WRITE BUFFER (MEMTABLE) SETTINGS
+# -------------------------------------------------------------------------
+# Note: These apply to EACH column family separately!
+# Total RAM = write_buffer_size_mb x max_write_buffer_number x 16 CFs
+#
+# For 64GB RAM: 128 MB x 4 x 16 = 8 GB (leaves room for OS + other ops)
+# -------------------------------------------------------------------------
+write_buffer_size_mb = 128
+max_write_buffer_number = 4
+
+# -------------------------------------------------------------------------
+# L0 FILE MANAGEMENT (DISABLED FOR BULK LOAD)
+# -------------------------------------------------------------------------
+# Set high to prevent compaction triggers during merge.
+# We'll do one final compaction at the end for optimal file organization.
+# -------------------------------------------------------------------------
+l0_compaction_trigger = 999
+l0_slowdown_writes_trigger = 999
+l0_stop_writes_trigger = 999
+
+# -------------------------------------------------------------------------
+# SST FILE SIZE SETTINGS
+# -------------------------------------------------------------------------
+# target_file_size_mb: Target size for SST files in each column family.
+#
+# For 15B entries (~600 GB total, ~37 GB per CF):
+# - 256 MB files -> ~145 files per CF
+# - Good balance between file count and compaction efficiency
+# -------------------------------------------------------------------------
+target_file_size_mb = 256
+
+# -------------------------------------------------------------------------
+# max_bytes_for_level_base_mb: Maximum total size for L1 per column family.
+#
+# L1 = 2.5 GB, L2 = 25 GB, L3 = 250 GB per CF (10x multiplier)
+#
+# With ~37 GB per CF:
+# - Most data fits in L2/L3
+# - Good for range queries
+# -------------------------------------------------------------------------
+max_bytes_for_level_base_mb = 2560
+
+# -------------------------------------------------------------------------
+# RESOURCE LIMITS
+# -------------------------------------------------------------------------
+# max_background_jobs: Controls flush and compaction parallelism
+# Higher = faster final compaction, more CPU usage
+max_background_jobs = 8
+
+# max_open_files: File handle limit
+# With 16 CFs x ~150 files each = ~2400 files, 10000 is plenty
+max_open_files = 10000
+
+# -------------------------------------------------------------------------
+# BLOOM FILTER
+# -------------------------------------------------------------------------
+# Essential for hash key lookups.
+# 10 bits/key = ~1% false positive rate
+# Memory: 15B keys x 10 bits = ~18.75 GB (loaded on demand per SST)
+bloom_filter_bits_per_key = 10
+
+# -------------------------------------------------------------------------
+# BLOCK CACHE (SMALL FOR BULK LOAD)
+# -------------------------------------------------------------------------
+# During bulk load, we're mostly writing, so small cache is fine.
+# Most RAM goes to MemTables for write buffering.
+block_cache_size_mb = 512
+
+# -------------------------------------------------------------------------
+# WAL (WRITE-AHEAD LOG) - DISABLED FOR BULK LOAD
+# -------------------------------------------------------------------------
+# WAL is disabled for maximum write speed during bulk load.
+# Safe because: if crash, restart from scratch (source data is intact).
+disable_wal = true
+
+
+# =============================================================================
+# ACTIVE STORE SETTINGS (PHASE 2)
+# =============================================================================
+# These settings are used when generating the active store configuration
+# after bulk load completes. The tool writes 'active_store_config.toml'
+# to the output directory with these settings.
+#
+# Use these when reopening the store for real-time ingestion + queries.
+# =============================================================================
+[active_store]
+
+# -------------------------------------------------------------------------
+# WAL (WRITE-AHEAD LOG) - ENABLED FOR ACTIVE USE
+# -------------------------------------------------------------------------
+# MUST be enabled for production use to prevent data loss on crash.
+enable_wal = true
+
+# -------------------------------------------------------------------------
+# L0 COMPACTION TRIGGERS (ACTIVE MODE)
+# -------------------------------------------------------------------------
+# Normal triggers for balanced read/write performance.
+# - l0_compaction_trigger = 4: Compact when 4 L0 files accumulate
+# - l0_slowdown_writes_trigger = 20: Slow writes at 20 L0 files
+# - l0_stop_writes_trigger = 36: Stop writes at 36 L0 files
+# -------------------------------------------------------------------------
+l0_compaction_trigger = 4
+l0_slowdown_writes_trigger = 20
+l0_stop_writes_trigger = 36
+
+# -------------------------------------------------------------------------
+# BLOCK CACHE (LARGE FOR READ PERFORMANCE)
+# -------------------------------------------------------------------------
+# 16 GB block cache for caching frequently accessed SST blocks.
+# Essential for random hash lookups.
+#
+# For 64GB RAM: 16 GB cache + 4 GB MemTables = 20 GB base usage
+# Leaves room for OS cache, bloom filters, and other processes.
+block_cache_size_mb = 16384
+
+# -------------------------------------------------------------------------
+# WRITE BUFFER (MEMTABLE) SETTINGS FOR ACTIVE USE
+# -------------------------------------------------------------------------
+# Smaller than bulk load since write rate is lower.
+# Total RAM = 64 MB x 4 x 16 = 4 GB
+# -------------------------------------------------------------------------
+write_buffer_size_mb = 64
+max_write_buffer_number = 4
+
+
+# =============================================================================
+# USAGE EXAMPLES
+# =============================================================================
+#
+# 1. Dry run (validate config and count entries without writing):
+#    ./tx-hash-cf-merger --config config.toml --dry-run
+#
+# 2. Full merge from existing RocksDB stores:
+#    ./tx-hash-cf-merger --config config.toml
+#
+# 3. Merge with larger batch size:
+#    ./tx-hash-cf-merger --config config.toml --batch-size 500000
+#
+# 4. LFS mode with custom workers and log files:
+#    ./tx-hash-cf-merger --config config.toml \
+#        --lfs-workers 16 \
+#        --log-file /var/log/merger.log \
+#        --error-file /var/log/merger.err
+#
+# 5. After merge completes, use the generated config for active use:
+#    Use settings from: <output_path>/active_store_config.toml
+#
+# =============================================================================
