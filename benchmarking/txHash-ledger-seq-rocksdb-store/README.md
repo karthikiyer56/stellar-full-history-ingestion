@@ -12,6 +12,15 @@ measuring latency and throughput. Use it to:
 - Measure cache effectiveness
 - Identify performance bottlenecks
 
+## Features
+
+- **Store Statistics Display**: Shows comprehensive store stats before benchmark (SST files, WAL files, per-CF level breakdown)
+- **Progress Logging**: Updates every 1% with running statistics
+- **Separate Tracking**: Found, NotFound, and Error cases tracked separately
+- **Detailed Statistics**: Min, max, avg, stddev, and percentiles (p50, p75, p90, p95, p99)
+- **Latency Histogram**: Visual breakdown of latency distribution
+- **Log File Support**: Separate log and error file outputs
+
 ## Usage
 
 ### Basic Benchmark
@@ -19,8 +28,7 @@ measuring latency and throughput. Use it to:
 ```bash
 tx-hash-store-benchmark \
   --store /data/tx-hash-store \
-  --hashes /data/sample-hashes.txt \
-  --count 10000
+  --hashes /data/sample-hashes.txt
 ```
 
 ### With Custom Settings
@@ -29,10 +37,9 @@ tx-hash-store-benchmark \
 tx-hash-store-benchmark \
   --store /data/tx-hash-store \
   --hashes /data/sample-hashes.txt \
-  --count 100000 \
-  --warmup 1000 \
   --block-cache 2048 \
-  --randomize=true
+  --log-file benchmark.log \
+  --error-file benchmark.err
 ```
 
 ## Options
@@ -41,11 +48,9 @@ tx-hash-store-benchmark \
 |------|-------------|---------|
 | `--store` | Path to RocksDB store | (required) |
 | `--hashes` | Path to file with hex tx hashes | (required) |
-| `--count` | Number of lookups to perform | 10000 |
-| `--warmup` | Number of warmup lookups (not counted) | 100 |
 | `--block-cache` | Block cache size in MB | 512 |
-| `--randomize` | Randomize hash order for lookups | true |
-| `--percentiles` | Show latency percentiles | true |
+| `--log-file` | Output file for logs | stdout |
+| `--error-file` | Output file for errors | stdout |
 | `--help` | Show help message | |
 
 ## Hash File Format
@@ -69,34 +74,86 @@ rocksdb_ldb --db=/data/tx-hash-store scan --column_family=0 | \
 
 ## Output
 
+The benchmark outputs store statistics followed by benchmark results:
+
+### Store Statistics
+
 ```
 ================================================================================
-                         BENCHMARK RESULTS
+                          STORE STATISTICS
 ================================================================================
 
-Store:           /data/tx-hash-store
-Lookups:         10000
-Found:           9987 (99.87%)
-Not Found:       13 (0.13%)
+STORAGE OVERVIEW:
+  Total SST Files Size:  45.23 GB
+  Live SST Files Size:   44.89 GB
+  Est. Live Data Size:   44.50 GB
+  Memtable Size:         128 MB
 
-LATENCY:
-  Min:           1.23us
-  Max:           15.67ms
-  Avg:           45.23us
-  Median:        32.11us
+FILE COUNTS (Filesystem):
+  SST Files:             1,234
+  WAL Files:             2 (256 MB)
 
-PERCENTILES:
-  p50:           32.11us
-  p75:           48.67us
-  p90:           78.34us
-  p95:           125.89us
-  p99:           456.78us
+COLUMN FAMILY SUMMARY:
+  Total CFs:             16
+  Total Estimated Keys:  2,500,000,000
+  Total CF Size:         45.23 GB
+  Total CF Files:        1,234
 
-THROUGHPUT:
-  Total Time:    1.23s
-  Queries/sec:   8130.08
+COLUMN FAMILY DETAILS (Per-CF Level Breakdown):
+
+  CF   Est. Keys       Size        L0    L1    L2    L3    L4    L5    L6
+  ─────────────────────────────────────────────────────────────────────────
+  0    156,250,000     2.83 GB      2     -     4    12    45     -     -
+  1    156,250,000     2.83 GB      1     -     3    11    42     -     -
+  ...
+  ─────────────────────────────────────────────────────────────────────────
+  TOT  2,500,000,000  45.23 GB     32     -    64   192   720     -     -
 
 ================================================================================
+```
+
+### Benchmark Results
+
+```
+================================================================================
+                           BENCHMARK COMPLETE
+================================================================================
+
+SUMMARY:
+  Total Time:      1.23s
+  Total Lookups:   10,000
+  Found:           9,987 (99.87%)
+  Not Found:       13 (0.13%)
+  Errors:          0 (0.00%)
+  Throughput:      8,130.08 lookups/sec
+
+================================================================================
+                        FOUND LATENCY STATISTICS
+================================================================================
+  Count:     9,987
+  Min:       1.23us
+  Max:       15.67ms
+  Avg:       45.23us
+  Std Dev:   12.34us
+
+  Percentiles:
+    p50:     32.11us
+    p75:     48.67us
+    p90:     78.34us
+    p95:     125.89us
+    p99:     456.78us
+
+================================================================================
+                        COMBINED LATENCY HISTOGRAM
+================================================================================
+  0-10us:      1,234 (12.3%)
+  10-25us:     2,345 (23.5%)
+  25-50us:     3,456 (34.6%)
+  50-100us:    2,345 (23.5%)
+  100-250us:   456 (4.6%)
+  250-500us:   123 (1.2%)
+  500us-1ms:   28 (0.3%)
+  1ms+:        0 (0.0%)
 ```
 
 ## Metrics Explained
@@ -105,7 +162,7 @@ THROUGHPUT:
 
 - **Min/Max**: Extremes (max often indicates cache misses)
 - **Avg**: Mean latency across all lookups
-- **Median**: 50th percentile (better for skewed distributions)
+- **Std Dev**: Standard deviation (measure of variability)
 
 ### Percentiles
 
@@ -133,39 +190,14 @@ THROUGHPUT:
 | Low throughput | Store not compacted, too many levels |
 | High "Not Found" | Wrong hash format, or hashes from different store |
 | Increasing latency | Block cache thrashing |
-
-## Cache Warming
-
-The `--warmup` option performs initial lookups that are not counted in statistics.
-This simulates a "warm" cache scenario.
-
-```bash
-# Test cold cache performance
-tx-hash-store-benchmark --store /data/store --hashes hashes.txt --warmup 0
-
-# Test warm cache performance
-tx-hash-store-benchmark --store /data/store --hashes hashes.txt --warmup 10000
-```
-
-## Randomization
-
-By default, hashes are randomized before lookup. This simulates real-world access
-patterns where lookups are not sequential.
-
-```bash
-# Sequential access (best-case for caching)
-tx-hash-store-benchmark --store /data/store --hashes hashes.txt --randomize=false
-
-# Random access (realistic)
-tx-hash-store-benchmark --store /data/store --hashes hashes.txt --randomize=true
-```
+| Many files at L0 | Need compaction |
 
 ## Block Cache Tuning
 
 The block cache significantly affects read performance. Test different sizes:
 
 ```bash
-# Small cache (512 MB)
+# Small cache (512 MB - default)
 tx-hash-store-benchmark --store /data/store --hashes hashes.txt --block-cache 512
 
 # Large cache (4 GB)

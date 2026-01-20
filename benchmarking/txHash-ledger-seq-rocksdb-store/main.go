@@ -7,6 +7,7 @@
 // up in the store, measuring latency and throughput.
 //
 // Features:
+// - Store statistics display before benchmark (SST files, WAL files, per-CF stats)
 // - Progress logging every 1% with running statistics
 // - Separate tracking for Found, NotFound, and Error cases
 // - Detailed latency statistics (min, max, avg, stddev, percentiles)
@@ -24,9 +25,9 @@
 //   ./tx-hash-store-benchmark --store /data/store --hashes hashes.txt \
 //       --log-file benchmark.log --error-file benchmark.err
 //
-// With custom block cache and warmup:
+// With custom block cache:
 //   ./tx-hash-store-benchmark --store /data/store --hashes hashes.txt \
-//       --block-cache 2048 --warmup 500
+//       --block-cache 2048
 //
 // =============================================================================
 
@@ -56,7 +57,6 @@ import (
 
 const (
 	MB                    = 1024 * 1024
-	DefaultWarmup         = 100
 	DefaultBlockCache     = 512
 	BloomFilterBitsPerKey = 12 // Must match ingestion setting for optimal performance
 )
@@ -608,6 +608,231 @@ func getCFName(txHash []byte) string {
 }
 
 // =============================================================================
+// Store Statistics
+// =============================================================================
+
+// CFLevelStats holds per-level statistics for a column family
+type CFLevelStats struct {
+	FileCount int64
+	Size      int64
+}
+
+// CFStats holds statistics for a single column family
+type CFStats struct {
+	Name          string
+	EstimatedKeys int64
+	TotalSize     int64
+	TotalFiles    int64
+	LevelStats    [7]CFLevelStats // L0-L6
+}
+
+// getPropertyInt parses an integer property from the database
+func getPropertyInt(db *grocksdb.DB, property string) int64 {
+	value := db.GetProperty(property)
+	if value == "" {
+		return 0
+	}
+	var result int64
+	fmt.Sscanf(value, "%d", &result)
+	return result
+}
+
+// getPropertyIntCF parses an integer property for a column family
+func getPropertyIntCF(db *grocksdb.DB, property string, cf *grocksdb.ColumnFamilyHandle) int64 {
+	value := db.GetPropertyCF(property, cf)
+	if value == "" {
+		return 0
+	}
+	var result int64
+	fmt.Sscanf(value, "%d", &result)
+	return result
+}
+
+// countFilesInStore counts SST and WAL files in the store directory
+func countFilesInStore(storePath string) (sstCount int, walCount int, walBytes int64, err error) {
+	entries, err := os.ReadDir(storePath)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+
+		if strings.HasSuffix(name, ".sst") {
+			sstCount++
+		} else if strings.HasSuffix(name, ".log") {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			walCount++
+			walBytes += info.Size()
+		}
+	}
+
+	return sstCount, walCount, walBytes, nil
+}
+
+// getCFStats retrieves statistics for a column family using GetColumnFamilyMetadataCF
+func getCFStats(db *grocksdb.DB, cfHandle *grocksdb.ColumnFamilyHandle, cfName string) CFStats {
+	stats := CFStats{
+		Name: cfName,
+	}
+
+	// Get estimated keys
+	stats.EstimatedKeys = getPropertyIntCF(db, "rocksdb.estimate-num-keys", cfHandle)
+
+	// Get column family metadata for per-level breakdown
+	cfMeta := db.GetColumnFamilyMetadataCF(cfHandle)
+	if cfMeta != nil {
+		stats.TotalSize = int64(cfMeta.Size())
+		stats.TotalFiles = int64(cfMeta.FileCount())
+
+		levelMetas := cfMeta.LevelMetas()
+		for _, levelMeta := range levelMetas {
+			level := levelMeta.Level()
+			if level >= 0 && level < 7 {
+				sstMetas := levelMeta.SstMetas()
+				stats.LevelStats[level] = CFLevelStats{
+					FileCount: int64(len(sstMetas)),
+					Size:      int64(levelMeta.Size()),
+				}
+			}
+		}
+	}
+
+	return stats
+}
+
+// printStoreStats prints comprehensive store statistics before the benchmark
+func printStoreStats(store *Store, storePath string, logger *BenchmarkLogger) {
+	logger.Info("================================================================================")
+	logger.Info("                          STORE STATISTICS")
+	logger.Info("================================================================================")
+	logger.Info("")
+
+	// Storage overview from global properties
+	logger.Info("STORAGE OVERVIEW:")
+	totalSSTSize := getPropertyInt(store.db, "rocksdb.total-sst-files-size")
+	liveSSTSize := getPropertyInt(store.db, "rocksdb.live-sst-files-size")
+	liveDataSize := getPropertyInt(store.db, "rocksdb.estimate-live-data-size")
+	memtableSize := getPropertyInt(store.db, "rocksdb.cur-size-all-mem-tables")
+
+	logger.Info("  Total SST Files Size:  %s", helpers.FormatBytes(totalSSTSize))
+	if liveSSTSize > 0 {
+		logger.Info("  Live SST Files Size:   %s", helpers.FormatBytes(liveSSTSize))
+	}
+	if liveDataSize > 0 {
+		logger.Info("  Est. Live Data Size:   %s", helpers.FormatBytes(liveDataSize))
+	}
+	if memtableSize > 0 {
+		logger.Info("  Memtable Size:         %s", helpers.FormatBytes(memtableSize))
+	}
+	logger.Info("")
+
+	// File counts from filesystem
+	logger.Info("FILE COUNTS (Filesystem):")
+	sstCount, walCount, walBytes, err := countFilesInStore(storePath)
+	if err != nil {
+		logger.Info("  (Could not read directory: %v)", err)
+	} else {
+		logger.Info("  SST Files:             %s", helpers.FormatNumber(int64(sstCount)))
+		if walCount > 0 {
+			logger.Info("  WAL Files:             %s (%s)", helpers.FormatNumber(int64(walCount)), helpers.FormatBytes(walBytes))
+		} else {
+			logger.Info("  WAL Files:             0")
+		}
+	}
+	logger.Info("")
+
+	// Collect per-CF statistics
+	cfStatsList := make([]CFStats, 0, len(ColumnFamilyNames))
+	var totalEstKeys int64
+	var totalCFSize int64
+	var totalCFFiles int64
+	var levelTotals [7]CFLevelStats
+
+	for _, cfName := range ColumnFamilyNames {
+		idx := store.cfIndexMap[cfName]
+		cfHandle := store.cfHandles[idx]
+		cfStats := getCFStats(store.db, cfHandle, cfName)
+		cfStatsList = append(cfStatsList, cfStats)
+
+		totalEstKeys += cfStats.EstimatedKeys
+		totalCFSize += cfStats.TotalSize
+		totalCFFiles += cfStats.TotalFiles
+
+		for level := 0; level < 7; level++ {
+			levelTotals[level].FileCount += cfStats.LevelStats[level].FileCount
+			levelTotals[level].Size += cfStats.LevelStats[level].Size
+		}
+	}
+
+	// Column family summary
+	logger.Info("COLUMN FAMILY SUMMARY:")
+	logger.Info("  Total CFs:             16")
+	logger.Info("  Total Estimated Keys:  %s", helpers.FormatNumber(totalEstKeys))
+	logger.Info("  Total CF Size:         %s", helpers.FormatBytes(totalCFSize))
+	logger.Info("  Total CF Files:        %s", helpers.FormatNumber(totalCFFiles))
+	logger.Info("")
+
+	// Per-CF level breakdown table
+	logger.Info("COLUMN FAMILY DETAILS (Per-CF Level Breakdown):")
+	logger.Info("")
+
+	// Table header
+	logger.Info("  CF   Est. Keys       Size        L0    L1    L2    L3    L4    L5    L6")
+	logger.Info("  ─────────────────────────────────────────────────────────────────────────")
+
+	for _, cfStats := range cfStatsList {
+		// Format level file counts
+		l0 := formatLevelCount(cfStats.LevelStats[0].FileCount)
+		l1 := formatLevelCount(cfStats.LevelStats[1].FileCount)
+		l2 := formatLevelCount(cfStats.LevelStats[2].FileCount)
+		l3 := formatLevelCount(cfStats.LevelStats[3].FileCount)
+		l4 := formatLevelCount(cfStats.LevelStats[4].FileCount)
+		l5 := formatLevelCount(cfStats.LevelStats[5].FileCount)
+		l6 := formatLevelCount(cfStats.LevelStats[6].FileCount)
+
+		logger.Info("  %-4s %13s %11s  %5s %5s %5s %5s %5s %5s %5s",
+			cfStats.Name,
+			helpers.FormatNumber(cfStats.EstimatedKeys),
+			helpers.FormatBytes(cfStats.TotalSize),
+			l0, l1, l2, l3, l4, l5, l6)
+	}
+
+	// Table footer with totals
+	logger.Info("  ─────────────────────────────────────────────────────────────────────────")
+	logger.Info("  %-4s %13s %11s  %5s %5s %5s %5s %5s %5s %5s",
+		"TOT",
+		helpers.FormatNumber(totalEstKeys),
+		helpers.FormatBytes(totalCFSize),
+		formatLevelCount(levelTotals[0].FileCount),
+		formatLevelCount(levelTotals[1].FileCount),
+		formatLevelCount(levelTotals[2].FileCount),
+		formatLevelCount(levelTotals[3].FileCount),
+		formatLevelCount(levelTotals[4].FileCount),
+		formatLevelCount(levelTotals[5].FileCount),
+		formatLevelCount(levelTotals[6].FileCount))
+
+	logger.Info("")
+	logger.Info("================================================================================")
+	logger.Info("")
+}
+
+// formatLevelCount formats a level file count for the table
+func formatLevelCount(count int64) string {
+	if count == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", count)
+}
+
+// =============================================================================
 // Hash Loading
 // =============================================================================
 
@@ -772,7 +997,7 @@ func errorCollector(
 // Main Benchmark Function
 // =============================================================================
 
-func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, logger *BenchmarkLogger) error {
+func runBenchmark(storePath, hashesFile string, blockCacheMB int, logger *BenchmarkLogger) error {
 	logger.Info("")
 	logger.Info("################################################################################")
 	logger.Info("          TX HASH -> LEDGER SEQUENCE ROCKSDB STORE BENCHMARK")
@@ -797,24 +1022,11 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 		return fmt.Errorf("input file contains no valid hashes")
 	}
 
-	// Adjust warmup if needed
-	if warmupCount >= totalHashes {
-		warmupCount = totalHashes / 10 // Use 10% for warmup if count is too high
-		if warmupCount < 1 {
-			warmupCount = 0
-		}
-		logger.Info("Adjusted warmup to %d (input file too small for requested warmup)", warmupCount)
-	}
-
-	benchmarkCount := totalHashes - warmupCount
-
 	// Print configuration
 	logger.Info("CONFIGURATION:")
 	logger.Info("  Store Path:      %s", storePath)
 	logger.Info("  Hashes File:     %s", hashesFile)
-	logger.Info("  Total Hashes:    %s", helpers.FormatNumber(int64(totalHashes)))
-	logger.Info("  Warmup Lookups:  %s", helpers.FormatNumber(int64(warmupCount)))
-	logger.Info("  Benchmark Lookups: %s", helpers.FormatNumber(int64(benchmarkCount)))
+	logger.Info("  Total Lookups:   %s", helpers.FormatNumber(int64(totalHashes)))
 	logger.Info("  Block Cache:     %d MB", blockCacheMB)
 	logger.Info("")
 
@@ -831,28 +1043,11 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 	logger.Info("Store opened successfully in %s", helpers.FormatDuration(storeOpenElapsed))
 	logger.Info("")
 
-	// Warmup phase
-	if warmupCount > 0 {
-		logger.Info("================================================================================")
-		logger.Info("                          WARMUP PHASE")
-		logger.Info("================================================================================")
-		logger.Info("Performing %s warmup lookups...", helpers.FormatNumber(int64(warmupCount)))
-		logger.Sync()
-
-		warmupStart := time.Now()
-		for i := 0; i < warmupCount; i++ {
-			store.Get(hashes[i])
-		}
-		warmupElapsed := time.Since(warmupStart)
-
-		logger.Info("Warmup complete in %s (%.2f lookups/sec)",
-			helpers.FormatDuration(warmupElapsed),
-			float64(warmupCount)/warmupElapsed.Seconds())
-		logger.Info("")
-	}
+	// Print store statistics before benchmark
+	printStoreStats(store, storePath, logger)
 
 	// Initialize stats
-	stats := NewAggregatedStats(benchmarkCount)
+	stats := NewAggregatedStats(totalHashes)
 
 	// Create channels
 	progressChan := make(chan int, 1000)
@@ -864,7 +1059,7 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 	startTime := time.Now()
 
 	// Start progress reporter
-	go progressReporter(logger, stats, benchmarkCount, progressChan, progressDone, startTime)
+	go progressReporter(logger, stats, totalHashes, progressChan, progressDone, startTime)
 
 	// Start error collector
 	go errorCollector(logger, errorChan, errorDone)
@@ -875,7 +1070,7 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 	logger.Info("================================================================================")
 	logger.Info("")
 
-	for i := warmupCount; i < totalHashes; i++ {
+	for i := 0; i < totalHashes; i++ {
 		hash := hashes[i]
 
 		start := time.Now()
@@ -1023,7 +1218,6 @@ func main() {
 	var (
 		storePath    string
 		hashesFile   string
-		warmupCount  int
 		blockCacheMB int
 		logFile      string
 		errorFile    string
@@ -1032,7 +1226,6 @@ func main() {
 
 	flag.StringVar(&storePath, "store", "", "Path to RocksDB store (required)")
 	flag.StringVar(&hashesFile, "hashes", "", "Path to file with hex tx hashes (required)")
-	flag.IntVar(&warmupCount, "warmup", DefaultWarmup, "Number of warmup lookups")
 	flag.IntVar(&blockCacheMB, "block-cache", DefaultBlockCache, "Block cache size in MB")
 	flag.StringVar(&logFile, "log-file", "", "Output file for logs (default: stdout)")
 	flag.StringVar(&errorFile, "error-file", "", "Output file for errors (default: stdout)")
@@ -1076,7 +1269,7 @@ func main() {
 	defer logger.Close()
 
 	// Run benchmark
-	if err := runBenchmark(absStorePath, absHashesFile, warmupCount, blockCacheMB, logger); err != nil {
+	if err := runBenchmark(absStorePath, absHashesFile, blockCacheMB, logger); err != nil {
 		logger.Error("Benchmark failed: %v", err)
 		os.Exit(1)
 	}
@@ -1096,11 +1289,16 @@ func printUsage() {
 	fmt.Println("  --store PATH          Path to RocksDB store (required)")
 	fmt.Println("  --hashes FILE         Path to file with hex tx hashes (required)")
 	fmt.Println("                        All hashes in the file will be looked up")
-	fmt.Println("  --warmup N            Number of warmup lookups (default: 100)")
 	fmt.Println("  --block-cache N       Block cache size in MB (default: 512)")
 	fmt.Println("  --log-file FILE       Output file for logs (default: stdout)")
 	fmt.Println("  --error-file FILE     Output file for errors (default: stdout)")
 	fmt.Println("  --help                Show this help message")
+	fmt.Println()
+	fmt.Println("FEATURES:")
+	fmt.Println("  - Displays store statistics before benchmark (SST files, WAL files, per-CF stats)")
+	fmt.Println("  - Progress logging every 1% with running statistics")
+	fmt.Println("  - Separate tracking for Found, NotFound, and Error cases")
+	fmt.Println("  - Detailed latency statistics with percentiles and histogram")
 	fmt.Println()
 	fmt.Println("HASHES FILE FORMAT:")
 	fmt.Println("  One 64-character hex transaction hash per line:")
