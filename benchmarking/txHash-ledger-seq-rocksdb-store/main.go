@@ -378,15 +378,21 @@ func computeHistogram(samples []float64) []HistogramBucket {
 
 // BenchmarkLogger handles logging to file or stdout
 type BenchmarkLogger struct {
-	infoLogger  *log.Logger
-	errorLogger *log.Logger
-	logFile     *os.File
-	errorFile   *os.File
+	infoLogger   *log.Logger
+	errorLogger  *log.Logger
+	logFile      *os.File
+	errorFile    *os.File
+	logToFile    bool
+	errorToFile  bool
+	logCount     int
+	syncInterval int // sync every N log calls
 }
 
 // NewBenchmarkLogger creates a new logger with optional file outputs
 func NewBenchmarkLogger(logPath, errorPath string) (*BenchmarkLogger, error) {
-	bl := &BenchmarkLogger{}
+	bl := &BenchmarkLogger{
+		syncInterval: 10, // sync every 10 log calls
+	}
 
 	// Setup info logger
 	if logPath != "" {
@@ -395,6 +401,7 @@ func NewBenchmarkLogger(logPath, errorPath string) (*BenchmarkLogger, error) {
 			return nil, fmt.Errorf("failed to create log file: %w", err)
 		}
 		bl.logFile = f
+		bl.logToFile = true
 		bl.infoLogger = log.New(f, "", log.LstdFlags)
 	} else {
 		bl.infoLogger = log.New(os.Stdout, "", log.LstdFlags)
@@ -410,6 +417,7 @@ func NewBenchmarkLogger(logPath, errorPath string) (*BenchmarkLogger, error) {
 			return nil, fmt.Errorf("failed to create error file: %w", err)
 		}
 		bl.errorFile = f
+		bl.errorToFile = true
 		bl.errorLogger = log.New(f, "", log.LstdFlags)
 	} else {
 		bl.errorLogger = log.New(os.Stdout, "", log.LstdFlags)
@@ -421,11 +429,31 @@ func NewBenchmarkLogger(logPath, errorPath string) (*BenchmarkLogger, error) {
 // Info logs an info message
 func (bl *BenchmarkLogger) Info(format string, v ...interface{}) {
 	bl.infoLogger.Printf(format, v...)
+	if bl.logToFile && bl.logFile != nil {
+		bl.logCount++
+		if bl.logCount >= bl.syncInterval {
+			bl.logFile.Sync()
+			bl.logCount = 0
+		}
+	}
 }
 
 // Error logs an error message
 func (bl *BenchmarkLogger) Error(format string, v ...interface{}) {
 	bl.errorLogger.Printf(format, v...)
+	if bl.errorToFile && bl.errorFile != nil {
+		bl.errorFile.Sync() // Always sync errors immediately
+	}
+}
+
+// Sync forces a sync of log files
+func (bl *BenchmarkLogger) Sync() {
+	if bl.logToFile && bl.logFile != nil {
+		bl.logFile.Sync()
+	}
+	if bl.errorToFile && bl.errorFile != nil {
+		bl.errorFile.Sync()
+	}
 }
 
 // Close closes any open file handles
@@ -749,13 +777,16 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 
 	// Load hashes
 	logger.Info("Loading hashes from: %s", hashesFile)
+	logger.Sync()
+	hashLoadStart := time.Now()
 	hashes, err := loadHashes(hashesFile)
 	if err != nil {
 		return fmt.Errorf("failed to load hashes: %w", err)
 	}
+	hashLoadElapsed := time.Since(hashLoadStart)
 
 	totalHashes := len(hashes)
-	logger.Info("Loaded %s hashes", helpers.FormatNumber(int64(totalHashes)))
+	logger.Info("Loaded %s hashes in %s", helpers.FormatNumber(int64(totalHashes)), helpers.FormatDuration(hashLoadElapsed))
 	logger.Info("")
 
 	if totalHashes == 0 {
@@ -785,12 +816,15 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 
 	// Open store
 	logger.Info("Opening store...")
+	logger.Sync()
+	storeOpenStart := time.Now()
 	store, err := openStore(storePath, blockCacheMB)
 	if err != nil {
 		return fmt.Errorf("failed to open store: %w", err)
 	}
 	defer store.Close()
-	logger.Info("Store opened successfully")
+	storeOpenElapsed := time.Since(storeOpenStart)
+	logger.Info("Store opened successfully in %s", helpers.FormatDuration(storeOpenElapsed))
 	logger.Info("")
 
 	// Warmup phase
@@ -799,6 +833,7 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 		logger.Info("                          WARMUP PHASE")
 		logger.Info("================================================================================")
 		logger.Info("Performing %s warmup lookups...", helpers.FormatNumber(int64(warmupCount)))
+		logger.Sync()
 
 		warmupStart := time.Now()
 		for i := 0; i < warmupCount; i++ {
