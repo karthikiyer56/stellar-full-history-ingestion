@@ -208,6 +208,18 @@ func main() {
 	totalTime := time.Since(startTime)
 
 	// =========================================================================
+	// Flush All Column Families
+	// =========================================================================
+	logger.Info("")
+	logger.Info("Flushing all column families to SST files...")
+	flushStart := time.Now()
+	if err := outputStore.FlushAll(); err != nil {
+		logger.Error("Failed to flush store: %v", err)
+		os.Exit(1)
+	}
+	logger.Info("Flush complete in %s", helpers.FormatDuration(time.Since(flushStart)))
+
+	// =========================================================================
 	// Final Summary
 	// =========================================================================
 	stats.LogSummary(logger, totalTime)

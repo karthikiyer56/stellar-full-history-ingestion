@@ -19,8 +19,8 @@
 // Dry run (show stats without flushing):
 //   flush-store --store /path/to/rocksdb/store --dry-run
 //
-// With verbose output and custom workers:
-//   flush-store --store /path/to/rocksdb/store --verbose --workers 8
+// With more background jobs for faster flush:
+//   flush-store --store /path/to/rocksdb/store --max-background-jobs 32
 //
 // =============================================================================
 
@@ -33,7 +33,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
@@ -42,10 +41,10 @@ import (
 )
 
 const (
-	MB                  = 1024 * 1024
-	DefaultBlockCacheMB = 64
-	DefaultWorkers      = 16
-	EntrySize           = 36 // 32-byte key + 4-byte value
+	MB                       = 1024 * 1024
+	DefaultBlockCacheMB      = 64
+	DefaultMaxBackgroundJobs = 16
+	EntrySize                = 36 // 32-byte key + 4-byte value
 )
 
 // FileInfo holds information about a file
@@ -54,30 +53,23 @@ type FileInfo struct {
 	Size int64
 }
 
-// FlushResult holds the result of flushing a single CF
-type FlushResult struct {
-	CFName   string
-	Duration time.Duration
-	Error    error
-}
-
 func main() {
 	var (
-		storePath    string
-		blockCacheMB int
-		workers      int
-		logFile      string
-		dryRun       bool
-		verbose      bool
-		showHelp     bool
+		storePath         string
+		blockCacheMB      int
+		maxBackgroundJobs int
+		logFile           string
+		dryRun            bool
+		verbose           bool
+		showHelp          bool
 	)
 
 	flag.StringVar(&storePath, "store", "", "Path to existing RocksDB store (required)")
 	flag.IntVar(&blockCacheMB, "block-cache", DefaultBlockCacheMB, "Block cache size in MB")
-	flag.IntVar(&workers, "workers", DefaultWorkers, "Number of parallel flush workers")
+	flag.IntVar(&maxBackgroundJobs, "max-background-jobs", DefaultMaxBackgroundJobs, "Max background jobs for RocksDB flush")
 	flag.StringVar(&logFile, "log-file", "", "Output file for logs (default: stdout)")
 	flag.BoolVar(&dryRun, "dry-run", false, "Show stats without flushing")
-	flag.BoolVar(&verbose, "verbose", false, "Show per-CF flush details")
+	flag.BoolVar(&verbose, "verbose", false, "Show detailed flush progress")
 	flag.BoolVar(&showHelp, "help", false, "Show help message")
 
 	flag.Parse()
@@ -106,12 +98,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate workers
-	if workers < 1 {
-		workers = 1
+	// Validate max background jobs
+	if maxBackgroundJobs < 1 {
+		maxBackgroundJobs = 1
 	}
-	if workers > 16 {
-		workers = 16
+	if maxBackgroundJobs > 64 {
+		maxBackgroundJobs = 64
 	}
 
 	// Setup logger
@@ -132,7 +124,7 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		if err := runFlush(logger, absStorePath, blockCacheMB, workers, verbose); err != nil {
+		if err := runFlush(logger, absStorePath, blockCacheMB, maxBackgroundJobs, verbose); err != nil {
 			logger.Error("Flush failed: %v", err)
 			os.Exit(1)
 		}
@@ -205,7 +197,7 @@ func runDryRun(logger *txhashrework.Logger, storePath string) error {
 // Flush
 // =============================================================================
 
-func runFlush(logger *txhashrework.Logger, storePath string, blockCacheMB, workers int, verbose bool) error {
+func runFlush(logger *txhashrework.Logger, storePath string, blockCacheMB, maxBackgroundJobs int, verbose bool) error {
 	totalStart := time.Now()
 
 	logger.Info("")
@@ -213,10 +205,9 @@ func runFlush(logger *txhashrework.Logger, storePath string, blockCacheMB, worke
 	logger.Info("                         FLUSH STORE UTILITY")
 	logger.Info("================================================================================")
 	logger.Info("")
-	logger.Info("Store Path:    %s", storePath)
-	logger.Info("Block Cache:   %d MB", blockCacheMB)
-	logger.Info("Workers:       %d", workers)
-	logger.Info("Verbose:       %v", verbose)
+	logger.Info("Store Path:          %s", storePath)
+	logger.Info("Block Cache:         %d MB", blockCacheMB)
+	logger.Info("Max Background Jobs: %d", maxBackgroundJobs)
 	logger.Info("")
 
 	// Count files before
@@ -242,7 +233,7 @@ func runFlush(logger *txhashrework.Logger, storePath string, blockCacheMB, worke
 	// Open store
 	logger.Info("Opening store (this may take a while if WAL replay is needed)...")
 	openStart := time.Now()
-	store, err := openStoreForFlush(storePath, blockCacheMB, logger)
+	store, err := openStoreForFlush(storePath, blockCacheMB, maxBackgroundJobs, logger)
 	openDuration := time.Since(openStart)
 	if err != nil {
 		return fmt.Errorf("failed to open store: %w", err)
@@ -252,31 +243,22 @@ func runFlush(logger *txhashrework.Logger, storePath string, blockCacheMB, worke
 	logger.Info("Store opened in %s", helpers.FormatDuration(openDuration))
 	logger.Info("")
 
-	// Flush all CFs in parallel
-	logger.Info("Flushing all column families with %d workers...", workers)
+	// Flush all CFs
+	logger.Info("Flushing all 16 column families...")
+	if verbose {
+		logger.Info("  (RocksDB will parallelize internally using %d background jobs)", maxBackgroundJobs)
+	}
 	logger.Info("")
 
 	flushStart := time.Now()
-	results := flushAllParallel(store, workers, verbose, logger)
+	err = flushAll(store, verbose, logger)
 	flushDuration := time.Since(flushStart)
 
-	// Check for errors
-	var flushErrors []string
-	for _, r := range results {
-		if r.Error != nil {
-			flushErrors = append(flushErrors, fmt.Sprintf("CF %s: %v", r.CFName, r.Error))
-		}
+	if err != nil {
+		return fmt.Errorf("flush failed: %w", err)
 	}
 
-	if len(flushErrors) > 0 {
-		logger.Error("Flush errors:")
-		for _, e := range flushErrors {
-			logger.Error("  %s", e)
-		}
-		return fmt.Errorf("%d column families failed to flush", len(flushErrors))
-	}
-
-	logger.Info("Total flush time: %s", helpers.FormatDuration(flushDuration))
+	logger.Info("Flush complete in %s", helpers.FormatDuration(flushDuration))
 	logger.Info("")
 
 	// Close store
@@ -320,75 +302,39 @@ func runFlush(logger *txhashrework.Logger, storePath string, blockCacheMB, worke
 }
 
 // =============================================================================
-// Parallel Flush
+// Flush
 // =============================================================================
 
-func flushAllParallel(store *FlushStore, workers int, verbose bool, logger *txhashrework.Logger) []FlushResult {
+func flushAll(store *FlushStore, verbose bool, logger *txhashrework.Logger) error {
 	cfNames := txhashrework.ColumnFamilyNames // 16 CFs: 0-9, a-f
 
-	results := make([]FlushResult, len(cfNames))
-	resultsMu := sync.Mutex{}
-
-	// Create work channel
-	work := make(chan int, len(cfNames))
+	// Collect all CF handles (skip index 0 which is "default")
+	cfHandles := make([]*grocksdb.ColumnFamilyHandle, len(cfNames))
 	for i := range cfNames {
-		work <- i
+		cfHandles[i] = store.CFHandles[i+1] // +1 because index 0 is "default"
 	}
-	close(work)
 
 	// Create flush options
 	flushOpts := grocksdb.NewDefaultFlushOptions()
 	flushOpts.SetWait(true)
 	defer flushOpts.Destroy()
 
-	// Start workers
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range work {
-				cfName := cfNames[i]
-				cfHandle := store.CFHandles[i+1] // +1 because index 0 is "default"
-
-				start := time.Now()
-				err := store.DB.FlushCF(cfHandle, flushOpts)
-				duration := time.Since(start)
-
-				result := FlushResult{
-					CFName:   cfName,
-					Duration: duration,
-					Error:    err,
-				}
-
-				resultsMu.Lock()
-				results[i] = result
-				resultsMu.Unlock()
-
-				if verbose {
-					if err != nil {
-						logger.Error("  CF %s: FAILED in %s - %v", cfName, helpers.FormatDuration(duration), err)
-					} else {
-						logger.Info("  CF %s: flushed in %s", cfName, helpers.FormatDuration(duration))
-					}
-				}
-			}
-		}()
+	if verbose {
+		logger.Info("  Calling FlushCFs for all %d column families...", len(cfNames))
 	}
 
-	wg.Wait()
+	// Flush all CFs in one call - RocksDB handles parallelization internally
+	err := store.DB.FlushCFs(cfHandles, flushOpts)
 
-	// If not verbose, show summary
-	if !verbose {
-		var totalCFTime time.Duration
-		for _, r := range results {
-			totalCFTime += r.Duration
+	if verbose {
+		if err != nil {
+			logger.Error("  FlushCFs failed: %v", err)
+		} else {
+			logger.Info("  FlushCFs completed successfully")
 		}
-		logger.Info("  All 16 CFs flushed (total CF time: %s, wall time with %d workers)",
-			helpers.FormatDuration(totalCFTime), workers)
 	}
 
-	return results
+	return err
 }
 
 // =============================================================================
@@ -403,7 +349,7 @@ type FlushStore struct {
 	BlockCache *grocksdb.Cache
 }
 
-func openStoreForFlush(path string, blockCacheMB int, logger *txhashrework.Logger) (*FlushStore, error) {
+func openStoreForFlush(path string, blockCacheMB, maxBackgroundJobs int, logger *txhashrework.Logger) (*FlushStore, error) {
 	// Create minimal block cache
 	var blockCache *grocksdb.Cache
 	if blockCacheMB > 0 {
@@ -416,6 +362,7 @@ func openStoreForFlush(path string, blockCacheMB int, logger *txhashrework.Logge
 	opts.SetErrorIfExists(false)
 	opts.SetMaxOpenFiles(-1)
 	opts.SetInfoLogLevel(grocksdb.WarnInfoLogLevel)
+	opts.SetMaxBackgroundJobs(maxBackgroundJobs) // Control flush parallelism
 
 	// Prepare column family names (16 CFs + default)
 	cfNames := []string{"default"}
@@ -545,22 +492,21 @@ func printUsage() {
 	fmt.Println("  flush-store --store PATH [OPTIONS]")
 	fmt.Println()
 	fmt.Println("OPTIONS:")
-	fmt.Println("  --store PATH        Path to existing RocksDB store (required)")
-	fmt.Println("  --block-cache N     Block cache size in MB (default: 64)")
-	fmt.Println("  --workers N         Number of parallel flush workers (default: 16)")
-	fmt.Println("  --log-file FILE     Output file for logs (default: stdout)")
-	fmt.Println("  --dry-run           Show stats without flushing")
-	fmt.Println("  --verbose           Show per-CF flush details")
-	fmt.Println("  --help              Show this help message")
+	fmt.Println("  --store PATH              Path to existing RocksDB store (required)")
+	fmt.Println("  --block-cache N           Block cache size in MB (default: 64)")
+	fmt.Println("  --max-background-jobs N   Max RocksDB background jobs for flush (default: 16)")
+	fmt.Println("  --log-file FILE           Output file for logs (default: stdout)")
+	fmt.Println("  --dry-run                 Show stats without flushing")
+	fmt.Println("  --verbose                 Show detailed flush progress")
+	fmt.Println("  --help                    Show this help message")
 	fmt.Println()
 	fmt.Println("EXAMPLES:")
 	fmt.Println("  # Dry run to see current state")
 	fmt.Println("  flush-store --store /data/tx-hash-store --dry-run")
 	fmt.Println()
-	fmt.Println("  # Flush with verbose output")
-	fmt.Println("  flush-store --store /data/tx-hash-store --verbose")
+	fmt.Println("  # Flush with default settings")
+	fmt.Println("  flush-store --store /data/tx-hash-store")
 	fmt.Println()
-	fmt.Println("  # Flush with custom settings")
-	fmt.Println("  flush-store --store /data/tx-hash-store \\")
-	fmt.Println("    --block-cache 128 --workers 8 --log-file flush.log")
+	fmt.Println("  # Flush with more parallelism")
+	fmt.Println("  flush-store --store /data/tx-hash-store --max-background-jobs 32")
 }
