@@ -152,7 +152,7 @@ func createColumnFamilyOptions(settings *RocksDBSettings, blockCache *grocksdb.C
 	// =========================================================================
 	opts.SetWriteBufferSize(uint64(settings.WriteBufferSizeMB * MB))
 	opts.SetMaxWriteBufferNumber(settings.MaxWriteBufferNumber)
-	opts.SetMinWriteBufferNumberToMerge(2)
+	opts.SetMinWriteBufferNumberToMerge(4)
 
 	// =========================================================================
 	// L0 Management
