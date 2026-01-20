@@ -55,9 +55,10 @@ import (
 // =============================================================================
 
 const (
-	MB                = 1024 * 1024
-	DefaultWarmup     = 100
-	DefaultBlockCache = 512
+	MB                    = 1024 * 1024
+	DefaultWarmup         = 100
+	DefaultBlockCache     = 512
+	BloomFilterBitsPerKey = 12 // Must match ingestion setting for optimal performance
 )
 
 // ColumnFamilyNames contains the names of all 16 column families.
@@ -490,12 +491,13 @@ func openStore(path string, blockCacheMB int) (*Store, error) {
 
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(false)
+	opts.SetMaxOpenFiles(-1) // Keep all files open for better performance
 
 	// Prepare CF names
 	cfNames := []string{"default"}
 	cfNames = append(cfNames, ColumnFamilyNames...)
 
-	// Create options for each CF with block cache
+	// Create options for each CF with block cache and bloom filter
 	cfOptsList := make([]*grocksdb.Options, len(cfNames))
 	for i := range cfNames {
 		cfOpts := grocksdb.NewDefaultOptions()
@@ -504,12 +506,14 @@ func openStore(path string, blockCacheMB int) (*Store, error) {
 		if blockCache != nil {
 			bbto.SetBlockCache(blockCache)
 		}
+		// Enable bloom filter for read performance (must match ingestion setting)
+		bbto.SetFilterPolicy(grocksdb.NewBloomFilter(BloomFilterBitsPerKey))
 		cfOpts.SetBlockBasedTableFactory(bbto)
 
 		cfOptsList[i] = cfOpts
 	}
 
-	// Open for read-only
+	// Open as read-only
 	db, cfHandles, err := grocksdb.OpenDbForReadOnlyColumnFamilies(opts, path, cfNames, cfOptsList, false)
 	if err != nil {
 		opts.Destroy()
@@ -814,8 +818,8 @@ func runBenchmark(storePath, hashesFile string, warmupCount, blockCacheMB int, l
 	logger.Info("  Block Cache:     %d MB", blockCacheMB)
 	logger.Info("")
 
-	// Open store
-	logger.Info("Opening store...")
+	// Open store in read-only mode
+	logger.Info("Opening store (read-only)...")
 	logger.Sync()
 	storeOpenStart := time.Now()
 	store, err := openStore(storePath, blockCacheMB)
@@ -1089,14 +1093,14 @@ func printUsage() {
 	fmt.Println("  tx-hash-store-benchmark --store PATH --hashes FILE [OPTIONS]")
 	fmt.Println()
 	fmt.Println("OPTIONS:")
-	fmt.Println("  --store PATH        Path to RocksDB store (required)")
-	fmt.Println("  --hashes FILE       Path to file with hex tx hashes (required)")
-	fmt.Println("                      All hashes in the file will be looked up")
-	fmt.Println("  --warmup N          Number of warmup lookups (default: 100)")
-	fmt.Println("  --block-cache N     Block cache size in MB (default: 512)")
-	fmt.Println("  --log-file FILE     Output file for logs (default: stdout)")
-	fmt.Println("  --error-file FILE   Output file for errors (default: stdout)")
-	fmt.Println("  --help              Show this help message")
+	fmt.Println("  --store PATH          Path to RocksDB store (required)")
+	fmt.Println("  --hashes FILE         Path to file with hex tx hashes (required)")
+	fmt.Println("                        All hashes in the file will be looked up")
+	fmt.Println("  --warmup N            Number of warmup lookups (default: 100)")
+	fmt.Println("  --block-cache N       Block cache size in MB (default: 512)")
+	fmt.Println("  --log-file FILE       Output file for logs (default: stdout)")
+	fmt.Println("  --error-file FILE     Output file for errors (default: stdout)")
+	fmt.Println("  --help                Show this help message")
 	fmt.Println()
 	fmt.Println("HASHES FILE FORMAT:")
 	fmt.Println("  One 64-character hex transaction hash per line:")
@@ -1106,7 +1110,7 @@ func printUsage() {
 	fmt.Println("    # Lines starting with # are ignored")
 	fmt.Println()
 	fmt.Println("EXAMPLES:")
-	fmt.Println("  # Basic benchmark (all hashes, output to stdout)")
+	fmt.Println("  # Basic benchmark")
 	fmt.Println("  tx-hash-store-benchmark \\")
 	fmt.Println("    --store /data/tx-hash-store \\")
 	fmt.Println("    --hashes /data/sample-hashes.txt")
@@ -1115,7 +1119,7 @@ func printUsage() {
 	fmt.Println("  tx-hash-store-benchmark \\")
 	fmt.Println("    --store /data/tx-hash-store \\")
 	fmt.Println("    --hashes /data/sample-hashes.txt \\")
-	fmt.Println("    --block-cache 2048 \\")
+	fmt.Println("    --block-cache 4096 \\")
 	fmt.Println("    --log-file benchmark.log \\")
 	fmt.Println("    --error-file benchmark.err")
 }
