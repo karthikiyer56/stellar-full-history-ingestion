@@ -37,7 +37,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"sync"
@@ -51,9 +50,6 @@ import (
 const (
 	// separatorLine is the visual separator used in logs
 	separatorLine = "========================================================================="
-
-	// logBufferSize is the buffer size for the buffered writers
-	logBufferSize = 64 * 1024 // 64 KB
 
 	// timeFormat is the timestamp format for log messages
 	timeFormat = "2006-01-02 15:04:05.000"
@@ -86,12 +82,6 @@ type DualLogger struct {
 
 	// errorFile is the file handle for error messages
 	errorFile *os.File
-
-	// logWriter is a buffered writer for the log file
-	logWriter *bufio.Writer
-
-	// errorWriter is a buffered writer for the error file
-	errorWriter *bufio.Writer
 
 	// logPath stores the path to the log file (for error messages)
 	logPath string
@@ -127,12 +117,10 @@ func NewDualLogger(logPath, errorPath string) (*DualLogger, error) {
 	}
 
 	return &DualLogger{
-		logFile:     logFile,
-		errorFile:   errorFile,
-		logWriter:   bufio.NewWriterSize(logFile, logBufferSize),
-		errorWriter: bufio.NewWriterSize(errorFile, logBufferSize),
-		logPath:     logPath,
-		errorPath:   errorPath,
+		logFile:   logFile,
+		errorFile: errorFile,
+		logPath:   logPath,
+		errorPath: errorPath,
 	}, nil
 }
 
@@ -143,13 +131,14 @@ func NewDualLogger(logPath, errorPath string) (*DualLogger, error) {
 //	[2024-01-15 14:30:45.123] Your message here
 //
 // Supports printf-style formatting.
+// Writes are unbuffered for immediate visibility.
 func (l *DualLogger) Info(format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	timestamp := time.Now().Format(timeFormat)
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.logWriter, "[%s] %s\n", timestamp, msg)
+	fmt.Fprintf(l.logFile, "[%s] %s\n", timestamp, msg)
 }
 
 // Error logs an error message to the error file.
@@ -160,6 +149,7 @@ func (l *DualLogger) Info(format string, args ...interface{}) {
 //
 // Errors are also written to the log file (for context).
 // Supports printf-style formatting.
+// Writes are unbuffered for immediate visibility.
 func (l *DualLogger) Error(format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -168,10 +158,10 @@ func (l *DualLogger) Error(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 
 	// Write to error file
-	fmt.Fprintf(l.errorWriter, "[%s] ERROR: %s\n", timestamp, msg)
+	fmt.Fprintf(l.errorFile, "[%s] ERROR: %s\n", timestamp, msg)
 
 	// Also write to log file for context
-	fmt.Fprintf(l.logWriter, "[%s] ERROR: %s\n", timestamp, msg)
+	fmt.Fprintf(l.logFile, "[%s] ERROR: %s\n", timestamp, msg)
 }
 
 // Separator logs a visual separator line to the log file.
@@ -181,32 +171,32 @@ func (l *DualLogger) Error(format string, args ...interface{}) {
 //	=========================================================================
 //
 // Use separators to demarcate phases or sections in the log.
+// Writes are unbuffered for immediate visibility.
 func (l *DualLogger) Separator() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	fmt.Fprintln(l.logWriter, separatorLine)
+	fmt.Fprintln(l.logFile, separatorLine)
 }
 
-// Sync forces a flush of all log buffers to disk.
+// Sync forces a flush of all log data to disk (fsync).
 //
 // Call this:
 //   - After important checkpoints
 //   - Before operations that might crash
 //   - Periodically during long operations
 //
-// This ensures logs are visible in real-time when tailing the file.
+// With unbuffered logging, this performs an fsync to ensure
+// data is durably written to disk.
 func (l *DualLogger) Sync() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.logWriter.Flush()
-	l.errorWriter.Flush()
 	l.logFile.Sync()
 	l.errorFile.Sync()
 }
 
-// Close closes all log files after flushing buffers.
+// Close closes all log files after syncing.
 //
 // Always call Close() when done logging (use defer):
 //
@@ -217,16 +207,6 @@ func (l *DualLogger) Sync() {
 func (l *DualLogger) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	if l.logWriter != nil {
-		l.logWriter.Flush()
-		l.logWriter = nil
-	}
-
-	if l.errorWriter != nil {
-		l.errorWriter.Flush()
-		l.errorWriter = nil
-	}
 
 	if l.logFile != nil {
 		l.logFile.Sync()
@@ -273,15 +253,6 @@ type QueryLogger struct {
 
 	// errorFile is for query errors
 	errorFile *os.File
-
-	// outputWriter is a buffered writer for CSV output
-	outputWriter *bufio.Writer
-
-	// logWriter is a buffered writer for statistics
-	logWriter *bufio.Writer
-
-	// errorWriter is a buffered writer for errors
-	errorWriter *bufio.Writer
 }
 
 // NewQueryLogger creates a new QueryLogger.
@@ -316,16 +287,13 @@ func NewQueryLogger(outputPath, logPath, errorPath string) (*QueryLogger, error)
 	}
 
 	ql := &QueryLogger{
-		outputFile:   outputFile,
-		logFile:      logFile,
-		errorFile:    errorFile,
-		outputWriter: bufio.NewWriterSize(outputFile, logBufferSize),
-		logWriter:    bufio.NewWriterSize(logFile, logBufferSize),
-		errorWriter:  bufio.NewWriterSize(errorFile, logBufferSize),
+		outputFile: outputFile,
+		logFile:    logFile,
+		errorFile:  errorFile,
 	}
 
 	// Write CSV header
-	fmt.Fprintln(ql.outputWriter, "txHash,ledgerSeq,queryTimeUs")
+	fmt.Fprintln(ql.outputFile, "txHash,ledgerSeq,queryTimeUs")
 
 	return ql, nil
 }
@@ -338,11 +306,13 @@ func NewQueryLogger(outputPath, logPath, errorPath string) (*QueryLogger, error)
 //   - txHashHex: Transaction hash as hex string (64 characters)
 //   - ledgerSeq: Ledger sequence number
 //   - queryTimeUs: Query duration in microseconds
+//
+// Writes are unbuffered for immediate visibility.
 func (ql *QueryLogger) Result(txHashHex string, ledgerSeq uint32, queryTimeUs int64) {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 
-	fmt.Fprintf(ql.outputWriter, "%s,%d,%d\n", txHashHex, ledgerSeq, queryTimeUs)
+	fmt.Fprintf(ql.outputFile, "%s,%d,%d\n", txHashHex, ledgerSeq, queryTimeUs)
 }
 
 // NotFound logs a query for a txHash that was not found.
@@ -352,67 +322,58 @@ func (ql *QueryLogger) Result(txHashHex string, ledgerSeq uint32, queryTimeUs in
 // PARAMETERS:
 //   - txHashHex: Transaction hash as hex string (64 characters)
 //   - queryTimeUs: Query duration in microseconds
+//
+// Writes are unbuffered for immediate visibility.
 func (ql *QueryLogger) NotFound(txHashHex string, queryTimeUs int64) {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 
-	fmt.Fprintf(ql.outputWriter, "%s,-1,%d\n", txHashHex, queryTimeUs)
+	fmt.Fprintf(ql.outputFile, "%s,-1,%d\n", txHashHex, queryTimeUs)
 }
 
 // Stats logs query statistics to the statistics log file.
 //
 // Supports printf-style formatting.
+// Writes are unbuffered for immediate visibility.
 func (ql *QueryLogger) Stats(format string, args ...interface{}) {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 
 	timestamp := time.Now().Format(timeFormat)
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(ql.logWriter, "[%s] %s\n", timestamp, msg)
+	fmt.Fprintf(ql.logFile, "[%s] %s\n", timestamp, msg)
 }
 
 // Error logs an error to the query error file.
 //
 // Supports printf-style formatting.
+// Writes are unbuffered for immediate visibility.
 func (ql *QueryLogger) Error(format string, args ...interface{}) {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 
 	timestamp := time.Now().Format(timeFormat)
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(ql.errorWriter, "[%s] ERROR: %s\n", timestamp, msg)
+	fmt.Fprintf(ql.errorFile, "[%s] ERROR: %s\n", timestamp, msg)
 }
 
-// Sync forces a flush of all query log buffers to disk.
+// Sync forces a flush of all query log data to disk (fsync).
+//
+// With unbuffered logging, this performs an fsync to ensure
+// data is durably written to disk.
 func (ql *QueryLogger) Sync() {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 
-	ql.outputWriter.Flush()
-	ql.logWriter.Flush()
-	ql.errorWriter.Flush()
 	ql.outputFile.Sync()
 	ql.logFile.Sync()
 	ql.errorFile.Sync()
 }
 
-// Close closes all query log files after flushing buffers.
+// Close closes all query log files after syncing.
 func (ql *QueryLogger) Close() {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
-
-	if ql.outputWriter != nil {
-		ql.outputWriter.Flush()
-		ql.outputWriter = nil
-	}
-	if ql.logWriter != nil {
-		ql.logWriter.Flush()
-		ql.logWriter = nil
-	}
-	if ql.errorWriter != nil {
-		ql.errorWriter.Flush()
-		ql.errorWriter = nil
-	}
 
 	if ql.outputFile != nil {
 		ql.outputFile.Sync()

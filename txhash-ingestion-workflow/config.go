@@ -27,12 +27,12 @@
 //
 //   MemTables:
 //     WriteBufferSizeMB × MaxWriteBufferNumber × 16 CFs
-//     256 MB × 2 × 16 = 8,192 MB (8 GB)
+//     64 MB × 2 × 16 = 2,048 MB (2 GB)
 //
 //   Block Cache:
 //     Configurable via --block-cache-mb (default: 8 GB)
 //
-//   Total Default: ~16 GB for RocksDB
+//   Total Default: ~10 GB for RocksDB
 //
 //   RecSplit Build (additional, during Phase 3):
 //     ~40 bytes per key during construction
@@ -125,7 +125,7 @@ type RocksDBSettings struct {
 	// WriteBufferSizeMB is the size of each MemTable in megabytes.
 	//
 	// TRADE-OFFS:
-	//   Larger (e.g., 512 MB):
+	//   Larger (e.g., 256 MB):
 	//     + Fewer flushes, better write throughput
 	//     + Larger SST files (fewer files total)
 	//     - More memory usage
@@ -137,9 +137,10 @@ type RocksDBSettings struct {
 	//     - More frequent flushes
 	//     - More, smaller SST files
 	//
-	// DEFAULT: 256 MB
-	//   Balances throughput with reasonable crash recovery time.
-	//   With 16 CFs × 2 buffers, max WAL is ~8 GB → ~20-30s recovery.
+	// DEFAULT: 64 MB
+	//   Keeps WAL size manageable (~2 GB max across 16 CFs).
+	//   With deferred compaction, more L0 files is acceptable.
+	//   Crash recovery time: ~10-15 seconds.
 	//
 	WriteBufferSizeMB int
 
@@ -261,12 +262,12 @@ type RocksDBSettings struct {
 //
 // MAX WAL SIZE WITH DEFAULTS:
 //
-//	256 MB × 16 CFs = ~4 GB
-//	Recovery time: ~15-20 seconds
+//	64 MB × 16 CFs = ~1 GB
+//	Recovery time: ~10-15 seconds
 func DefaultRocksDBSettings() RocksDBSettings {
 	return RocksDBSettings{
 		// MemTable settings
-		WriteBufferSizeMB:           256,
+		WriteBufferSizeMB:           64,
 		MaxWriteBufferNumber:        2,
 		MinWriteBufferNumberToMerge: 1,
 

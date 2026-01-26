@@ -109,12 +109,13 @@ func main() {
 	// Log startup
 	logStartup(logger, config)
 
+	// Log configuration before heavy initialization (matches dry-run output order)
+	config.PrintConfig(logger)
+	config.PrintRocksDBConfig(logger)
+	logger.Sync()
+
 	// Handle dry-run
 	if config.DryRun {
-		// Show all configuration
-		config.PrintConfig(logger)
-		config.PrintRocksDBConfig(logger)
-
 		// Check and show meta store state if it exists
 		logDryRunMetaState(config, logger)
 

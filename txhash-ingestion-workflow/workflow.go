@@ -234,10 +234,6 @@ func (w *Workflow) Run() error {
 		startFrom = w.config.StartLedger
 	}
 
-	// Log configuration
-	w.config.PrintConfig(w.logger)
-	w.config.PrintRocksDBConfig(w.logger)
-
 	// Take initial memory snapshot
 	snapshot := TakeMemorySnapshot()
 	snapshot.Log(w.logger, "Initial")
