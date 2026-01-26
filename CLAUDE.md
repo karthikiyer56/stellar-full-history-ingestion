@@ -220,21 +220,20 @@ When partitioning by key prefix (e.g., first hex char of hash):
 - Use 16 column families: "0", "1", ..., "9", "a", "b", ..., "f"
 - Plus "default" CF (required by RocksDB)
 
-### Recommended Settings
-```go
-// Write-optimized (during ingestion)
-opts.SetDisableAutoCompactions(true)  // Manual compaction after
-opts.SetWriteBufferSize(512 * MB)
-opts.SetMaxWriteBufferNumber(4)
+### Write-Optimized Settings (During Ingestion)
+- Disable auto-compaction (`SetDisableAutoCompactions(true)`)
+- Use manual full compaction after ingestion completes
+- Configure MemTable sizes based on available RAM and number of CFs
+- Calculate total memory: `WriteBufferSize × MaxWriteBufferNumber × NumCFs`
 
-// Read-optimized (after compaction)
-// Use bloom filters, block cache
-```
+### Read-Optimized Settings (After Compaction)
+- Enable bloom filters for point lookups
+- Configure block cache based on available RAM
 
 ### Compaction
 - Disable auto-compaction during bulk ingestion
 - Run manual full compaction after ingestion completes
-- Verify counts after compaction
+- Verify counts after compaction by iterating store
 
 ---
 
@@ -249,3 +248,12 @@ Before considering a tool complete:
 - [ ] Error file captures all failures
 - [ ] README documents all behavior
 - [ ] Memory usage is reasonable
+
+---
+
+## Build Hygiene
+
+After verifying a build compiles successfully:
+- **DELETE the compiled executable** - do not leave binaries in the repo
+- Only source code should be committed
+- Run `rm <binary-name>` after `go build` verification

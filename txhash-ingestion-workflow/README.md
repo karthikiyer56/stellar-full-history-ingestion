@@ -151,17 +151,211 @@ go build -o txhash-ingestion-workflow .
 
 ## Pipeline Phases
 
-The workflow progresses through these phases in order:
+The workflow progresses through 5 logical phases (4 operational + completion):
 
-| Phase | Description |
-|-------|-------------|
-| `INGESTING` | Reading ledgers from LFS, extracting txHashes, writing to RocksDB |
-| `COMPACTING` | Running full compaction on all 16 column families, then verifying counts |
-| `BUILDING_RECSPLIT` | Building RecSplit minimal perfect hash indexes |
-| `VERIFYING` | Validating RecSplit indexes against RocksDB data |
-| `COMPLETE` | All phases finished successfully |
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           WORKFLOW PIPELINE DIAGRAM                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 1: INGESTING                                                          │ │
+│  │ ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐       │ │
+│  │ │ Read LFS    │ → │ Extract     │ → │ Partition   │ → │ Write to    │       │ │
+│  │ │ Ledgers     │   │ TxHashes    │   │ by 1st Hex  │   │ RocksDB CFs │       │ │
+│  │ └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘       │ │
+│  │                                                                              │ │
+│  │ Checkpoint: Every 1000 ledgers (last_committed_ledger, cfCounts)            │ │
+│  │ SIGHUP: Enabled (queries run against partial data)                          │ │
+│  │ Timing: IngestionTime                                                        │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 2A: COMPACTING (RocksDB)                                              │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ For each CF (0-f): Run full compaction → deduplicate → merge SST files │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ SIGHUP: Enabled (queries run against compacting data)                       │ │
+│  │ Timing: CompactionTime                                                       │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 2B: COUNT VERIFICATION                                                │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ For each CF: Iterate RocksDB → Count entries → Compare with cfCounts   │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ Purpose: Early detection of count mismatches before RecSplit build          │ │
+│  │ Timing: CountVerifyTime                                                      │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 3: BUILDING RECSPLIT                                                  │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ For each CF: Iterate RocksDB → Add keys to RecSplit → Build index      │ │ │
+│  │ │                                                                         │ │ │
+│  │ │ Mode: Sequential (one CF at a time) OR Parallel (all 16 CFs)           │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ SIGHUP: Ignored (RecSplit library not interruptible)                        │ │
+│  │ Timing: RecSplitTime                                                         │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 4: VERIFYING                                                          │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ For each CF: Iterate RocksDB → Lookup in RecSplit → Verify match       │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ Checkpoint: After each CF (verify_cf)                                       │ │
+│  │ SIGHUP: Ignored (verification must complete without side effects)          │ │
+│  │ Timing: VerificationTime                                                     │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 5: COMPLETE                                                           │ │
+│  │                                                                              │ │
+│  │ All phases finished successfully. Indexes are ready for use.                │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
-Progress is checkpointed to the meta store, allowing automatic resume after interruption.
+### Phase Summary Table
+
+| Phase | State Name | Description | Checkpoint | SIGHUP | Timing Field |
+|-------|------------|-------------|------------|--------|--------------|
+| 1 | `INGESTING` | Read LFS ledgers, extract txHashes, partition by first hex char, write to 16 RocksDB CFs | Every 1000 ledgers | Enabled | `IngestionTime` |
+| 2A | `COMPACTING` | Run full compaction on all 16 CFs to deduplicate and merge SST files | None (idempotent) | Enabled | `CompactionTime` |
+| 2B | (sub-phase) | Post-compaction count verification: iterate each CF, compare count with meta store | None | N/A | `CountVerifyTime` |
+| 3 | `BUILDING_RECSPLIT` | Build RecSplit minimal perfect hash indexes from compacted RocksDB data | None (restart from scratch) | Ignored | `RecSplitTime` |
+| 4 | `VERIFYING` | Verify every key in RocksDB can be found via RecSplit index | After each CF | Ignored | `VerificationTime` |
+| 5 | `COMPLETE` | All phases finished successfully | Final state | N/A | N/A |
+
+### Phase Details
+
+#### Phase 1: Ingestion
+
+**Input**: LFS ledger store (ledgers in chunk format)  
+**Output**: RocksDB with 16 column families (0-f), each containing txHash→ledgerSeq mappings
+
+**Process**:
+1. Open LFS store and create ledger iterator
+2. For each ledger in range [start_ledger, end_ledger]:
+   - Read LedgerCloseMeta from LFS
+   - Extract all transaction hashes
+   - Partition txHash by first hex character (determines CF)
+   - Accumulate into batch buffer
+3. Every 1000 ledgers:
+   - Write batch to RocksDB (all 16 CFs atomically)
+   - Update in-memory cfCounts
+   - Checkpoint to meta store: (last_committed_ledger, cfCounts)
+4. After all ledgers: flush MemTables to disk
+
+**Metrics Logged**:
+- Per-batch: ledgers processed, txHashes extracted, parse time, write time, ledgers/sec, tx/sec
+- Summary: total batches, ledgers, transactions, overall throughput
+
+#### Phase 2A: Compaction
+
+**Input**: RocksDB with potentially duplicate entries (from crash recovery re-ingestion)  
+**Output**: Compacted RocksDB with unique entries only
+
+**Process**:
+1. For each CF (0 through f):
+   - Run full manual compaction
+   - RocksDB merges all SST files, removes duplicates
+2. Log before/after statistics per CF
+
+**Metrics Logged**:
+- Per-CF: files before/after, size before/after, compaction time
+- Summary: total compaction time, space reduction
+
+#### Phase 2B: Count Verification
+
+**Input**: Compacted RocksDB + cfCounts from meta store  
+**Output**: Verification report (pass/fail per CF)
+
+**Process**:
+1. For each CF (0 through f):
+   - Iterate through all entries, count actual keys
+   - Compare with expected count from cfCounts
+   - Log match or mismatch
+2. If any mismatch: log warning but continue (RecSplit build is definitive check)
+
+**Metrics Logged**:
+- Per-CF: expected count, actual count, match status, verification time
+- Summary: total verification time, number of mismatches
+
+#### Phase 3: RecSplit Building
+
+**Input**: Compacted RocksDB with verified counts  
+**Output**: 16 RecSplit index files (cf-0.idx through cf-f.idx)
+
+**Process**:
+1. For each CF (sequentially or in parallel):
+   - Create RecSplit builder with expected key count
+   - Iterate RocksDB CF, add each key to builder
+   - Verify iterated count matches expected (definitive check)
+   - Build RecSplit index
+2. Clean up temporary files
+
+**Metrics Logged**:
+- Per-CF: key count, key add time, build time, index size
+- Summary: total keys indexed, total build time, total index size
+
+#### Phase 4: Verification
+
+**Input**: RocksDB + RecSplit indexes  
+**Output**: Verification report (pass/fail counts)
+
+**Process**:
+1. For each CF:
+   - Open RecSplit index
+   - Iterate RocksDB, for each key:
+     - Lookup in RecSplit index
+     - Verify returned value matches RocksDB value
+   - Checkpoint CF completion to meta store (verify_cf)
+2. Log any verification failures to error file
+
+**Metrics Logged**:
+- Per-CF: keys verified, failures, verification time, keys/sec
+- Summary: total keys verified, total failures, success rate
+
+### Final Summary Output
+
+At workflow completion, a comprehensive summary is logged:
+
+```
+                    WORKFLOW COMPLETE
+================================================================================
+
+OVERALL STATISTICS:
+  Start Time:        2024-01-15 10:00:00
+  End Time:          2024-01-15 14:30:00
+  Total Duration:    4h30m0s
+
+PHASE DURATIONS:
+  Ingestion:         2h15m30s
+  Compaction:        45m20s
+  Count Verify:      5m15s
+  RecSplit Build:    1h10m45s
+  Verification:      14m10s
+
+DATA STATISTICS:
+  Keys Ingested:     50,000,000
+  Keys Verified:     50,000,000
+  Verify Failures:   0
+
+MEMORY PEAK:
+  RSS:               14.2 GB
+
+OUTPUT LOCATIONS:
+  RocksDB:           /data/txhash-index/txHash-ledgerSeq/rocksdb
+  RecSplit Indexes:  /data/txhash-index/txHash-ledgerSeq/recsplit/index
+  Meta Store:        /data/txhash-index/txHash-ledgerSeq/meta
+```
 
 ### Post-Compaction Count Verification
 

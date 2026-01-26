@@ -119,8 +119,11 @@ type WorkflowStats struct {
 	// IngestionTime is the time spent in ingestion phase
 	IngestionTime time.Duration
 
-	// CompactionTime is the time spent in compaction phase
+	// CompactionTime is the time spent in compaction phase (RocksDB compaction only)
 	CompactionTime time.Duration
+
+	// CountVerifyTime is the time spent verifying counts after compaction
+	CountVerifyTime time.Duration
 
 	// RecSplitTime is the time spent building RecSplit indexes
 	RecSplitTime time.Duration
@@ -360,20 +363,21 @@ func (w *Workflow) runCompaction() error {
 
 	LogCompactionStart(w.logger)
 
-	phaseStart := time.Now()
-
-	// Run compaction
-	stats, err := RunCompaction(w.store, w.logger, w.memory)
+	// Run compaction (track time separately)
+	compactionStart := time.Now()
+	_, err := RunCompaction(w.store, w.logger, w.memory)
 	if err != nil {
 		return fmt.Errorf("compaction failed: %w", err)
 	}
+	w.stats.CompactionTime = time.Since(compactionStart)
 
-	// Verify counts match after compaction
+	// Verify counts match after compaction (track time separately)
 	// This catches count mismatches early before RecSplit build
 	verifyStats, err := VerifyCountsAfterCompaction(w.store, w.meta, w.logger)
 	if err != nil {
 		return fmt.Errorf("post-compaction count verification failed: %w", err)
 	}
+	w.stats.CountVerifyTime = verifyStats.TotalTime
 
 	// Log warning if mismatches found (but don't abort - RecSplit will fail definitively)
 	if !verifyStats.AllMatched {
@@ -383,15 +387,15 @@ func (w *Workflow) runCompaction() error {
 		w.logger.Error("")
 	}
 
-	w.stats.CompactionTime = time.Since(phaseStart)
-
 	// Transition to next phase
 	if err := w.meta.SetPhase(PhaseBuildingRecsplit); err != nil {
 		return fmt.Errorf("failed to set phase to BUILDING_RECSPLIT: %w", err)
 	}
 
 	w.logger.Info("")
-	w.logger.Info("Compaction phase completed in %v", stats.TotalTime)
+	w.logger.Info("Compaction phase completed:")
+	w.logger.Info("  RocksDB compaction: %v", w.stats.CompactionTime)
+	w.logger.Info("  Count verification: %v", w.stats.CountVerifyTime)
 	w.logger.Info("")
 	w.logger.Sync()
 
@@ -510,6 +514,7 @@ func (w *Workflow) logFinalSummary() {
 	w.logger.Info("PHASE DURATIONS:")
 	w.logger.Info("  Ingestion:         %v", w.stats.IngestionTime)
 	w.logger.Info("  Compaction:        %v", w.stats.CompactionTime)
+	w.logger.Info("  Count Verify:      %v", w.stats.CountVerifyTime)
 	w.logger.Info("  RecSplit Build:    %v", w.stats.RecSplitTime)
 	w.logger.Info("  Verification:      %v", w.stats.VerificationTime)
 	w.logger.Info("")

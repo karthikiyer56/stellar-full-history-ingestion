@@ -110,7 +110,22 @@ func main() {
 
 	// Handle dry-run
 	if config.DryRun {
-		logger.Info("DRY RUN: Configuration validated. Exiting without executing workflow.")
+		// Show all configuration
+		config.PrintConfig(logger)
+		config.PrintRocksDBConfig(logger)
+
+		// Check and show meta store state if it exists
+		logDryRunMetaState(config, logger)
+
+		logger.Separator()
+		logger.Info("                         DRY RUN COMPLETE")
+		logger.Separator()
+		logger.Info("")
+		logger.Info("Configuration validated successfully.")
+		logger.Info("No workflow executed (--dry-run mode).")
+		logger.Info("")
+		logger.Sync()
+
 		fmt.Println("Dry run complete. Configuration is valid.")
 		os.Exit(ExitSuccess)
 	}
@@ -317,4 +332,128 @@ func mustGetwd() string {
 		return "unknown"
 	}
 	return wd
+}
+
+// logDryRunMetaState checks if a meta store exists and logs its state.
+// This helps users understand what would happen on resume.
+func logDryRunMetaState(config *Config, logger Logger) {
+	// Check if meta store directory exists
+	if _, err := os.Stat(config.MetaStorePath); os.IsNotExist(err) {
+		logger.Separator()
+		logger.Info("                         META STORE STATE")
+		logger.Separator()
+		logger.Info("")
+		logger.Info("Meta store does not exist: %s", config.MetaStorePath)
+		logger.Info("This will be a FRESH START (no previous progress to resume)")
+		logger.Info("")
+		return
+	}
+
+	// Try to open meta store and read state
+	meta, err := OpenRocksDBMetaStore(config.MetaStorePath)
+	if err != nil {
+		logger.Separator()
+		logger.Info("                         META STORE STATE")
+		logger.Separator()
+		logger.Info("")
+		logger.Error("Failed to open meta store: %v", err)
+		logger.Info("")
+		return
+	}
+	defer meta.Close()
+
+	// Log the meta store state
+	logger.Separator()
+	logger.Info("                         META STORE STATE")
+	logger.Separator()
+	logger.Info("")
+
+	if !meta.Exists() {
+		logger.Info("Meta store exists but is not initialized.")
+		logger.Info("This will be a FRESH START")
+		logger.Info("")
+		return
+	}
+
+	// Read stored config
+	storedStart, _ := meta.GetStartLedger()
+	storedEnd, _ := meta.GetEndLedger()
+	phase, _ := meta.GetPhase()
+	lastCommitted, _ := meta.GetLastCommittedLedger()
+	cfCounts, _ := meta.GetCFCounts()
+
+	logger.Info("PREVIOUS RUN DETECTED - Will RESUME")
+	logger.Info("")
+	logger.Info("Stored Configuration:")
+	logger.Info("  Start Ledger:          %d", storedStart)
+	logger.Info("  End Ledger:            %d", storedEnd)
+	logger.Info("")
+
+	// Check for config mismatch
+	if storedStart != config.StartLedger || storedEnd != config.EndLedger {
+		logger.Error("CONFIG MISMATCH!")
+		logger.Error("  Command line: start=%d, end=%d", config.StartLedger, config.EndLedger)
+		logger.Error("  Meta store:   start=%d, end=%d", storedStart, storedEnd)
+		logger.Error("")
+		logger.Error("Cannot resume with different parameters.")
+		logger.Error("Either use the original parameters or delete the meta store to start fresh.")
+		logger.Info("")
+		return
+	}
+
+	logger.Info("Progress State:")
+	logger.Info("  Phase:                 %s", phase)
+	logger.Info("  Last Committed Ledger: %d", lastCommitted)
+
+	// Calculate and show CF counts
+	var totalCount uint64
+	for _, count := range cfCounts {
+		totalCount += count
+	}
+	logger.Info("  Total Entries So Far:  %s", FormatCount(int64(totalCount)))
+	logger.Info("")
+
+	// Show what will happen on resume
+	switch phase {
+	case PhaseIngesting:
+		if lastCommitted > 0 {
+			remaining := config.EndLedger - lastCommitted
+			logger.Info("Resume Action:")
+			logger.Info("  Will resume ingestion from ledger %d", lastCommitted+1)
+			logger.Info("  Remaining ledgers: %d", remaining)
+		} else {
+			logger.Info("Resume Action:")
+			logger.Info("  Will start ingestion from ledger %d", config.StartLedger)
+		}
+
+	case PhaseCompacting:
+		logger.Info("Resume Action:")
+		logger.Info("  Will restart compaction for all 16 CFs")
+
+	case PhaseBuildingRecsplit:
+		logger.Info("Resume Action:")
+		logger.Info("  Will rebuild all RecSplit indexes from scratch")
+
+	case PhaseVerifying:
+		verifyCF, _ := meta.GetVerifyCF()
+		logger.Info("Resume Action:")
+		logger.Info("  Will resume verification from CF: %s", verifyCF)
+
+	case PhaseComplete:
+		logger.Info("Status:")
+		logger.Info("  Workflow already COMPLETE - nothing to do")
+	}
+
+	logger.Info("")
+
+	// Show per-CF counts breakdown
+	if totalCount > 0 {
+		logger.Info("Per-CF Entry Counts:")
+		for _, cf := range ColumnFamilyNames {
+			count := cfCounts[cf]
+			pct := 100.0 * float64(count) / float64(totalCount)
+			logger.Info("  CF %s: %12s (%5.2f%%)", cf, FormatCount(int64(count)), pct)
+		}
+		logger.Info("")
+	}
 }
