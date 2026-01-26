@@ -41,6 +41,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"io"
 	"time"
 
@@ -135,7 +136,7 @@ func (i *Ingester) Run() error {
 	i.logger.Info("")
 	i.logger.Info("LFS Store:     %s", i.config.LFSStorePath)
 	i.logger.Info("Ledger Range:  %d - %d", i.config.StartLedger, i.config.EndLedger)
-	i.logger.Info("Total Ledgers: %s", FormatCount(int64(i.config.EndLedger-i.config.StartLedger+1)))
+	i.logger.Info("Total Ledgers: %s", helpers.FormatNumber(int64(i.config.EndLedger-i.config.StartLedger+1)))
 	i.logger.Info("Batch Size:    %d ledgers", i.config.BatchSize)
 	i.logger.Info("")
 
@@ -395,12 +396,12 @@ func LogIngestionStart(logger Logger, config *Config, resuming bool, startFrom u
 		logger.Info("RESUMING from ledger %d", startFrom)
 		logger.Info("  Original Start: %d", config.StartLedger)
 		logger.Info("  Original End:   %d", config.EndLedger)
-		logger.Info("  Remaining:      %s ledgers", FormatCount(int64(config.EndLedger-startFrom+1)))
+		logger.Info("  Remaining:      %s ledgers", helpers.FormatNumber(int64(config.EndLedger-startFrom+1)))
 	} else {
 		logger.Info("STARTING fresh ingestion")
 		logger.Info("  Start:   %d", config.StartLedger)
 		logger.Info("  End:     %d", config.EndLedger)
-		logger.Info("  Total:   %s ledgers", FormatCount(int64(config.EndLedger-config.StartLedger+1)))
+		logger.Info("  Total:   %s ledgers", helpers.FormatNumber(int64(config.EndLedger-config.StartLedger+1)))
 	}
 
 	logger.Info("")

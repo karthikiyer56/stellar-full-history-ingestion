@@ -43,6 +43,7 @@
 package main
 
 import (
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"runtime"
 	"sync"
 	"syscall"
@@ -234,11 +235,11 @@ func TakeMemorySnapshot() MemorySnapshot {
 // Log logs the snapshot to the logger.
 func (s *MemorySnapshot) Log(logger Logger, label string) {
 	logger.Info("%s Memory Snapshot:", label)
-	logger.Info("  RSS:          %s (%.2f GB)", FormatBytes(s.RSS), float64(s.RSS)/float64(GB))
-	logger.Info("  Heap Alloc:   %s", FormatBytes(int64(s.HeapAlloc)))
-	logger.Info("  Heap Sys:     %s", FormatBytes(int64(s.HeapSys)))
-	logger.Info("  Heap InUse:   %s", FormatBytes(int64(s.HeapInuse)))
-	logger.Info("  Stack InUse:  %s", FormatBytes(int64(s.StackInuse)))
+	logger.Info("  RSS:          %s (%.2f GB)", helpers.FormatBytes(s.RSS), float64(s.RSS)/float64(GB))
+	logger.Info("  Heap Alloc:   %s", helpers.FormatBytes(int64(s.HeapAlloc)))
+	logger.Info("  Heap Sys:     %s", helpers.FormatBytes(int64(s.HeapSys)))
+	logger.Info("  Heap InUse:   %s", helpers.FormatBytes(int64(s.HeapInuse)))
+	logger.Info("  Stack InUse:  %s", helpers.FormatBytes(int64(s.StackInuse)))
 	logger.Info("  GC Cycles:    %d", s.NumGC)
 	logger.Info("  GC Pause:     %v total", s.GCPauseTotal)
 }
@@ -305,9 +306,9 @@ func LogGoMemStats(logger Logger) {
 	runtime.ReadMemStats(&memStats)
 
 	logger.Info("Go Memory Stats:")
-	logger.Info("  Alloc:       %s", FormatBytes(int64(memStats.Alloc)))
-	logger.Info("  TotalAlloc:  %s", FormatBytes(int64(memStats.TotalAlloc)))
-	logger.Info("  Sys:         %s", FormatBytes(int64(memStats.Sys)))
+	logger.Info("  Alloc:       %s", helpers.FormatBytes(int64(memStats.Alloc)))
+	logger.Info("  TotalAlloc:  %s", helpers.FormatBytes(int64(memStats.TotalAlloc)))
+	logger.Info("  Sys:         %s", helpers.FormatBytes(int64(memStats.Sys)))
 	logger.Info("  NumGC:       %d", memStats.NumGC)
 	logger.Info("  NumGoroutine: %d", runtime.NumGoroutine())
 }
@@ -353,14 +354,14 @@ func LogRecSplitMemoryEstimate(logger Logger, cfCounts map[string]uint64, parall
 	if parallel {
 		total := EstimateRecSplitMemoryAllCFs(cfCounts)
 		logger.Info("  Mode:             Parallel (16 CFs simultaneously)")
-		logger.Info("  Estimated Memory: %s (%.2f GB)", FormatBytes(total), float64(total)/float64(GB))
+		logger.Info("  Estimated Memory: %s (%.2f GB)", helpers.FormatBytes(total), float64(total)/float64(GB))
 		logger.Info("")
 		logger.Info("  Per-CF estimates:")
 		for _, cf := range ColumnFamilyNames {
 			count := cfCounts[cf]
 			mem := EstimateRecSplitMemory(count)
 			logger.Info("    CF %s: %s keys → %s",
-				cf, FormatCount(int64(count)), FormatBytes(mem))
+				cf, helpers.FormatNumber(int64(count)), helpers.FormatBytes(mem))
 		}
 	} else {
 		var maxMem int64
@@ -374,7 +375,7 @@ func LogRecSplitMemoryEstimate(logger Logger, cfCounts map[string]uint64, parall
 		}
 		logger.Info("  Mode:             Sequential (one CF at a time)")
 		logger.Info("  Peak Memory:      %s (%.2f GB) for CF %s",
-			FormatBytes(maxMem), float64(maxMem)/float64(GB), maxCF)
+			helpers.FormatBytes(maxMem), float64(maxMem)/float64(GB), maxCF)
 	}
 	logger.Info("")
 }

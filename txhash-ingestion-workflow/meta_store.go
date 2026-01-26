@@ -58,6 +58,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,12 +372,12 @@ func (m *RocksDBMetaStore) LogState(logger Logger) {
 		for _, count := range cfCounts {
 			total += count
 		}
-		logger.Info("  Total CF Counts:       %s", FormatCount(int64(total)))
+		logger.Info("  Total CF Counts:       %s", helpers.FormatNumber(int64(total)))
 
 		// Show breakdown if requested (verbose)
 		logger.Info("  CF Counts:")
 		for _, cf := range ColumnFamilyNames {
-			logger.Info("    %s: %s", cf, FormatCount(int64(cfCounts[cf])))
+			logger.Info("    %s: %s", cf, helpers.FormatNumber(int64(cfCounts[cf])))
 		}
 	}
 	logger.Info("")
@@ -604,7 +605,7 @@ func LogResumeState(meta MetaStore, logger Logger, resumeFrom uint32, phase Phas
 				total += count
 			}
 			logger.Info("  Last Committed:        %d", lastCommitted)
-			logger.Info("  Entries So Far:        %s", FormatCount(int64(total)))
+			logger.Info("  Entries So Far:        %s", helpers.FormatNumber(int64(total)))
 		}
 
 	case PhaseCompacting:

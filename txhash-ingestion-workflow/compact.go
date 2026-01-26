@@ -43,6 +43,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"time"
 )
 
@@ -127,8 +128,8 @@ func (cs *CompactionStats) LogBeforeAfterComparison(logger Logger) {
 			cf,
 			before.TotalFiles,
 			after.TotalFiles,
-			FormatBytes(before.TotalSize),
-			FormatBytes(after.TotalSize))
+			helpers.FormatBytes(before.TotalSize),
+			helpers.FormatBytes(after.TotalSize))
 
 		totalFilesBefore += before.TotalFiles
 		totalFilesAfter += after.TotalFiles
@@ -142,8 +143,8 @@ func (cs *CompactionStats) LogBeforeAfterComparison(logger Logger) {
 		"TOT",
 		totalFilesBefore,
 		totalFilesAfter,
-		FormatBytes(totalSizeBefore),
-		FormatBytes(totalSizeAfter))
+		helpers.FormatBytes(totalSizeBefore),
+		helpers.FormatBytes(totalSizeAfter))
 
 	// Calculate reduction percentages
 	if totalFilesBefore > 0 {
@@ -388,7 +389,7 @@ func VerifyCountsAfterCompaction(
 	for _, count := range expectedCounts {
 		totalExpected += count
 	}
-	logger.Info("Expected total entries: %s", FormatCount(int64(totalExpected)))
+	logger.Info("Expected total entries: %s", helpers.FormatNumber(int64(totalExpected)))
 	logger.Info("")
 
 	// Verify each CF
@@ -436,8 +437,8 @@ func VerifyCountsAfterCompaction(
 
 		logger.Info("%-4s %15s %15s %8s %12v",
 			cfName,
-			FormatCount(int64(expectedCount)),
-			FormatCount(int64(actualCount)),
+			helpers.FormatNumber(int64(expectedCount)),
+			helpers.FormatNumber(int64(actualCount)),
 			matchStr,
 			cfDuration)
 	}
@@ -455,8 +456,8 @@ func VerifyCountsAfterCompaction(
 
 	logger.Info("%-4s %15s %15s %8s %12v",
 		"TOT",
-		FormatCount(int64(totalExpected)),
-		FormatCount(int64(totalActual)),
+		helpers.FormatNumber(int64(totalExpected)),
+		helpers.FormatNumber(int64(totalActual)),
 		totalMatchStr,
 		stats.TotalTime)
 	logger.Info("")

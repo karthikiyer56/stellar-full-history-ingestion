@@ -41,6 +41,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"strconv"
 	"sync"
 	"time"
@@ -634,8 +635,8 @@ func LogAllCFStats(store TxHashStore, logger Logger, label string) {
 	for _, cf := range stats {
 		logger.Info("%-4s %15s %15s %10d",
 			cf.Name,
-			FormatCount(cf.EstimatedKeys),
-			FormatBytes(cf.TotalSize),
+			helpers.FormatNumber(cf.EstimatedKeys),
+			helpers.FormatBytes(cf.TotalSize),
 			cf.TotalFiles)
 
 		totalKeys += cf.EstimatedKeys
@@ -644,7 +645,7 @@ func LogAllCFStats(store TxHashStore, logger Logger, label string) {
 	}
 
 	logger.Info("%-4s %15s %15s %10s", "----", "---------------", "---------------", "----------")
-	logger.Info("%-4s %15s %15s %10d", "TOT", FormatCount(totalKeys), FormatBytes(totalSize), totalFiles)
+	logger.Info("%-4s %15s %15s %10d", "TOT", helpers.FormatNumber(totalKeys), helpers.FormatBytes(totalSize), totalFiles)
 	logger.Info("")
 }
 

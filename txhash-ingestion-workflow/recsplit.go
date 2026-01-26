@@ -52,6 +52,7 @@ import (
 
 	erigonlog "github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/recsplit"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 )
 
 // =============================================================================
@@ -139,16 +140,16 @@ func (rs *RecSplitStats) LogSummary(logger Logger) {
 		if stats != nil {
 			logger.Info("%-4s %15s %12v %12s",
 				cf,
-				FormatCount(int64(stats.KeyCount)),
+				helpers.FormatNumber(int64(stats.KeyCount)),
 				stats.BuildTime,
-				FormatBytes(stats.IndexSize))
+				helpers.FormatBytes(stats.IndexSize))
 			totalKeys += stats.KeyCount
 			totalSize += stats.IndexSize
 		}
 	}
 
 	logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
-	logger.Info("%-4s %15s %12v %12s", "TOT", FormatCount(int64(totalKeys)), rs.TotalTime, FormatBytes(totalSize))
+	logger.Info("%-4s %15s %12v %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), rs.TotalTime, helpers.FormatBytes(totalSize))
 	logger.Info("")
 }
 
@@ -253,7 +254,7 @@ func (b *RecSplitBuilder) cleanupDirectories() error {
 	if err := os.RemoveAll(b.tmpPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to clean temp directory: %w", err)
 	}
-	if err := os.MkdirAll(b.tmpPath, 0755); err != nil {
+	if err := helpers.EnsureDir(b.tmpPath); err != nil {
 		return fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
@@ -261,7 +262,7 @@ func (b *RecSplitBuilder) cleanupDirectories() error {
 	if err := os.RemoveAll(b.indexPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to clean index directory: %w", err)
 	}
-	if err := os.MkdirAll(b.indexPath, 0755); err != nil {
+	if err := helpers.EnsureDir(b.indexPath); err != nil {
 		return fmt.Errorf("failed to create index directory: %w", err)
 	}
 
@@ -284,7 +285,7 @@ func (b *RecSplitBuilder) buildSequential() error {
 		}
 
 		b.logger.Info("[%2d/16] CF [%s]: Building index for %s keys...",
-			i+1, cfName, FormatCount(int64(keyCount)))
+			i+1, cfName, helpers.FormatNumber(int64(keyCount)))
 
 		stats, err := b.buildCFIndex(cfName, keyCount)
 		if err != nil {
@@ -293,7 +294,7 @@ func (b *RecSplitBuilder) buildSequential() error {
 
 		b.stats.PerCFStats[cfName] = stats
 		b.logger.Info("        Completed in %v, size: %s",
-			stats.BuildTime, FormatBytes(stats.IndexSize))
+			stats.BuildTime, helpers.FormatBytes(stats.IndexSize))
 
 		// Check memory after each CF
 		b.memory.Check()
@@ -332,7 +333,7 @@ func (b *RecSplitBuilder) buildParallel() error {
 			mu.Lock()
 			b.stats.PerCFStats[cf] = stats
 			b.logger.Info("CF [%s] completed: %s keys in %v",
-				cf, FormatCount(int64(stats.KeyCount)), stats.BuildTime)
+				cf, helpers.FormatNumber(int64(stats.KeyCount)), stats.BuildTime)
 			mu.Unlock()
 		}(i, cfName)
 	}
@@ -365,7 +366,7 @@ func (b *RecSplitBuilder) buildCFIndex(cfName string, keyCount uint64) (*RecSpli
 
 	// Create temp directory for this CF
 	cfTmpDir := filepath.Join(b.tmpPath, cfName)
-	if err := os.MkdirAll(cfTmpDir, 0755); err != nil {
+	if err := helpers.EnsureDir(cfTmpDir); err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 

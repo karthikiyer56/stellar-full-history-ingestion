@@ -48,6 +48,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers/lfs"
 )
 
 // =============================================================================
@@ -475,14 +478,9 @@ func (c *Config) Validate() error {
 	}
 	c.LFSStorePath = absLFSPath
 
-	if _, err := os.Stat(absLFSPath); os.IsNotExist(err) {
-		return fmt.Errorf("LFS store does not exist: %s", absLFSPath)
-	}
-
-	// Check for chunks directory
-	chunksPath := filepath.Join(absLFSPath, "chunks")
-	if _, err := os.Stat(chunksPath); os.IsNotExist(err) {
-		return fmt.Errorf("LFS store missing chunks directory: %s", chunksPath)
+	// Use helpers/lfs validation
+	if err := lfs.ValidateLfsStore(absLFSPath); err != nil {
+		return err
 	}
 
 	// =========================================================================
@@ -532,7 +530,7 @@ func (c *Config) Validate() error {
 		}
 
 		for _, dir := range dirs {
-			if err := os.MkdirAll(dir, 0755); err != nil {
+			if err := helpers.EnsureDir(dir); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", dir, err)
 			}
 		}
@@ -540,7 +538,7 @@ func (c *Config) Validate() error {
 		// Ensure log file directories exist
 		for _, logPath := range []string{c.LogFile, c.ErrorFile, c.QueryOutput, c.QueryLog, c.QueryError} {
 			logDir := filepath.Dir(logPath)
-			if err := os.MkdirAll(logDir, 0755); err != nil {
+			if err := helpers.EnsureDir(logDir); err != nil {
 				return fmt.Errorf("failed to create log directory %s: %w", logDir, err)
 			}
 		}

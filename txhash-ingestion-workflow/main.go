@@ -54,6 +54,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"os"
 	"os/signal"
 	"syscall"
@@ -410,7 +411,7 @@ func logDryRunMetaState(config *Config, logger Logger) {
 	for _, count := range cfCounts {
 		totalCount += count
 	}
-	logger.Info("  Total Entries So Far:  %s", FormatCount(int64(totalCount)))
+	logger.Info("  Total Entries So Far:  %s", helpers.FormatNumber(int64(totalCount)))
 	logger.Info("")
 
 	// Show what will happen on resume
@@ -452,7 +453,7 @@ func logDryRunMetaState(config *Config, logger Logger) {
 		for _, cf := range ColumnFamilyNames {
 			count := cfCounts[cf]
 			pct := 100.0 * float64(count) / float64(totalCount)
-			logger.Info("  CF %s: %12s (%5.2f%%)", cf, FormatCount(int64(count)), pct)
+			logger.Info("  CF %s: %12s (%5.2f%%)", cf, helpers.FormatNumber(int64(count)), pct)
 		}
 		logger.Info("")
 	}

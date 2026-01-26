@@ -42,6 +42,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"path/filepath"
 	"time"
 
@@ -112,7 +113,7 @@ func (vs *VerifyStats) LogSummary(logger Logger) {
 		if stats != nil {
 			logger.Info("%-4s %15s %10d %12v %15.0f",
 				cf,
-				FormatCount(int64(stats.KeysVerified)),
+				helpers.FormatNumber(int64(stats.KeysVerified)),
 				stats.Failures,
 				stats.VerifyTime,
 				stats.KeysPerSecond)
@@ -125,7 +126,7 @@ func (vs *VerifyStats) LogSummary(logger Logger) {
 		"----", "---------------", "----------", "------------", "---------------")
 	logger.Info("%-4s %15s %10d %12v",
 		"TOT",
-		FormatCount(int64(totalKeys)),
+		helpers.FormatNumber(int64(totalKeys)),
 		totalFailures,
 		vs.TotalTime)
 
@@ -236,7 +237,7 @@ func (v *Verifier) Run() (*VerifyStats, error) {
 
 		v.stats.PerCFStats[cfName] = stats
 		v.logger.Info("        Verified %s keys in %v (%.0f keys/sec), failures: %d",
-			FormatCount(int64(stats.KeysVerified)),
+			helpers.FormatNumber(int64(stats.KeysVerified)),
 			stats.VerifyTime,
 			stats.KeysPerSecond,
 			stats.Failures)

@@ -49,6 +49,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"time"
 )
 
@@ -342,7 +343,7 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 
 	w.logger.Info("")
 	w.logger.Info("Ingestion phase completed in %v", w.stats.IngestionTime)
-	w.logger.Info("Total keys ingested: %s", FormatCount(int64(totalKeys)))
+	w.logger.Info("Total keys ingested: %s", helpers.FormatNumber(int64(totalKeys)))
 	w.logger.Info("")
 	w.logger.Sync()
 
@@ -431,7 +432,7 @@ func (w *Workflow) runRecSplitBuild() error {
 
 	w.logger.Info("")
 	w.logger.Info("RecSplit build completed in %v", stats.TotalTime)
-	w.logger.Info("Total keys indexed: %s", FormatCount(int64(stats.TotalKeys)))
+	w.logger.Info("Total keys indexed: %s", helpers.FormatNumber(int64(stats.TotalKeys)))
 	w.logger.Info("")
 	w.logger.Sync()
 
@@ -477,7 +478,7 @@ func (w *Workflow) runVerification() error {
 
 	w.logger.Info("")
 	w.logger.Info("Verification completed in %v", stats.TotalTime)
-	w.logger.Info("Keys verified: %s", FormatCount(int64(stats.TotalKeysVerified)))
+	w.logger.Info("Keys verified: %s", helpers.FormatNumber(int64(stats.TotalKeysVerified)))
 	if stats.TotalFailures > 0 {
 		w.logger.Error("Verification failures: %d", stats.TotalFailures)
 	} else {
@@ -520,8 +521,8 @@ func (w *Workflow) logFinalSummary() {
 	w.logger.Info("")
 
 	w.logger.Info("DATA STATISTICS:")
-	w.logger.Info("  Keys Ingested:     %s", FormatCount(int64(w.stats.TotalKeysIngested)))
-	w.logger.Info("  Keys Verified:     %s", FormatCount(int64(w.stats.TotalKeysVerified)))
+	w.logger.Info("  Keys Ingested:     %s", helpers.FormatNumber(int64(w.stats.TotalKeysIngested)))
+	w.logger.Info("  Keys Verified:     %s", helpers.FormatNumber(int64(w.stats.TotalKeysVerified)))
 	if w.stats.VerificationFailures > 0 {
 		w.logger.Error("  Verify Failures:   %d", w.stats.VerificationFailures)
 	} else {
