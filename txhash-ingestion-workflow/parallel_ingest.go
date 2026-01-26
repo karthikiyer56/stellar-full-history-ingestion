@@ -438,12 +438,13 @@ func (pi *ParallelIngester) processBatch(batchNum int, startLedger, endLedger ui
 	return timing, nil
 }
 
-// reader reads compressed ledger data from LFS
+// reader reads RAW compressed ledger data from LFS (no decompression).
+// Workers handle the CPU-intensive decompression and unmarshaling.
 func (pi *ParallelIngester) reader(id int, startSeq, endSeq uint32, errChan chan<- error) {
 	defer pi.readerWg.Done()
 
-	// Create iterator for this reader's range
-	iterator, err := lfs.NewLedgerIterator(pi.config.LFSStorePath, startSeq, endSeq)
+	// Use RawLedgerIterator - only reads compressed bytes, no decompression
+	iterator, err := lfs.NewRawLedgerIterator(pi.config.LFSStorePath, startSeq, endSeq)
 	if err != nil {
 		select {
 		case errChan <- fmt.Errorf("reader %d: failed to create iterator: %w", id, err):
@@ -454,13 +455,11 @@ func (pi *ParallelIngester) reader(id int, startSeq, endSeq uint32, errChan chan
 	defer iterator.Close()
 
 	for {
-		readStart := time.Now()
-
-		// Read raw compressed data (we'll decompress in workers)
-		lcm, ledgerSeq, timing, hasMore, err := iterator.Next()
+		// Read raw compressed data - NO decompression here
+		data, hasMore, err := iterator.Next()
 		if err != nil {
 			select {
-			case errChan <- fmt.Errorf("reader %d: failed to read ledger %d: %w", id, ledgerSeq, err):
+			case errChan <- fmt.Errorf("reader %d: failed to read ledger %d: %w", id, data.LedgerSeq, err):
 			default:
 			}
 			return
@@ -469,22 +468,11 @@ func (pi *ParallelIngester) reader(id int, startSeq, endSeq uint32, errChan chan
 			break
 		}
 
-		// Marshal the LCM to bytes for the worker to process
-		// Note: This is slightly inefficient but allows clean separation
-		// In production, we'd pass the raw compressed bytes directly
-		data, err := lcm.MarshalBinary()
-		if err != nil {
-			select {
-			case errChan <- fmt.Errorf("reader %d: failed to marshal ledger %d: %w", id, ledgerSeq, err):
-			default:
-			}
-			return
-		}
-
+		// Send raw compressed bytes to worker for processing
 		pi.workChan <- LedgerWork{
-			LedgerSeq:      ledgerSeq,
-			CompressedData: data, // Already decompressed by iterator
-			ReadTime:       timing.TotalTime + time.Since(readStart),
+			LedgerSeq:      data.LedgerSeq,
+			CompressedData: data.CompressedData, // Actually compressed now!
+			ReadTime:       data.ReadTime,
 		}
 	}
 }
@@ -493,8 +481,7 @@ func (pi *ParallelIngester) reader(id int, startSeq, endSeq uint32, errChan chan
 func (pi *ParallelIngester) worker(id int, errChan chan<- error) {
 	defer pi.workerWg.Done()
 
-	// Create a zstd decoder for this worker (if we were passing compressed data)
-	// Since the iterator already decompresses, we skip this
+	// Create a zstd decoder for this worker - workers do actual decompression
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
 		select {
@@ -512,16 +499,22 @@ func (pi *ParallelIngester) worker(id int, errChan chan<- error) {
 		timing := WorkerTiming{}
 		totalStart := time.Now()
 
-		// Decompress (in this implementation, data is already decompressed by iterator)
-		// We'll skip decompress timing since iterator handled it
+		// Decompress - workers now do actual decompression (parallelized!)
 		decompressStart := time.Now()
-		// data := work.CompressedData (already decompressed)
+		uncompressed, err := decoder.DecodeAll(work.CompressedData, nil)
+		if err != nil {
+			select {
+			case errChan <- fmt.Errorf("worker %d: decompress failed for ledger %d: %w", id, work.LedgerSeq, err):
+			default:
+			}
+			return
+		}
 		timing.DecompressTime = time.Since(decompressStart)
 
 		// Unmarshal XDR
 		unmarshalStart := time.Now()
 		var lcm xdr.LedgerCloseMeta
-		if err := lcm.UnmarshalBinary(work.CompressedData); err != nil {
+		if err := lcm.UnmarshalBinary(uncompressed); err != nil {
 			select {
 			case errChan <- fmt.Errorf("worker %d: failed to unmarshal ledger %d: %w", id, work.LedgerSeq, err):
 			default:
