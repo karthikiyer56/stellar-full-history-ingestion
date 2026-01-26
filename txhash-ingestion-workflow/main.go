@@ -213,6 +213,10 @@ func parseFlags() *Config {
 
 	// Optional flags
 	flag.BoolVar(&config.ParallelRecsplit, "parallel-recsplit", false, "Build 16 RecSplit indexes in parallel (requires ~144GB RAM)")
+	flag.BoolVar(&config.SequentialIngestion, "sequential", false, "Use sequential (single-threaded) ingestion instead of parallel")
+	flag.IntVar(&config.ParallelWorkers, "parallel-workers", DefaultParallelWorkers, "Number of parallel workers for decompress/unmarshal/extract")
+	flag.IntVar(&config.ParallelReaders, "parallel-readers", DefaultParallelReaders, "Number of parallel LFS readers")
+	flag.IntVar(&config.ParallelBatchSize, "batch-size", DefaultParallelBatchSize, "Number of ledgers per batch (parallel mode)")
 	flag.BoolVar(&config.DryRun, "dry-run", false, "Validate configuration and exit without executing")
 	flag.IntVar(&config.RocksDB.BlockCacheSizeMB, "block-cache-mb", DefaultBlockCacheMB, "RocksDB block cache size in MB")
 
@@ -236,6 +240,10 @@ func parseFlags() *Config {
 		fmt.Fprintf(os.Stderr, "  --query-log PATH      Path to query statistics log\n")
 		fmt.Fprintf(os.Stderr, "  --query-error PATH    Path to query errors log\n")
 		fmt.Fprintf(os.Stderr, "\nOptional flags:\n")
+		fmt.Fprintf(os.Stderr, "  --sequential          Use sequential (single-threaded) ingestion\n")
+		fmt.Fprintf(os.Stderr, "  --parallel-workers N  Number of parallel workers (default: %d)\n", DefaultParallelWorkers)
+		fmt.Fprintf(os.Stderr, "  --parallel-readers N  Number of parallel LFS readers (default: %d)\n", DefaultParallelReaders)
+		fmt.Fprintf(os.Stderr, "  --batch-size N        Number of ledgers per batch (default: %d)\n", DefaultParallelBatchSize)
 		fmt.Fprintf(os.Stderr, "  --parallel-recsplit   Build 16 RecSplit indexes in parallel (~144GB RAM)\n")
 		fmt.Fprintf(os.Stderr, "  --block-cache-mb N    RocksDB block cache size in MB (default: %d)\n", DefaultBlockCacheMB)
 		fmt.Fprintf(os.Stderr, "  --dry-run             Validate configuration and exit\n")

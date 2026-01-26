@@ -316,8 +316,17 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 
 	phaseStart := time.Now()
 
-	// Run ingestion
-	err := RunIngestion(w.config, w.store, w.meta, w.logger, w.memory, startFromLedger)
+	// Choose between parallel and sequential ingestion
+	var err error
+	if w.config.SequentialIngestion {
+		w.logger.Info("Using SEQUENTIAL ingestion mode")
+		w.logger.Info("")
+		err = RunIngestion(w.config, w.store, w.meta, w.logger, w.memory, startFromLedger)
+	} else {
+		w.logger.Info("Using PARALLEL ingestion mode")
+		w.logger.Info("")
+		err = RunParallelIngestion(w.config, w.store, w.meta, w.logger, w.memory, startFromLedger)
+	}
 	if err != nil {
 		return fmt.Errorf("ingestion failed: %w", err)
 	}

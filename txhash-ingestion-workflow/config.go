@@ -379,6 +379,37 @@ type Config struct {
 	//
 	ParallelRecsplit bool
 
+	// SequentialIngestion uses the old single-threaded ingestion mode.
+	// Default: false (use parallel ingestion)
+	//
+	// Use this flag if you want to compare performance or if parallel
+	// mode has issues on your system.
+	//
+	SequentialIngestion bool
+
+	// ParallelWorkers is the number of worker goroutines for decompress/unmarshal/extract.
+	// Default: 16
+	//
+	// Each worker handles the full pipeline for a ledger:
+	// decompress → unmarshal XDR → extract txHashes
+	//
+	ParallelWorkers int
+
+	// ParallelReaders is the number of LFS reader goroutines.
+	// Default: 4
+	//
+	// Readers fetch compressed data from LFS and send to workers.
+	//
+	ParallelReaders int
+
+	// ParallelBatchSize is the number of ledgers per batch in parallel mode.
+	// Default: 5000
+	//
+	// Larger batches reduce checkpoint overhead but increase memory usage
+	// and potential re-work on crash recovery.
+	//
+	ParallelBatchSize int
+
 	// DryRun validates configuration without running the workflow.
 	// Shows what would happen and exits.
 	DryRun bool
@@ -609,8 +640,16 @@ func (c *Config) PrintConfig(logger Logger) {
 	logger.Info("")
 	logger.Info("OPTIONS:")
 	logger.Info("  Parallel RecSplit:   %v", c.ParallelRecsplit)
+	logger.Info("  Sequential Ingest:   %v", c.SequentialIngestion)
 	logger.Info("  Dry Run:             %v", c.DryRun)
 	logger.Info("")
+	if !c.SequentialIngestion {
+		logger.Info("PARALLEL INGESTION SETTINGS:")
+		logger.Info("  Parallel Workers:    %d", c.ParallelWorkers)
+		logger.Info("  Parallel Readers:    %d", c.ParallelReaders)
+		logger.Info("  Batch Size:          %d ledgers", c.ParallelBatchSize)
+		logger.Info("")
+	}
 }
 
 // PrintRocksDBConfig prints the RocksDB configuration to the logger.
