@@ -349,15 +349,15 @@ func (c *Config) Validate() error {
 	// Validate Ledger Range Pattern
 	// =========================================================================
 
-	startStr := fmt.Sprintf("%d", c.StartLedger)
-	if !ledgerStartPattern.MatchString(startStr) {
-		return fmt.Errorf("--start-ledger must match pattern X0000001 (e.g., 10000001, 20000001), got: %d", c.StartLedger)
-	}
-
-	endStr := fmt.Sprintf("%d", c.EndLedger)
-	if !ledgerEndPattern.MatchString(endStr) {
-		return fmt.Errorf("--end-ledger must match pattern Y0000000 (e.g., 20000000, 30000000), got: %d", c.EndLedger)
-	}
+	//startStr := fmt.Sprintf("%d", c.StartLedger)
+	//if !ledgerStartPattern.MatchString(startStr) {
+	//	return fmt.Errorf("--start-ledger must match pattern X0000001 (e.g., 10000001, 20000001), got: %d", c.StartLedger)
+	//}
+	//
+	//endStr := fmt.Sprintf("%d", c.EndLedger)
+	//if !ledgerEndPattern.MatchString(endStr) {
+	//	return fmt.Errorf("--end-ledger must match pattern Y0000000 (e.g., 20000000, 30000000), got: %d", c.EndLedger)
+	//}
 
 	if c.StartLedger >= c.EndLedger {
 		return fmt.Errorf("--start-ledger (%d) must be less than --end-ledger (%d)", c.StartLedger, c.EndLedger)
