@@ -26,7 +26,7 @@
 //
 //   SIGHUP is IGNORED during:
 //     - BUILDING_RECSPLIT: RecSplit has exclusive iteration
-//     - VERIFYING: Similar exclusive iteration
+//     - VERIFYING_RECSPLIT: Parallel verification in progress
 //     - COMPLETE: Process exits soon anyway
 //
 // QUERY FILE FORMAT:

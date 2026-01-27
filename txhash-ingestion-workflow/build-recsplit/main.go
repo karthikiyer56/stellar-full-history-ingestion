@@ -33,24 +33,97 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
-	erigonlog "github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/db/recsplit"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/compact"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/logging"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/memory"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/recsplit"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/verify"
 	"github.com/linxGnu/grocksdb"
 )
+
+// =============================================================================
+// Iterator Adapter - wraps grocksdb.Iterator to implement interfaces.Iterator
+// =============================================================================
+
+type iteratorAdapter struct {
+	iter *grocksdb.Iterator
+}
+
+func (a *iteratorAdapter) SeekToFirst() {
+	a.iter.SeekToFirst()
+}
+
+func (a *iteratorAdapter) Valid() bool {
+	return a.iter.Valid()
+}
+
+func (a *iteratorAdapter) Next() {
+	a.iter.Next()
+}
+
+func (a *iteratorAdapter) Key() []byte {
+	return a.iter.Key().Data()
+}
+
+func (a *iteratorAdapter) Value() []byte {
+	return a.iter.Value().Data()
+}
+
+func (a *iteratorAdapter) Error() error {
+	return a.iter.Err()
+}
+
+func (a *iteratorAdapter) Close() {
+	a.iter.Close()
+}
+
+// scanIteratorAdapter wraps grocksdb.Iterator with scan-optimized ReadOptions.
+// Unlike iteratorAdapter, this also owns and destroys the ReadOptions on Close().
+type scanIteratorAdapter struct {
+	iter     *grocksdb.Iterator
+	scanOpts *grocksdb.ReadOptions
+}
+
+func (a *scanIteratorAdapter) SeekToFirst() {
+	a.iter.SeekToFirst()
+}
+
+func (a *scanIteratorAdapter) Valid() bool {
+	return a.iter.Valid()
+}
+
+func (a *scanIteratorAdapter) Next() {
+	a.iter.Next()
+}
+
+func (a *scanIteratorAdapter) Key() []byte {
+	return a.iter.Key().Data()
+}
+
+func (a *scanIteratorAdapter) Value() []byte {
+	return a.iter.Value().Data()
+}
+
+func (a *scanIteratorAdapter) Error() error {
+	return a.iter.Err()
+}
+
+func (a *scanIteratorAdapter) Close() {
+	a.iter.Close()
+	if a.scanOpts != nil {
+		a.scanOpts.Destroy()
+	}
+}
 
 // =============================================================================
 // RocksDB Store (supports both read-only and read-write modes)
@@ -65,6 +138,7 @@ type Store struct {
 	blockCache *grocksdb.Cache
 	cfIndexMap map[string]int
 	readOnly   bool
+	path       string
 }
 
 func OpenStore(path string, blockCacheMB int, readOnly bool) (*Store, error) {
@@ -128,14 +202,36 @@ func OpenStore(path string, blockCacheMB int, readOnly bool) (*Store, error) {
 		blockCache: blockCache,
 		cfIndexMap: cfIndexMap,
 		readOnly:   readOnly,
+		path:       path,
 	}, nil
 }
 
-func (s *Store) NewIteratorCF(cfName string) *grocksdb.Iterator {
+// NewIteratorCF implements interfaces.TxHashStore (partial).
+// Returns an interfaces.Iterator for use with pkg/recsplit and pkg/verify.
+func (s *Store) NewIteratorCF(cfName string) interfaces.Iterator {
 	cfHandle := s.cfHandles[s.cfIndexMap[cfName]]
-	return s.db.NewIteratorCF(s.readOpts, cfHandle)
+	rawIter := s.db.NewIteratorCF(s.readOpts, cfHandle)
+	return &iteratorAdapter{iter: rawIter}
 }
 
+// NewScanIteratorCF creates a scan-optimized iterator for sequential scans.
+// Uses readahead prefetching and avoids polluting the block cache.
+func (s *Store) NewScanIteratorCF(cfName string) interfaces.Iterator {
+	cfHandle := s.cfHandles[s.cfIndexMap[cfName]]
+
+	// Create scan-optimized read options
+	scanOpts := grocksdb.NewDefaultReadOptions()
+	scanOpts.SetReadaheadSize(2 * 1024 * 1024) // 2MB readahead
+	scanOpts.SetFillCache(false)               // Don't pollute block cache
+
+	rawIter := s.db.NewIteratorCF(scanOpts, cfHandle)
+	return &scanIteratorAdapter{
+		iter:     rawIter,
+		scanOpts: scanOpts,
+	}
+}
+
+// CompactCF implements compact.Compactable.
 func (s *Store) CompactCF(cfName string) time.Duration {
 	if s.readOnly {
 		return 0
@@ -146,6 +242,7 @@ func (s *Store) CompactCF(cfName string) time.Duration {
 	return time.Since(start)
 }
 
+// Get retrieves a value from the store.
 func (s *Store) Get(cfName string, key []byte) ([]byte, bool, error) {
 	cfHandle := s.cfHandles[s.cfIndexMap[cfName]]
 	slice, err := s.db.GetCF(s.readOpts, cfHandle, key)
@@ -161,6 +258,11 @@ func (s *Store) Get(cfName string, key []byte) ([]byte, bool, error) {
 	value := make([]byte, slice.Size())
 	copy(value, slice.Data())
 	return value, true, nil
+}
+
+// Path returns the store path.
+func (s *Store) Path() string {
+	return s.path
 }
 
 func (s *Store) Close() {
@@ -189,6 +291,90 @@ func (s *Store) Close() {
 }
 
 // =============================================================================
+// Minimal TxHashStore Adapter
+// =============================================================================
+
+// TxHashStoreAdapter wraps Store to implement interfaces.TxHashStore.
+// Only the methods needed by pkg/recsplit and pkg/verify are actually used.
+type TxHashStoreAdapter struct {
+	store *Store
+}
+
+func NewTxHashStoreAdapter(store *Store) *TxHashStoreAdapter {
+	return &TxHashStoreAdapter{store: store}
+}
+
+func (a *TxHashStoreAdapter) NewIteratorCF(cfName string) interfaces.Iterator {
+	return a.store.NewIteratorCF(cfName)
+}
+
+func (a *TxHashStoreAdapter) NewScanIteratorCF(cfName string) interfaces.Iterator {
+	return a.store.NewScanIteratorCF(cfName)
+}
+
+func (a *TxHashStoreAdapter) Get(txHash []byte) ([]byte, bool, error) {
+	cfName := cf.GetName(txHash)
+	return a.store.Get(cfName, txHash)
+}
+
+func (a *TxHashStoreAdapter) Path() string {
+	return a.store.Path()
+}
+
+// Unused methods - implement as no-ops or panics
+func (a *TxHashStoreAdapter) WriteBatch(entriesByCF map[string][]types.Entry) error {
+	panic("WriteBatch not supported in read-only mode")
+}
+
+func (a *TxHashStoreAdapter) FlushAll() error {
+	panic("FlushAll not supported in read-only mode")
+}
+
+func (a *TxHashStoreAdapter) CompactAll() time.Duration {
+	panic("CompactAll not supported - use compact.CompactAllCFs instead")
+}
+
+func (a *TxHashStoreAdapter) CompactCF(cfName string) time.Duration {
+	return a.store.CompactCF(cfName)
+}
+
+func (a *TxHashStoreAdapter) GetAllCFStats() []types.CFStats {
+	return nil
+}
+
+func (a *TxHashStoreAdapter) GetCFStats(cfName string) types.CFStats {
+	return types.CFStats{}
+}
+
+func (a *TxHashStoreAdapter) Close() {
+	// Don't close here - the underlying store is closed separately
+}
+
+// =============================================================================
+// No-Op MetaStore for standalone verification
+// =============================================================================
+
+// NoOpMetaStore implements interfaces.MetaStore with no-op operations.
+// Used for standalone verification where no crash recovery is needed.
+type NoOpMetaStore struct{}
+
+func (m *NoOpMetaStore) GetStartLedger() (uint32, error)               { return 0, nil }
+func (m *NoOpMetaStore) GetEndLedger() (uint32, error)                 { return 0, nil }
+func (m *NoOpMetaStore) SetConfig(startLedger, endLedger uint32) error { return nil }
+func (m *NoOpMetaStore) GetPhase() (types.Phase, error)                { return "", nil }
+func (m *NoOpMetaStore) SetPhase(phase types.Phase) error              { return nil }
+func (m *NoOpMetaStore) GetLastCommittedLedger() (uint32, error)       { return 0, nil }
+func (m *NoOpMetaStore) GetCFCounts() (map[string]uint64, error)       { return nil, nil }
+func (m *NoOpMetaStore) CommitBatchProgress(lastLedger uint32, cfCounts map[string]uint64) error {
+	return nil
+}
+func (m *NoOpMetaStore) GetVerifyCF() (string, error)      { return "", nil }
+func (m *NoOpMetaStore) SetVerifyCF(cf string) error       { return nil }
+func (m *NoOpMetaStore) Exists() bool                      { return false }
+func (m *NoOpMetaStore) LogState(logger interfaces.Logger) {}
+func (m *NoOpMetaStore) Close()                            {}
+
+// =============================================================================
 // Key Counter (discovers key counts by iterating)
 // =============================================================================
 
@@ -200,170 +386,10 @@ func countKeys(store *Store, cfName string) (uint64, error) {
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		count++
 	}
-	if err := iter.Err(); err != nil {
+	if err := iter.Error(); err != nil {
 		return 0, err
 	}
 	return count, nil
-}
-
-// =============================================================================
-// RecSplit Builder
-// =============================================================================
-
-type CFBuildStats struct {
-	CFName    string
-	KeyCount  uint64
-	BuildTime time.Duration
-	IndexSize int64
-}
-
-func buildCFIndex(store *Store, cfName string, keyCount uint64, indexPath, tmpPath string, logger *logging.DualLogger) (*CFBuildStats, error) {
-	stats := &CFBuildStats{
-		CFName:   cfName,
-		KeyCount: keyCount,
-	}
-
-	startTime := time.Now()
-
-	// Create temp directory for this CF
-	cfTmpDir := filepath.Join(tmpPath, cfName)
-	if err := os.MkdirAll(cfTmpDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create temp dir: %w", err)
-	}
-
-	// Index file path
-	indexFile := filepath.Join(indexPath, fmt.Sprintf("cf-%s.idx", cfName))
-
-	// Create RecSplit builder
-	erigonLogger := erigonlog.New()
-
-	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
-		KeyCount:           int(keyCount),
-		Enums:              false,
-		LessFalsePositives: true,
-		BucketSize:         types.RecSplitBucketSize,
-		LeafSize:           types.RecSplitLeafSize,
-		TmpDir:             cfTmpDir,
-		IndexFile:          indexFile,
-		BaseDataID:         0,
-		Version:            types.RecSplitDataVersion,
-	}, erigonLogger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create RecSplit: %w", err)
-	}
-	defer rs.Close()
-
-	// Iterate and add keys
-	iter := store.NewIteratorCF(cfName)
-	defer iter.Close()
-
-	keysAdded := 0
-	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-		key := iter.Key().Data()
-		value := iter.Value().Data()
-		ledgerSeq := types.ParseLedgerSeq(value)
-
-		if err := rs.AddKey(key, uint64(ledgerSeq)); err != nil {
-			return nil, fmt.Errorf("failed to add key %d: %w", keysAdded, err)
-		}
-		keysAdded++
-	}
-
-	if err := iter.Err(); err != nil {
-		return nil, fmt.Errorf("iterator error: %w", err)
-	}
-
-	if uint64(keysAdded) != keyCount {
-		return nil, fmt.Errorf("key count mismatch: expected %d, got %d", keyCount, keysAdded)
-	}
-
-	// Build the index
-	ctx := context.Background()
-	if err := rs.Build(ctx); err != nil {
-		if err == recsplit.ErrCollision {
-			return nil, fmt.Errorf("hash collision detected (rare, try rebuilding)")
-		}
-		return nil, fmt.Errorf("failed to build index: %w", err)
-	}
-
-	stats.BuildTime = time.Since(startTime)
-
-	// Get index file size
-	if info, err := os.Stat(indexFile); err == nil {
-		stats.IndexSize = info.Size()
-	}
-
-	// Clean up temp directory
-	os.RemoveAll(cfTmpDir)
-
-	return stats, nil
-}
-
-// =============================================================================
-// Verification
-// =============================================================================
-
-type VerifyResult struct {
-	CFName       string
-	KeysVerified uint64
-	Failures     uint64
-	Duration     time.Duration
-}
-
-func verifyCF(store *Store, cfName string, indexPath string, logger *logging.DualLogger) (*VerifyResult, error) {
-	result := &VerifyResult{
-		CFName: cfName,
-	}
-
-	startTime := time.Now()
-
-	// Open RecSplit index
-	idxPath := filepath.Join(indexPath, fmt.Sprintf("cf-%s.idx", cfName))
-	idx, err := recsplit.OpenIndex(idxPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open index %s: %w", idxPath, err)
-	}
-	defer idx.Close()
-
-	reader := recsplit.NewIndexReader(idx)
-
-	// Iterate over RocksDB and verify each key
-	iter := store.NewIteratorCF(cfName)
-	defer iter.Close()
-
-	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-		key := iter.Key().Data()
-		value := iter.Value().Data()
-		expectedLedgerSeq := types.ParseLedgerSeq(value)
-
-		// Look up in RecSplit
-		offset, found := reader.Lookup(key)
-		if !found {
-			result.Failures++
-			logger.Error("CF %s: Key %s not found in RecSplit",
-				cfName, types.BytesToHex(key))
-			continue
-		}
-
-		// RecSplit returns uint64, which is our ledgerSeq
-		actualLedgerSeq := uint32(offset)
-
-		if actualLedgerSeq != expectedLedgerSeq {
-			result.Failures++
-			logger.Error("CF %s: Key %s value mismatch: expected %d, got %d",
-				cfName, types.BytesToHex(key), expectedLedgerSeq, actualLedgerSeq)
-			continue
-		}
-
-		result.KeysVerified++
-	}
-
-	if err := iter.Err(); err != nil {
-		return nil, fmt.Errorf("iterator error: %w", err)
-	}
-
-	result.Duration = time.Since(startTime)
-	return result, nil
 }
 
 // =============================================================================
@@ -378,7 +404,7 @@ func main() {
 	errorPath := flag.String("error", "", "Path to error file (required)")
 	parallel := flag.Bool("parallel", false, "Build 16 indexes in parallel")
 	doCompact := flag.Bool("compact", false, "Compact RocksDB before building")
-	verify := flag.Bool("verify", false, "Verify indexes after building")
+	doVerify := flag.Bool("verify", false, "Verify indexes after building")
 	blockCacheMB := flag.Int("block-cache-mb", 8192, "RocksDB block cache size in MB")
 
 	flag.Parse()
@@ -411,7 +437,7 @@ func main() {
 	logger.Info("  Output Dir:      %s", *outputDir)
 	logger.Info("  Parallel Mode:   %v", *parallel)
 	logger.Info("  Compact First:   %v", *doCompact)
-	logger.Info("  Verify After:    %v", *verify)
+	logger.Info("  Verify After:    %v", *doVerify)
 	logger.Info("  Block Cache:     %d MB", *blockCacheMB)
 	logger.Info("")
 
@@ -480,195 +506,49 @@ func main() {
 	logger.Info("Current RSS: %.2f GB", memMonitor.CurrentRSSGB())
 	logger.Info("")
 
-	// Estimate memory
-	if *parallel {
-		estMem := totalKeys * 40 // ~40 bytes per key
-		logger.Info("MEMORY ESTIMATE (Parallel Mode):")
-		logger.Info("  ~%s for all 16 CFs building simultaneously", helpers.FormatBytes(int64(estMem)))
-		logger.Info("")
-		logger.Info("WARNING: This requires significant RAM!")
-	} else {
-		var maxKeys uint64
-		for _, count := range cfCounts {
-			if count > maxKeys {
-				maxKeys = count
-			}
-		}
-		estMem := maxKeys * 40
-		logger.Info("MEMORY ESTIMATE (Sequential Mode):")
-		logger.Info("  ~%s peak (largest CF)", helpers.FormatBytes(int64(estMem)))
-	}
-	logger.Info("")
+	// Phase 2: Build indexes using pkg/recsplit
+	// Create adapter for pkg/recsplit
+	storeAdapter := NewTxHashStoreAdapter(store)
 
-	// Phase 2: Build indexes
-	logger.Separator()
-	logger.Info("                    BUILDING RECSPLIT INDEXES")
-	logger.Separator()
-	logger.Info("")
+	// Use pkg/recsplit.Builder
+	builder := recsplit.NewBuilder(
+		storeAdapter,
+		cfCounts,
+		indexPath,
+		tmpPath,
+		*parallel,
+		logger,
+		memMonitor,
+	)
 
-	buildStart := time.Now()
-	allStats := make(map[string]*CFBuildStats)
-
-	if *parallel {
-		logger.Info("Building 16 indexes in parallel...")
-		logger.Info("")
-
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		errors := make([]error, len(cf.Names))
-
-		for i, cfName := range cf.Names {
-			wg.Add(1)
-			go func(idx int, cfn string) {
-				defer wg.Done()
-
-				keyCount := cfCounts[cfn]
-				if keyCount == 0 {
-					return
-				}
-
-				stats, err := buildCFIndex(store, cfn, keyCount, indexPath, tmpPath, logger)
-				if err != nil {
-					errors[idx] = fmt.Errorf("CF %s: %w", cfn, err)
-					return
-				}
-
-				mu.Lock()
-				allStats[cfn] = stats
-				logger.Info("CF [%s] completed: %s keys in %v, size: %s",
-					cfn, helpers.FormatNumber(int64(stats.KeyCount)), stats.BuildTime, helpers.FormatBytes(stats.IndexSize))
-				mu.Unlock()
-			}(i, cfName)
-		}
-
-		wg.Wait()
-
-		for _, err := range errors {
-			if err != nil {
-				logger.Error("%v", err)
-				os.Exit(1)
-			}
-		}
-	} else {
-		logger.Info("Building indexes sequentially...")
-		logger.Info("")
-
-		for i, cfName := range cf.Names {
-			keyCount := cfCounts[cfName]
-			if keyCount == 0 {
-				logger.Info("[%2d/16] CF [%s]: No keys, skipping", i+1, cfName)
-				continue
-			}
-
-			logger.Info("[%2d/16] CF [%s]: Building index for %s keys...",
-				i+1, cfName, helpers.FormatNumber(int64(keyCount)))
-
-			stats, err := buildCFIndex(store, cfName, keyCount, indexPath, tmpPath, logger)
-			if err != nil {
-				logger.Error("Failed to build index for CF %s: %v", cfName, err)
-				os.Exit(1)
-			}
-
-			allStats[cfName] = stats
-			logger.Info("        Completed in %v, size: %s, RSS: %.2f GB",
-				stats.BuildTime, helpers.FormatBytes(stats.IndexSize), memMonitor.CurrentRSSGB())
-		}
+	buildStats, err := builder.Run()
+	if err != nil {
+		logger.Error("RecSplit building failed: %v", err)
+		os.Exit(1)
 	}
 
-	totalBuildTime := time.Since(buildStart)
+	// Phase 3: Verification (optional) using pkg/verify
+	if *doVerify {
+		// Use pkg/verify.Verifier with no-op meta store
+		noOpMeta := &NoOpMetaStore{}
+		verifier := verify.NewVerifier(
+			storeAdapter,
+			noOpMeta,
+			indexPath,
+			"", // no resume
+			logger,
+			memMonitor,
+		)
 
-	// Log build summary
-	logger.Info("")
-	logger.Separator()
-	logger.Info("                    BUILD SUMMARY")
-	logger.Separator()
-	logger.Info("")
-
-	var totalSize int64
-	logger.Info("%-4s %15s %12s %12s", "CF", "Keys", "Build Time", "Index Size")
-	logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
-
-	for _, cfName := range cf.Names {
-		stats := allStats[cfName]
-		if stats != nil {
-			logger.Info("%-4s %15s %12v %12s",
-				cfName,
-				helpers.FormatNumber(int64(stats.KeyCount)),
-				stats.BuildTime,
-				helpers.FormatBytes(stats.IndexSize))
-			totalSize += stats.IndexSize
-		}
-	}
-
-	logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
-	logger.Info("%-4s %15s %12v %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), totalBuildTime, helpers.FormatBytes(totalSize))
-	logger.Info("")
-	logger.Info("Output: %s", indexPath)
-	logger.Info("Current RSS: %.2f GB", memMonitor.CurrentRSSGB())
-	logger.Info("")
-
-	// Phase 3: Verification (optional)
-	if *verify {
-		logger.Separator()
-		logger.Info("                    VERIFICATION PHASE")
-		logger.Separator()
-		logger.Info("")
-		logger.Info("Verifying RecSplit indexes against RocksDB data...")
-		logger.Info("")
-
-		verifyStart := time.Now()
-		var totalVerified, totalFailures uint64
-
-		for i, cfName := range cf.Names {
-			keyCount := cfCounts[cfName]
-			if keyCount == 0 {
-				logger.Info("[%2d/16] CF [%s]: No keys, skipping", i+1, cfName)
-				continue
-			}
-
-			logger.Info("[%2d/16] CF [%s]: Verifying %s keys...",
-				i+1, cfName, helpers.FormatNumber(int64(keyCount)))
-
-			result, err := verifyCF(store, cfName, indexPath, logger)
-			if err != nil {
-				logger.Error("Verification error for CF %s: %v", cfName, err)
-				continue
-			}
-
-			totalVerified += result.KeysVerified
-			totalFailures += result.Failures
-
-			if result.Failures == 0 {
-				logger.Info("        PASSED: %s keys verified in %v",
-					helpers.FormatNumber(int64(result.KeysVerified)), result.Duration)
-			} else {
-				logger.Error("        FAILED: %d failures out of %d keys",
-					result.Failures, result.KeysVerified+result.Failures)
-			}
-
-			if (i+1)%4 == 0 {
-				memMonitor.Check()
-			}
+		verifyStats, err := verifier.Run()
+		if err != nil {
+			logger.Error("Verification failed: %v", err)
+			os.Exit(1)
 		}
 
-		totalVerifyTime := time.Since(verifyStart)
-
-		logger.Info("")
-		logger.Separator()
-		logger.Info("                    VERIFICATION SUMMARY")
-		logger.Separator()
-		logger.Info("")
-		logger.Info("Total Keys Verified: %s", helpers.FormatNumber(int64(totalVerified)))
-		logger.Info("Total Failures:      %d", totalFailures)
-		logger.Info("Verification Time:   %v", totalVerifyTime)
-		logger.Info("")
-
-		if totalFailures == 0 {
-			logger.Info("STATUS: ALL VERIFICATIONS PASSED")
-		} else {
-			logger.Error("STATUS: %d FAILURES DETECTED", totalFailures)
+		if verifyStats.TotalFailures > 0 {
+			logger.Error("Verification completed with %d failures", verifyStats.TotalFailures)
 		}
-		logger.Info("")
 	}
 
 	// Final summary
@@ -679,11 +559,17 @@ func main() {
 	// Clean up temp directory
 	os.RemoveAll(tmpPath)
 
-	fmt.Printf("Build complete: %s keys in %v\n", helpers.FormatNumber(int64(totalKeys)), totalBuildTime)
+	fmt.Printf("Build complete: %s keys in %v\n", helpers.FormatNumber(int64(buildStats.TotalKeys)), buildStats.TotalTime)
 	fmt.Printf("Index files: %s\n", indexPath)
+
+	// Calculate total size
+	var totalSize int64
+	for _, stats := range buildStats.PerCFStats {
+		totalSize += stats.IndexSize
+	}
 	fmt.Printf("Total index size: %s\n", helpers.FormatBytes(totalSize))
 
-	if *verify {
+	if *doVerify {
 		fmt.Println("Verification: PASSED")
 	}
 }

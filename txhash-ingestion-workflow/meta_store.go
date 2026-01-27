@@ -575,7 +575,7 @@ func CheckResumability(meta interfaces.MetaStore, configStart, configEnd uint32)
 			startFrom = lastCommitted + 1
 		}
 
-	case types.PhaseCompacting, types.PhaseBuildingRecsplit, types.PhaseVerifying:
+	case types.PhaseCompacting, types.PhaseBuildingRecsplit, types.PhaseVerifyingRecsplit:
 		// These phases restart from the beginning of the phase
 		startFrom = 0 // Not applicable for these phases
 
@@ -617,7 +617,7 @@ func LogResumeState(meta interfaces.MetaStore, logger interfaces.Logger, resumeF
 	case types.PhaseBuildingRecsplit:
 		logger.Info("  Action:                Rebuild all RecSplit indexes")
 
-	case types.PhaseVerifying:
+	case types.PhaseVerifyingRecsplit:
 		verifyCF, _ := meta.GetVerifyCF()
 		logger.Info("  Resume From CF:        %s", verifyCF)
 

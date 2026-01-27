@@ -253,6 +253,34 @@ func (s *RocksDBTxHashStore) NewIteratorCF(cfName string) interfaces.Iterator {
 	return &rocksDBIterator{iter: iter}
 }
 
+// NewScanIteratorCF creates a scan-optimized iterator for a specific column family.
+//
+// This iterator is optimized for full sequential scans (e.g., counting entries):
+//   - 2MB readahead buffer for prefetching sequential reads
+//   - Does not fill block cache (avoids cache pollution during scans)
+//   - Auto-tunes readahead size based on access patterns
+//
+// Use this for operations that iterate through all entries in a CF, such as
+// count verification after compaction. For point lookups or small range scans,
+// use NewIteratorCF() instead.
+func (s *RocksDBTxHashStore) NewScanIteratorCF(cfName string) interfaces.Iterator {
+	s.mu.RLock()
+	cfHandle := s.getCFHandleByName(cfName)
+	s.mu.RUnlock()
+
+	// Create scan-optimized read options
+	scanOpts := grocksdb.NewDefaultReadOptions()
+	scanOpts.SetReadaheadSize(2 * 1024 * 1024) // 2MB readahead for sequential access
+	scanOpts.SetFillCache(false)               // Don't pollute block cache with scan data
+
+	iter := s.db.NewIteratorCF(scanOpts, cfHandle)
+
+	return &rocksDBScanIterator{
+		iter:     iter,
+		scanOpts: scanOpts, // Must destroy when iterator closes
+	}
+}
+
 // FlushAll flushes all column family MemTables to SST files on disk.
 func (s *RocksDBTxHashStore) FlushAll() error {
 	s.mu.Lock()
@@ -275,44 +303,74 @@ func (s *RocksDBTxHashStore) FlushAll() error {
 	return nil
 }
 
-// CompactAll performs full compaction on all 16 column families.
+// CompactAll performs full compaction on all 16 column families in parallel.
+//
+// NOTE: This method does NOT hold a lock during compaction. RocksDB is thread-safe
+// and handles concurrent reads/writes during compaction internally. All 16 CFs are
+// compacted in parallel using goroutines, with SetExclusiveManualCompaction(false)
+// to allow concurrent manual compactions. Queries continue to work during compaction.
 func (s *RocksDBTxHashStore) CompactAll() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Get all CF handles under read lock (quick operation)
+	s.mu.RLock()
+	cfHandles := make([]*grocksdb.ColumnFamilyHandle, len(cf.Names))
+	for i := range cf.Names {
+		cfHandles[i] = s.cfHandles[i+1] // +1 because index 0 is "default"
+	}
+	s.mu.RUnlock()
 
 	s.logger.Separator()
-	s.logger.Info("                    COMPACTING ALL COLUMN FAMILIES")
+	s.logger.Info("                    COMPACTING ALL COLUMN FAMILIES (PARALLEL)")
 	s.logger.Separator()
+	s.logger.Info("")
+	s.logger.Info("Starting parallel compaction of all 16 column families...")
 
 	totalStart := time.Now()
 
+	// Compact all CFs in parallel - RocksDB is thread-safe
+	var wg sync.WaitGroup
 	for i, cfName := range cf.Names {
-		s.logger.Info("Compacting CF [%s]...", cfName)
-		start := time.Now()
+		wg.Add(1)
+		go func(idx int, name string) {
+			defer wg.Done()
 
-		cfHandle := s.cfHandles[i+1] // +1 because index 0 is "default"
-		s.db.CompactRangeCF(cfHandle, grocksdb.Range{Start: nil, Limit: nil})
+			// Create options that allow parallel manual compactions
+			opts := grocksdb.NewCompactRangeOptions()
+			opts.SetExclusiveManualCompaction(false) // Allow concurrent compactions
+			defer opts.Destroy()
 
-		elapsed := time.Since(start)
-		s.logger.Info("  CF [%s] compacted in %v", cfName, elapsed)
+			start := time.Now()
+			s.db.CompactRangeCFOpt(cfHandles[idx], grocksdb.Range{Start: nil, Limit: nil}, opts)
+			s.logger.Info("  CF [%s] compacted in %v", name, time.Since(start))
+		}(i, cfName)
 	}
+	wg.Wait()
 
 	totalTime := time.Since(totalStart)
 	s.logger.Info("")
-	s.logger.Info("All column families compacted in %v", totalTime)
+	s.logger.Info("All column families compacted in %v (parallel)", totalTime)
 
 	return totalTime
 }
 
 // CompactCF compacts a single column family by name.
+//
+// NOTE: This method does NOT hold a lock during compaction. RocksDB is thread-safe
+// and handles concurrent reads/writes during compaction internally. Uses
+// SetExclusiveManualCompaction(false) to allow concurrent compactions with other CFs.
 func (s *RocksDBTxHashStore) CompactCF(cfName string) time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	start := time.Now()
-
+	// Get CF handle under read lock (quick operation)
+	s.mu.RLock()
 	cfHandle := s.getCFHandleByName(cfName)
-	s.db.CompactRangeCF(cfHandle, grocksdb.Range{Start: nil, Limit: nil})
+	s.mu.RUnlock()
+
+	// Create options that allow parallel manual compactions
+	opts := grocksdb.NewCompactRangeOptions()
+	opts.SetExclusiveManualCompaction(false) // Allow concurrent compactions
+	defer opts.Destroy()
+
+	// Compaction runs WITHOUT holding any lock - RocksDB is thread-safe
+	start := time.Now()
+	s.db.CompactRangeCFOpt(cfHandle, grocksdb.Range{Start: nil, Limit: nil}, opts)
 
 	return time.Since(start)
 }
@@ -502,9 +560,52 @@ func (it *rocksDBIterator) Close() {
 	it.iter.Close()
 }
 
+// =============================================================================
+// RocksDB Scan Iterator Wrapper (optimized for sequential scans)
+// =============================================================================
+
+// rocksDBScanIterator wraps grocksdb.Iterator with scan-optimized ReadOptions.
+// Unlike rocksDBIterator, this also owns and destroys the ReadOptions on Close().
+type rocksDBScanIterator struct {
+	iter     *grocksdb.Iterator
+	scanOpts *grocksdb.ReadOptions
+}
+
+func (it *rocksDBScanIterator) SeekToFirst() {
+	it.iter.SeekToFirst()
+}
+
+func (it *rocksDBScanIterator) Valid() bool {
+	return it.iter.Valid()
+}
+
+func (it *rocksDBScanIterator) Next() {
+	it.iter.Next()
+}
+
+func (it *rocksDBScanIterator) Key() []byte {
+	return it.iter.Key().Data()
+}
+
+func (it *rocksDBScanIterator) Value() []byte {
+	return it.iter.Value().Data()
+}
+
+func (it *rocksDBScanIterator) Error() error {
+	return it.iter.Err()
+}
+
+func (it *rocksDBScanIterator) Close() {
+	it.iter.Close()
+	if it.scanOpts != nil {
+		it.scanOpts.Destroy()
+	}
+}
+
 // Compile-Time Interface Checks
 var _ interfaces.TxHashStore = (*RocksDBTxHashStore)(nil)
 var _ interfaces.Iterator = (*rocksDBIterator)(nil)
+var _ interfaces.Iterator = (*rocksDBScanIterator)(nil)
 
 // =============================================================================
 // Utility Functions

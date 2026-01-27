@@ -48,7 +48,7 @@ const (
 // =============================================================================
 
 // Phase represents the current workflow phase.
-// Phases progress linearly: INGESTING -> COMPACTING -> BUILDING_RECSPLIT -> VERIFYING -> COMPLETE
+// Phases progress linearly: INGESTING -> COMPACTING -> BUILDING_RECSPLIT -> VERIFYING_RECSPLIT -> COMPLETE
 //
 // CRASH RECOVERY BEHAVIOR BY PHASE:
 //
@@ -65,20 +65,19 @@ const (
 //	  - Delete all temp and index files
 //	  - Rebuild all RecSplit indexes from scratch
 //
-//	VERIFYING:
-//	  - Resume from the CF stored in verify_cf
-//	  - Restart that CF from the beginning
+//	VERIFYING_RECSPLIT:
+//	  - Re-run verification for all 16 CFs (parallel, idempotent)
 //
 //	COMPLETE:
 //	  - Log "Already complete" and exit 0
 type Phase string
 
 const (
-	PhaseIngesting        Phase = "INGESTING"
-	PhaseCompacting       Phase = "COMPACTING"
-	PhaseBuildingRecsplit Phase = "BUILDING_RECSPLIT"
-	PhaseVerifying        Phase = "VERIFYING"
-	PhaseComplete         Phase = "COMPLETE"
+	PhaseIngesting         Phase = "INGESTING"
+	PhaseCompacting        Phase = "COMPACTING"
+	PhaseBuildingRecsplit  Phase = "BUILDING_RECSPLIT"
+	PhaseVerifyingRecsplit Phase = "VERIFYING_RECSPLIT"
+	PhaseComplete          Phase = "COMPLETE"
 )
 
 // String returns the string representation of the phase.

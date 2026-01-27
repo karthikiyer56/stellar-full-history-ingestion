@@ -82,6 +82,13 @@ type TxHashStore interface {
 	// NewIteratorCF creates a new iterator for a specific column family.
 	NewIteratorCF(cfName string) Iterator
 
+	// NewScanIteratorCF creates a scan-optimized iterator for a specific column family.
+	// This iterator is optimized for full sequential scans (e.g., counting entries):
+	//   - Large readahead buffer for prefetching
+	//   - Does not fill block cache (avoids cache pollution)
+	//   - Auto-tunes readahead size
+	NewScanIteratorCF(cfName string) Iterator
+
 	// FlushAll flushes all column family MemTables to SST files on disk.
 	FlushAll() error
 

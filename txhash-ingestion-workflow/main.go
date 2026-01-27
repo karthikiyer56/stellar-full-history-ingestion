@@ -32,7 +32,7 @@
 //	  - Reads txHashes from --query-file and looks them up in RocksDB
 //	  - Results written to --query-output as CSV
 //	  - Statistics written to --query-log
-//	  - Ignored during BUILDING_RECSPLIT, VERIFYING, and COMPLETE phases
+//	  - Ignored during BUILDING_RECSPLIT, VERIFYING_RECSPLIT, and COMPLETE phases
 //
 //	SIGINT / SIGTERM:
 //	  - Triggers graceful shutdown
@@ -449,7 +449,7 @@ func logDryRunMetaState(config *Config, logger interfaces.Logger) {
 		logger.Info("Resume Action:")
 		logger.Info("  Will rebuild all RecSplit indexes from scratch")
 
-	case types.PhaseVerifying:
+	case types.PhaseVerifyingRecsplit:
 		verifyCF, _ := meta.GetVerifyCF()
 		logger.Info("Resume Action:")
 		logger.Info("  Will resume verification from CF: %s", verifyCF)

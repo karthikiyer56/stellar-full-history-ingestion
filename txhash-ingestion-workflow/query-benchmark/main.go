@@ -31,38 +31,23 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"math"
 	"os"
-	"sort"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/stats"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 	"github.com/linxGnu/grocksdb"
 )
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-const (
-	MB = 1024 * 1024
-	GB = 1024 * 1024 * 1024
-
-	// Column family names
-	cfCount = 16
-)
-
-var ColumnFamilyNames = []string{
-	"0", "1", "2", "3", "4", "5", "6", "7",
-	"8", "9", "a", "b", "c", "d", "e", "f",
-}
 
 // =============================================================================
 // Logging
 // =============================================================================
 
+// Logger is a simple file-based logger for query-benchmark.
+// This is intentionally minimal - the tool doesn't need dual logging.
 type Logger struct {
 	mu      sync.Mutex
 	logFile *os.File
@@ -104,107 +89,6 @@ func (l *Logger) Close() {
 }
 
 // =============================================================================
-// Latency Statistics
-// =============================================================================
-
-type LatencyStats struct {
-	mu      sync.Mutex
-	samples []time.Duration
-}
-
-func NewLatencyStats() *LatencyStats {
-	return &LatencyStats{
-		samples: make([]time.Duration, 0, 10000),
-	}
-}
-
-func (ls *LatencyStats) Add(d time.Duration) {
-	ls.mu.Lock()
-	defer ls.mu.Unlock()
-	ls.samples = append(ls.samples, d)
-}
-
-type LatencySummary struct {
-	Count  int
-	Min    time.Duration
-	Max    time.Duration
-	Avg    time.Duration
-	StdDev time.Duration
-	P50    time.Duration
-	P90    time.Duration
-	P95    time.Duration
-	P99    time.Duration
-}
-
-func (ls *LatencyStats) Summary() LatencySummary {
-	ls.mu.Lock()
-	defer ls.mu.Unlock()
-
-	n := len(ls.samples)
-	if n == 0 {
-		return LatencySummary{}
-	}
-
-	sorted := make([]time.Duration, n)
-	copy(sorted, ls.samples)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
-
-	var sum int64
-	for _, d := range ls.samples {
-		sum += int64(d)
-	}
-	avg := sum / int64(n)
-
-	var variance float64
-	for _, d := range ls.samples {
-		diff := float64(int64(d) - avg)
-		variance += diff * diff
-	}
-	variance /= float64(n)
-	stdDev := time.Duration(math.Sqrt(variance))
-
-	return LatencySummary{
-		Count:  n,
-		Min:    sorted[0],
-		Max:    sorted[n-1],
-		Avg:    time.Duration(avg),
-		StdDev: stdDev,
-		P50:    percentile(sorted, 0.50),
-		P90:    percentile(sorted, 0.90),
-		P95:    percentile(sorted, 0.95),
-		P99:    percentile(sorted, 0.99),
-	}
-}
-
-func percentile(sorted []time.Duration, p float64) time.Duration {
-	n := len(sorted)
-	if n == 0 {
-		return 0
-	}
-	if n == 1 {
-		return sorted[0]
-	}
-	idx := int(math.Ceil(float64(n)*p)) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= n {
-		idx = n - 1
-	}
-	return sorted[idx]
-}
-
-func (s LatencySummary) String() string {
-	if s.Count == 0 {
-		return "count=0 (no samples)"
-	}
-	return fmt.Sprintf("count=%d min=%v max=%v avg=%v±%v p50=%v p90=%v p95=%v p99=%v",
-		s.Count, s.Min, s.Max, s.Avg, s.StdDev, s.P50, s.P90, s.P95, s.P99)
-}
-
-// =============================================================================
 // RocksDB Store (Read-Only)
 // =============================================================================
 
@@ -222,7 +106,7 @@ func OpenStore(path string, blockCacheMB int) (*Store, error) {
 	// Create shared block cache
 	var blockCache *grocksdb.Cache
 	if blockCacheMB > 0 {
-		blockCache = grocksdb.NewLRUCache(uint64(blockCacheMB * MB))
+		blockCache = grocksdb.NewLRUCache(uint64(blockCacheMB * types.MB))
 	}
 
 	// Create database options
@@ -231,7 +115,7 @@ func OpenStore(path string, blockCacheMB int) (*Store, error) {
 
 	// Prepare column family names
 	cfNames := []string{"default"}
-	cfNames = append(cfNames, ColumnFamilyNames...)
+	cfNames = append(cfNames, cf.Names...)
 
 	// Create options for each CF
 	cfOptsList := make([]*grocksdb.Options, len(cfNames))
@@ -283,7 +167,7 @@ func OpenStore(path string, blockCacheMB int) (*Store, error) {
 }
 
 func (s *Store) Get(txHash []byte) (value []byte, found bool, err error) {
-	cfName := GetColumnFamilyName(txHash)
+	cfName := cf.GetName(txHash)
 	cfHandle := s.cfHandles[s.cfIndexMap[cfName]]
 
 	slice, err := s.db.GetCF(s.readOpts, cfHandle, txHash)
@@ -324,43 +208,6 @@ func (s *Store) Close() {
 	if s.blockCache != nil {
 		s.blockCache.Destroy()
 	}
-}
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-func GetColumnFamilyName(txHash []byte) string {
-	if len(txHash) < 1 {
-		return "0"
-	}
-	idx := int(txHash[0] >> 4)
-	if idx < 0 || idx > 15 {
-		return "0"
-	}
-	return ColumnFamilyNames[idx]
-}
-
-func ParseLedgerSeq(value []byte) uint32 {
-	if len(value) != 4 {
-		return 0
-	}
-	return uint32(value[0])<<24 | uint32(value[1])<<16 | uint32(value[2])<<8 | uint32(value[3])
-}
-
-func HexToBytes(hexStr string) []byte {
-	if len(hexStr)%2 != 0 {
-		return nil
-	}
-	bytes := make([]byte, len(hexStr)/2)
-	for i := 0; i < len(hexStr); i += 2 {
-		b, err := strconv.ParseUint(hexStr[i:i+2], 16, 8)
-		if err != nil {
-			return nil
-		}
-		bytes[i/2] = byte(b)
-	}
-	return bytes
 }
 
 // =============================================================================
@@ -441,9 +288,9 @@ func main() {
 	// Write CSV header
 	fmt.Fprintln(output, "txHash,ledgerSeq,queryTimeUs")
 
-	// Initialize statistics
-	foundStats := NewLatencyStats()
-	notFoundStats := NewLatencyStats()
+	// Initialize statistics using pkg/stats
+	foundStats := stats.NewLatencyStats()
+	notFoundStats := stats.NewLatencyStats()
 	var foundCount, notFoundCount, parseErrors int
 
 	logger.Info("Running queries...")
@@ -461,8 +308,8 @@ func main() {
 			continue
 		}
 
-		// Parse txHash
-		txHash := HexToBytes(line)
+		// Parse txHash using pkg/types
+		txHash := types.HexToBytes(line)
 		if txHash == nil || len(txHash) != 32 {
 			parseErrors++
 			logger.Info("Line %d: invalid txHash: %s", lineNum, line)
@@ -480,7 +327,7 @@ func main() {
 		}
 
 		if found {
-			ledgerSeq := ParseLedgerSeq(value)
+			ledgerSeq := types.ParseLedgerSeq(value)
 			foundStats.Add(queryTime)
 			foundCount++
 			fmt.Fprintf(output, "%s,%d,%d\n", line, ledgerSeq, queryTime.Microseconds())

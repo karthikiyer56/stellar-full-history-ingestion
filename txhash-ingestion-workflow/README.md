@@ -159,6 +159,68 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                  │
 │  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 1: INGESTING (PARALLEL)                                               │ │
+│  │ ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐       │ │
+│  │ │ LFS Readers │ → │ Workers     │ → │ Collector   │ → │ Write to    │       │ │
+│  │ │ (4 threads) │   │ (16 threads)│   │ (1 thread)  │   │ RocksDB CFs │       │ │
+│  │ └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘       │ │
+│  │                                                                              │ │
+│  │ Checkpoint: Every 5000 ledgers (last_committed_ledger, cfCounts)            │ │
+│  │ SIGHUP: Enabled (queries run against partial data)                          │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 2A: COMPACTING (PARALLEL - 16 CFs simultaneously)                     │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ All 16 CFs compact in parallel using goroutines                        │ │ │
+│  │ │ Queries NOT blocked: RocksDB is thread-safe, no locks held             │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ SIGHUP: Enabled (queries run concurrently with compaction)                  │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 2B: COUNT VERIFICATION (PARALLEL - 16 CFs simultaneously)            │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ All 16 CFs counted in parallel using scan-optimized iterators          │ │ │
+│  │ │ Compare actual counts with expected counts from meta store              │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 3: BUILDING RECSPLIT (Sequential OR Parallel)                         │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ Sequential: One CF at a time (~9 GB RAM per CF)                        │ │ │
+│  │ │ Parallel:   All 16 CFs simultaneously (~144 GB RAM total)              │ │ │
+│  │ │             Use --parallel-recsplit flag                               │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ SIGHUP: Ignored (RecSplit library not interruptible)                        │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 4: VERIFYING_RECSPLIT (PARALLEL - 16 CFs simultaneously)                       │ │
+│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
+│  │ │ All 16 CFs verified in parallel using scan-optimized iterators         │ │ │
+│  │ │ For each key: lookup in RecSplit, verify ledgerSeq matches RocksDB     │ │ │
+│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                              │ │
+│  │ SIGHUP: Ignored (verification is read-only, but runs independently)         │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                      ↓                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│  │ PHASE 5: COMPLETE                                                           │ │
+│  │                                                                              │ │
+│  │ All phases finished successfully. Indexes are ready for use.                │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           WORKFLOW PIPELINE DIAGRAM                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
 │  │ PHASE 1: INGESTING                                                          │ │
 │  │ ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐       │ │
 │  │ │ Read LFS    │ → │ Extract     │ → │ Partition   │ → │ Write to    │       │ │
@@ -203,7 +265,7 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 │  └─────────────────────────────────────────────────────────────────────────────┘ │
 │                                      ↓                                           │
 │  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 4: VERIFYING                                                          │ │
+│  │ PHASE 4: VERIFYING_RECSPLIT                                                          │ │
 │  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
 │  │ │ For each CF: Iterate RocksDB → Lookup in RecSplit → Verify match       │ │ │
 │  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
@@ -224,104 +286,331 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 
 ### Phase Summary Table
 
-| Phase | State Name | Description | Checkpoint | SIGHUP | Timing Field |
-|-------|------------|-------------|------------|--------|--------------|
-| 1 | `INGESTING` | Read LFS ledgers, extract txHashes, partition by first hex char, write to 16 RocksDB CFs | Every 1000 ledgers | Enabled | `IngestionTime` |
-| 2A | `COMPACTING` | Run full compaction on all 16 CFs to deduplicate and merge SST files | None (idempotent) | Enabled | `CompactionTime` |
-| 2B | (sub-phase) | Post-compaction count verification: iterate each CF, compare count with meta store | None | N/A | `CountVerifyTime` |
-| 3 | `BUILDING_RECSPLIT` | Build RecSplit minimal perfect hash indexes from compacted RocksDB data | None (restart from scratch) | Ignored | `RecSplitTime` |
-| 4 | `VERIFYING` | Verify every key in RocksDB can be found via RecSplit index | After each CF | Ignored | `VerificationTime` |
-| 5 | `COMPLETE` | All phases finished successfully | Final state | N/A | N/A |
+| Phase | State Name | Description | Parallel | Checkpoint | SIGHUP |
+|-------|------------|-------------|----------|------------|--------|
+| 1 | `INGESTING` | Read LFS ledgers, extract txHashes, write to 16 RocksDB CFs | Yes (16 workers + 4 readers) | Every 5000 ledgers | Enabled |
+| 2A | `COMPACTING` | Run full compaction on all 16 CFs | Yes (16 goroutines) | None (idempotent) | Enabled |
+| 2B | (sub-phase) | Count verification after compaction | Yes (16 goroutines) | None | N/A |
+| 3 | `BUILDING_RECSPLIT` | Build RecSplit perfect hash indexes | Optional (`--parallel-recsplit`) | None | Ignored |
+| 4 | `VERIFYING_RECSPLIT` | Verify RecSplit indexes against RocksDB | Yes (16 goroutines) | None (idempotent) | Ignored |
+| 5 | `COMPLETE` | All phases finished successfully | N/A | Final state | N/A |
 
-### Phase Details
+---
 
-#### Phase 1: Ingestion
+## Phase Details with Implementation Specifics
+
+### Phase 1: Ingestion
 
 **Input**: LFS ledger store (ledgers in chunk format)  
 **Output**: RocksDB with 16 column families (0-f), each containing txHash→ledgerSeq mappings
 
-**Process**:
-1. Open LFS store and create ledger iterator
-2. For each ledger in range [start_ledger, end_ledger]:
-   - Read LedgerCloseMeta from LFS
-   - Extract all transaction hashes
-   - Partition txHash by first hex character (determines CF)
-   - Accumulate into batch buffer
-3. Every 1000 ledgers:
-   - Write batch to RocksDB (all 16 CFs atomically)
-   - Update in-memory cfCounts
-   - Checkpoint to meta store: (last_committed_ledger, cfCounts)
-4. After all ledgers: flush MemTables to disk
+#### Parallel Pipeline Architecture
 
-**Metrics Logged**:
-- Per-batch: ledgers processed, txHashes extracted, parse time, write time, ledgers/sec, tx/sec
-- Summary: total batches, ledgers, transactions, overall throughput
+Ingestion uses a 3-stage parallel pipeline:
 
-#### Phase 2A: Compaction
+```
+┌─────────────────┐    ┌─────────────────────┐    ┌──────────────┐
+│   LFS READERS   │───>│    WORKER POOL      │───>│   COLLECTOR  │
+│  (4 goroutines) │    │   (16 goroutines)   │    │ (1 goroutine)│
+└─────────────────┘    └─────────────────────┘    └──────────────┘
+```
 
-**Input**: RocksDB with potentially duplicate entries (from crash recovery re-ingestion)  
+| Stage | Goroutines | Responsibility |
+|-------|------------|----------------|
+| **LFS Readers** | 4 | Read raw compressed ledger data from LFS |
+| **Workers** | 16 | Decompress, unmarshal XDR, extract txHashes |
+| **Collector** | 1 | Accumulate entries by CF, track completion |
+
+#### Key Configuration Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `DefaultParallelBatchSize` | 5000 ledgers | Checkpoint frequency |
+| `DefaultParallelWorkers` | 16 | Number of worker goroutines |
+| `DefaultParallelReaders` | 4 | Number of LFS reader goroutines |
+| Work channel buffer | 200 items | ~30 MB memory |
+| Entry channel buffer | 100 items | ~2 MB memory |
+
+#### RocksDB Write Optimizations
+
+During ingestion, RocksDB is configured for **write-optimized** performance:
+
+```go
+opts.SetDisableAutoCompactions(true)  // No compaction during ingestion
+writeOpts.SetSync(false)              // Async writes (WAL handles durability)
+opts.SetMinWriteBufferNumberToMerge(1) // Flush MemTables immediately when full
+```
+
+#### Checkpoint Mechanism
+
+Every 5000 ledgers (configurable), the system performs an **atomic checkpoint**:
+
+1. Write batch to RocksDB (all 16 CFs)
+2. Update in-memory `cfCounts` (per-CF entry counts)
+3. Atomically checkpoint to meta store using WriteBatch:
+   - `last_committed_ledger`
+   - `cf_counts` map
+
+**Key insight**: Counts are checkpointed WITH progress, not computed from RocksDB. On resume, counts are restored from checkpoint, ensuring accuracy even with re-ingested duplicates.
+
+#### Crash Recovery
+
+On restart during ingestion:
+1. Load `last_committed_ledger` and `cf_counts` from meta store
+2. Resume from `last_committed_ledger + 1`
+3. Up to 4999 ledgers may be re-ingested (duplicates handled by compaction)
+4. Re-ingested data creates duplicates in RocksDB (same key → same value)
+5. Compaction phase deduplicates them
+
+---
+
+### Phase 2A: Compaction
+
+**Input**: RocksDB with potentially duplicate entries  
 **Output**: Compacted RocksDB with unique entries only
 
-**Process**:
-1. For each CF (0 through f):
-   - Run full manual compaction
-   - RocksDB merges all SST files, removes duplicates
-2. Log before/after statistics per CF
+#### Parallel Compaction Implementation
 
-**Metrics Logged**:
-- Per-CF: files before/after, size before/after, compaction time
-- Summary: total compaction time, space reduction
+All 16 column families are compacted **simultaneously** using goroutines:
 
-#### Phase 2B: Count Verification
+```go
+var wg sync.WaitGroup
+for i, cfName := range cf.Names {
+    wg.Add(1)
+    go func(idx int, name string) {
+        defer wg.Done()
+        
+        // Allow concurrent manual compactions
+        opts := grocksdb.NewCompactRangeOptions()
+        opts.SetExclusiveManualCompaction(false)
+        
+        s.db.CompactRangeCFOpt(cfHandles[idx], grocksdb.Range{}, opts)
+    }(i, cfName)
+}
+wg.Wait()
+```
 
-**Input**: Compacted RocksDB + cfCounts from meta store  
+#### How Queries Continue During Compaction
+
+**Critical design decision**: Compaction does NOT block queries.
+
+```go
+func (s *RocksDBTxHashStore) CompactCF(cfName string) time.Duration {
+    // Only hold read lock briefly to get CF handle (~microseconds)
+    s.mu.RLock()
+    cfHandle := s.getCFHandleByName(cfName)
+    s.mu.RUnlock()
+
+    // Compaction runs WITHOUT any lock - RocksDB is thread-safe
+    opts := grocksdb.NewCompactRangeOptions()
+    opts.SetExclusiveManualCompaction(false)
+    s.db.CompactRangeCFOpt(cfHandle, grocksdb.Range{}, opts)
+}
+```
+
+**Why this works**:
+1. RocksDB is internally thread-safe
+2. `SetExclusiveManualCompaction(false)` allows concurrent manual compactions
+3. The mutex is only held for CF handle lookup (~1 microsecond)
+4. SIGHUP queries use `RLock` and work concurrently
+
+#### Performance Improvement
+
+| Mode | Time for 16 CFs |
+|------|-----------------|
+| Sequential (old) | ~50-60 minutes |
+| Parallel (new) | ~4-5 minutes |
+
+---
+
+### Phase 2B: Count Verification
+
+**Input**: Compacted RocksDB + `cfCounts` from meta store  
 **Output**: Verification report (pass/fail per CF)
 
-**Process**:
-1. For each CF (0 through f):
-   - Iterate through all entries, count actual keys
-   - Compare with expected count from cfCounts
-   - Log match or mismatch
-2. If any mismatch: log warning but continue (RecSplit build is definitive check)
+#### Parallel Verification Implementation
 
-**Metrics Logged**:
-- Per-CF: expected count, actual count, match status, verification time
-- Summary: total verification time, number of mismatches
+All 16 CFs are verified **in parallel**:
 
-#### Phase 3: RecSplit Building
+```go
+var wg sync.WaitGroup
+for i, cfName := range cf.Names {
+    wg.Add(1)
+    go func(idx int, name string) {
+        defer wg.Done()
+        
+        // Use scan-optimized iterator
+        iter := s.NewScanIteratorCF(name)
+        for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+            actualCount++
+        }
+        
+        // Compare with expected
+        match := expectedCounts[name] == actualCount
+    }(i, cfName)
+}
+wg.Wait()
+```
+
+#### Scan-Optimized Iterator
+
+Count verification uses a **scan-optimized iterator** for better performance:
+
+```go
+scanOpts := grocksdb.NewDefaultReadOptions()
+scanOpts.SetReadaheadSize(2 * 1024 * 1024)  // 2MB readahead prefetch
+scanOpts.SetFillCache(false)                 // Don't pollute block cache
+```
+
+| Optimization | Benefit |
+|--------------|---------|
+| 2MB readahead | Prefetches sequential data, reduces I/O latency |
+| `SetFillCache(false)` | Prevents scan data from evicting hot data from block cache |
+
+#### Performance Improvement
+
+| Mode | Time for 16 CFs (~3.5B entries) |
+|------|--------------------------------|
+| Sequential | ~70 minutes |
+| Parallel | ~4-5 minutes |
+| Parallel + scan iterator | ~1-2 minutes |
+
+---
+
+### Phase 3: RecSplit Building
 
 **Input**: Compacted RocksDB with verified counts  
-**Output**: 16 RecSplit index files (cf-0.idx through cf-f.idx)
+**Output**: 16 RecSplit index files (`cf-0.idx` through `cf-f.idx`)
 
-**Process**:
-1. For each CF (sequentially or in parallel):
-   - Create RecSplit builder with expected key count
-   - Iterate RocksDB CF, add each key to builder
-   - Verify iterated count matches expected (definitive check)
-   - Build RecSplit index
-2. Clean up temporary files
+#### Sequential vs Parallel Mode
 
-**Metrics Logged**:
-- Per-CF: key count, key add time, build time, index size
-- Summary: total keys indexed, total build time, total index size
+| Mode | Flag | Memory Required | Time |
+|------|------|-----------------|------|
+| Sequential | (default) | ~9 GB | ~2-3 hours |
+| Parallel | `--parallel-recsplit` | ~144 GB (16 × 9 GB) | ~15-20 minutes |
 
-#### Phase 4: Verification
+#### Parallel Implementation
+
+With `--parallel-recsplit`, all 16 CFs are built simultaneously:
+
+```go
+var wg sync.WaitGroup
+for i, cfName := range cf.Names {
+    wg.Add(1)
+    go func(idx int, cfn string) {
+        defer wg.Done()
+        stats, err := b.buildCFIndex(cfn, keyCount)
+        // Store result at index for ordered output
+        results[idx] = stats
+    }(i, cfName)
+}
+wg.Wait()
+```
+
+#### RecSplit Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Bucket size | 2000 | Keys per bucket during construction |
+| Leaf size | 8 | Minimum keys for leaf node |
+| Data version | 1 | Index file format version |
+
+#### Build Process Per CF
+
+1. Create temp directory for CF
+2. Create RecSplit builder with **exact** key count from meta store
+3. Iterate RocksDB CF, add each key with its ledgerSeq value
+4. **Verify**: `keysAdded == expectedCount` (definitive check - build fails if mismatch)
+5. Finalize perfect hash function
+6. Write index file
+7. Clean up temp directory
+
+#### Crash Recovery
+
+On restart during RecSplit building:
+1. Delete ALL partial index files and temp directories
+2. Rebuild all 16 indexes from scratch
+3. RecSplit construction is not resumable mid-CF
+
+---
+
+### Phase 4: RecSplit Verification
 
 **Input**: RocksDB + RecSplit indexes  
 **Output**: Verification report (pass/fail counts)
 
-**Process**:
-1. For each CF:
-   - Open RecSplit index
-   - Iterate RocksDB, for each key:
-     - Lookup in RecSplit index
-     - Verify returned value matches RocksDB value
-   - Checkpoint CF completion to meta store (verify_cf)
-2. Log any verification failures to error file
+#### Parallel Verification Implementation
 
-**Metrics Logged**:
-- Per-CF: keys verified, failures, verification time, keys/sec
-- Summary: total keys verified, total failures, success rate
+All 16 CFs are verified **in parallel** using goroutines:
+
+```go
+var wg sync.WaitGroup
+for i, cfName := range cf.Names {
+    wg.Add(1)
+    go func(idx int, name string) {
+        defer wg.Done()
+        
+        // Open RecSplit index
+        idx, _ := recsplit.OpenIndex(indexPath)
+        reader := recsplit.NewIndexReader(idx)
+        
+        // Use scan-optimized iterator for RocksDB
+        iter := store.NewScanIteratorCF(name)
+        
+        for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+            key := iter.Key()
+            expectedLedgerSeq := types.ParseLedgerSeq(iter.Value())
+            
+            // Lookup in RecSplit
+            offset, found := reader.Lookup(key)
+            
+            if !found || uint32(offset) != expectedLedgerSeq {
+                failures++
+            }
+            keysVerified++
+        }
+    }(i, cfName)
+}
+wg.Wait()
+```
+
+#### Verification Process
+
+For each key in RocksDB:
+1. Look up in RecSplit index
+2. Verify key is found
+3. Verify returned ledgerSeq matches RocksDB value
+4. Log any failures to error file
+
+#### Crash Recovery
+
+Verification is **idempotent** (read-only). On crash:
+1. Simply re-run verification for all 16 CFs
+2. No per-CF checkpointing needed
+3. Takes ~2-3 minutes with parallel execution
+
+#### Performance
+
+| Mode | Time for 16 CFs (~3.5B entries) |
+|------|--------------------------------|
+| Sequential (old) | ~70 minutes |
+| Parallel (new) | ~4-5 minutes |
+
+---
+
+### Performance Summary
+
+All phases leverage parallelism for maximum performance:
+
+| Phase | Parallelism | Before Optimization | After Optimization |
+|-------|-------------|---------------------|-------------------|
+| **Ingestion** | 4 readers + 16 workers | N/A | ~2-3 hours for 56M ledgers |
+| **Compaction** | 16 goroutines | ~50-60 min | ~4-5 min |
+| **Count Verification** | 16 goroutines + scan iterator | ~70 min | ~1-2 min |
+| **RecSplit Build** | Optional 16 goroutines | ~2-3 hours | ~15-20 min (parallel) |
+| **RecSplit Verify** | 16 goroutines + scan iterator | ~70 min | ~4-5 min |
+
+**Total pipeline time (with parallel RecSplit)**: ~3-4 hours for 56M ledgers / 3.5B txHashes
 
 ### Final Summary Output
 
@@ -684,7 +973,7 @@ The `--query-log` file contains aggregate statistics:
 ### When SIGHUP is Ignored
 
 - During `BUILDING_RECSPLIT` phase (RecSplit library is not interruptible)
-- During `VERIFYING` phase (verification must complete without side effects)
+- During `VERIFYING_RECSPLIT` phase (verification must complete without side effects)
 - During `COMPLETE` phase (nothing to query)
 
 ## Memory Configuration

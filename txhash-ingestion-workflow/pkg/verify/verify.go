@@ -12,6 +12,7 @@ package verify
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/erigontech/erigon/db/recsplit"
@@ -124,6 +125,7 @@ func (vs *Stats) LogSummary(logger interfaces.Logger) {
 // =============================================================================
 
 // Verifier handles verification of RecSplit indexes against RocksDB data.
+// Verification runs in parallel across all 16 column families.
 type Verifier struct {
 	store     interfaces.TxHashStore
 	meta      interfaces.MetaStore
@@ -132,7 +134,8 @@ type Verifier struct {
 	memory    interfaces.MemoryMonitor
 	stats     *Stats
 
-	// resumeFromCF is the CF to resume from (empty = start from beginning)
+	// resumeFromCF is deprecated and ignored. Kept for backward compatibility.
+	// Parallel verification always verifies all CFs from the beginning.
 	resumeFromCF string
 }
 
@@ -140,9 +143,9 @@ type Verifier struct {
 //
 // PARAMETERS:
 //   - store: RocksDB store to verify against
-//   - meta: Meta store for progress tracking
+//   - meta: Meta store for progress tracking (not used for per-CF checkpoints)
 //   - indexPath: Directory containing RecSplit index files
-//   - resumeFromCF: CF to resume from (empty = start from beginning)
+//   - resumeFromCF: DEPRECATED - ignored, kept for backward compatibility
 //   - logger: Logger instance
 //   - mem: Memory monitor
 func NewVerifier(
@@ -165,58 +168,54 @@ func NewVerifier(
 }
 
 // Run executes the verification phase.
+//
+// All 16 column families are verified in parallel using goroutines.
+// Verification is read-only and idempotent, so parallel execution is safe.
+// On crash, verification simply restarts from the beginning (no per-CF checkpoint needed).
 func (v *Verifier) Run() (*Stats, error) {
 	v.stats.StartTime = time.Now()
 
 	v.logger.Separator()
-	v.logger.Info("                    VERIFICATION PHASE")
+	v.logger.Info("                    VERIFICATION PHASE (PARALLEL)")
 	v.logger.Separator()
 	v.logger.Info("")
 
-	if v.resumeFromCF != "" {
-		v.logger.Info("RESUMING from CF [%s]", v.resumeFromCF)
-		v.logger.Info("")
-	}
+	v.logger.Info("Verifying all 16 column families in parallel...")
+	v.logger.Info("")
 
-	// Determine starting CF index
-	startIdx := 0
-	if v.resumeFromCF != "" {
-		for i, cfName := range cf.Names {
-			if cfName == v.resumeFromCF {
-				startIdx = i
-				break
+	// Pre-allocate results slice to maintain CF order
+	results := make([]*CFStats, len(cf.Names))
+	errors := make([]error, len(cf.Names))
+
+	// Verify all CFs in parallel
+	var wg sync.WaitGroup
+	for i, cfName := range cf.Names {
+		wg.Add(1)
+		go func(idx int, name string) {
+			defer wg.Done()
+
+			stats, err := v.verifyCF(name)
+			if err != nil {
+				errors[idx] = err
+				v.logger.Error("Verification error for CF %s: %v", name, err)
+				return
 			}
-		}
+
+			results[idx] = stats
+			v.logger.Info("  CF [%s] verified: %s keys in %v (%.0f keys/sec), failures: %d",
+				name,
+				helpers.FormatNumber(int64(stats.KeysVerified)),
+				stats.VerifyTime,
+				stats.KeysPerSecond,
+				stats.Failures)
+		}(i, cfName)
 	}
+	wg.Wait()
 
-	// Verify each CF
-	for i := startIdx; i < len(cf.Names); i++ {
-		cfName := cf.Names[i]
-
-		// Update progress in meta store
-		if err := v.meta.SetVerifyCF(cfName); err != nil {
-			return nil, fmt.Errorf("failed to update verify CF: %w", err)
-		}
-
-		v.logger.Info("[%2d/16] Verifying CF [%s]...", i+1, cfName)
-
-		stats, err := v.verifyCF(cfName)
-		if err != nil {
-			// Log error but continue (per requirements)
-			v.logger.Error("Verification error for CF %s: %v", cfName, err)
-			continue
-		}
-
-		v.stats.PerCFStats[cfName] = stats
-		v.logger.Info("        Verified %s keys in %v (%.0f keys/sec), failures: %d",
-			helpers.FormatNumber(int64(stats.KeysVerified)),
-			stats.VerifyTime,
-			stats.KeysPerSecond,
-			stats.Failures)
-
-		// Check memory every 4 CFs
-		if (i+1)%4 == 0 {
-			v.memory.Check()
+	// Collect results (maintain order)
+	for i, cfName := range cf.Names {
+		if results[i] != nil {
+			v.stats.PerCFStats[cfName] = results[i]
 		}
 	}
 
@@ -233,6 +232,9 @@ func (v *Verifier) Run() (*Stats, error) {
 		v.stats.SuccessRate = 100.0 * float64(v.stats.TotalKeysVerified-v.stats.TotalFailures) /
 			float64(v.stats.TotalKeysVerified)
 	}
+
+	// Check memory at end
+	v.memory.Check()
 
 	// Log summary
 	v.stats.LogSummary(v.logger)
@@ -261,8 +263,8 @@ func (v *Verifier) verifyCF(cfName string) (*CFStats, error) {
 
 	reader := recsplit.NewIndexReader(idx)
 
-	// Iterate over RocksDB and verify each key
-	iter := v.store.NewIteratorCF(cfName)
+	// Iterate over RocksDB and verify each key using scan-optimized iterator
+	iter := v.store.NewScanIteratorCF(cfName)
 	defer iter.Close()
 
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {

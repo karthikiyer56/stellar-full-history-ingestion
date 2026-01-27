@@ -10,6 +10,7 @@ package compact
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
@@ -31,7 +32,7 @@ type Compactable interface {
 	CompactCF(cfName string) time.Duration
 }
 
-// CompactAllCFs compacts all 16 column families.
+// CompactAllCFs compacts all 16 column families in parallel.
 // This is a lightweight helper for tools that don't need full compaction statistics.
 //
 // Parameters:
@@ -40,21 +41,26 @@ type Compactable interface {
 //
 // Returns the total time taken for all compactions.
 func CompactAllCFs(store Compactable, logger interfaces.Logger) time.Duration {
-	logger.Info("Compacting all column families...")
+	logger.Info("Compacting all 16 column families in parallel...")
 	logger.Info("")
 
 	totalStart := time.Now()
 
-	for i, cfName := range cf.Names {
-		logger.Info("[%2d/16] Compacting CF [%s]...", i+1, cfName)
-		cfStart := time.Now()
-		store.CompactCF(cfName)
-		logger.Info("        Completed in %v", time.Since(cfStart))
+	var wg sync.WaitGroup
+	for _, cfName := range cf.Names {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			cfStart := time.Now()
+			store.CompactCF(name)
+			logger.Info("  CF [%s] compacted in %v", name, time.Since(cfStart))
+		}(cfName)
 	}
+	wg.Wait()
 
 	totalTime := time.Since(totalStart)
 	logger.Info("")
-	logger.Info("All column families compacted in %v", totalTime)
+	logger.Info("All column families compacted in %v (parallel)", totalTime)
 
 	return totalTime
 }
@@ -223,35 +229,47 @@ func (c *Compactor) Run() (*CompactionStats, error) {
 	beforeMem := memory.TakeMemorySnapshot()
 	beforeMem.Log(c.logger, "Pre-Compaction")
 
-	// Compact each CF
+	// Compact each CF in parallel
 	c.logger.Separator()
-	c.logger.Info("                    COMPACTING COLUMN FAMILIES")
+	c.logger.Info("                    COMPACTING COLUMN FAMILIES (PARALLEL)")
 	c.logger.Separator()
 	c.logger.Info("")
+	c.logger.Info("Starting parallel compaction of all 16 column families...")
 
 	totalStart := time.Now()
 
-	for i, cfName := range cf.Names {
-		c.logger.Info("[%2d/16] Compacting CF [%s]...", i+1, cfName)
+	// Use a mutex to protect stats map writes (Go maps are not thread-safe)
+	// This mutex is LOCAL and does NOT affect query reads at all
+	var statsMu sync.Mutex
+	var wg sync.WaitGroup
 
-		cfStart := time.Now()
-		c.store.CompactCF(cfName)
-		cfElapsed := time.Since(cfStart)
+	for _, cfName := range cf.Names {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
 
-		c.stats.PerCFTime[cfName] = cfElapsed
-		c.logger.Info("        Completed in %v", cfElapsed)
+			cfStart := time.Now()
+			c.store.CompactCF(name)
+			cfElapsed := time.Since(cfStart)
 
-		// Check memory every 4 CFs
-		if (i+1)%4 == 0 {
-			c.memory.Check()
-		}
+			// Protect map write with local mutex (< 1 microsecond)
+			statsMu.Lock()
+			c.stats.PerCFTime[name] = cfElapsed
+			statsMu.Unlock()
+
+			c.logger.Info("  CF [%s] compacted in %v", name, cfElapsed)
+		}(cfName)
 	}
+	wg.Wait()
+
+	// Memory check after all compactions complete
+	c.memory.Check()
 
 	c.stats.TotalTime = time.Since(totalStart)
 	c.stats.EndTime = time.Now()
 
 	c.logger.Info("")
-	c.logger.Info("All column families compacted in %v", c.stats.TotalTime)
+	c.logger.Info("All column families compacted in %v (parallel)", c.stats.TotalTime)
 	c.logger.Info("")
 
 	// Collect after stats
@@ -318,6 +336,7 @@ type CountVerificationStats struct {
 
 // VerifyCountsAfterCompaction iterates through each CF in RocksDB and verifies
 // that the actual count matches the expected count from meta store.
+// All 16 CFs are verified in parallel for faster execution.
 func VerifyCountsAfterCompaction(
 	s interfaces.TxHashStore,
 	meta interfaces.MetaStore,
@@ -325,12 +344,12 @@ func VerifyCountsAfterCompaction(
 ) (*CountVerificationStats, error) {
 	stats := &CountVerificationStats{
 		StartTime:  time.Now(),
-		Results:    make([]CountVerificationResult, 0, 16),
+		Results:    make([]CountVerificationResult, 16), // Pre-allocate for all 16 CFs
 		AllMatched: true,
 	}
 
 	logger.Separator()
-	logger.Info("                POST-COMPACTION COUNT VERIFICATION")
+	logger.Info("                POST-COMPACTION COUNT VERIFICATION (PARALLEL)")
 	logger.Separator()
 	logger.Info("")
 	logger.Info("Verifying RocksDB entry counts match checkpointed counts...")
@@ -349,56 +368,101 @@ func VerifyCountsAfterCompaction(
 	}
 	logger.Info("Expected total entries: %s", helpers.FormatNumber(int64(totalExpected)))
 	logger.Info("")
+	logger.Info("Starting parallel count verification of all 16 column families...")
+	logger.Info("")
 
-	// Verify each CF
-	logger.Info("%-4s %15s %15s %8s %12s", "CF", "Expected", "Actual", "Match", "Time")
-	logger.Info("%-4s %15s %15s %8s %12s", "----", "---------------", "---------------", "--------", "------------")
+	// Verify each CF in parallel
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
 
-	var totalActual uint64
+	for i, cfName := range cf.Names {
+		wg.Add(1)
+		go func(idx int, name string) {
+			defer wg.Done()
 
-	for _, cfName := range cf.Names {
-		cfStart := time.Now()
+			cfStart := time.Now()
+			expectedCount := expectedCounts[name]
 
-		expectedCount := expectedCounts[cfName]
-
-		// Iterate and count actual entries
-		actualCount := uint64(0)
-		iter := s.NewIteratorCF(cfName)
-		for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-			actualCount++
-		}
-		if err := iter.Error(); err != nil {
+			// Iterate and count actual entries using scan-optimized iterator
+			actualCount := uint64(0)
+			iter := s.NewScanIteratorCF(name)
+			for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+				actualCount++
+			}
+			iterErr := iter.Error()
 			iter.Close()
-			return nil, fmt.Errorf("iterator error for CF %s: %w", cfName, err)
-		}
-		iter.Close()
 
-		cfDuration := time.Since(cfStart)
-		match := expectedCount == actualCount
+			if iterErr != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("iterator error for CF %s: %w", name, iterErr)
+				}
+				errMu.Unlock()
+				return
+			}
 
-		result := CountVerificationResult{
-			CFName:        cfName,
-			ExpectedCount: expectedCount,
-			ActualCount:   actualCount,
-			Match:         match,
-			Duration:      cfDuration,
-		}
-		stats.Results = append(stats.Results, result)
-		totalActual += actualCount
+			cfDuration := time.Since(cfStart)
+			match := expectedCount == actualCount
 
-		matchStr := "OK"
-		if !match {
-			matchStr = "MISMATCH"
+			// Store result at the correct index (maintains order)
+			stats.Results[idx] = CountVerificationResult{
+				CFName:        name,
+				ExpectedCount: expectedCount,
+				ActualCount:   actualCount,
+				Match:         match,
+				Duration:      cfDuration,
+			}
+
+			matchStr := "OK"
+			if !match {
+				matchStr = "MISMATCH"
+			}
+
+			logger.Info("  CF [%s] verified: expected=%s, actual=%s, %s, %v",
+				name,
+				helpers.FormatNumber(int64(expectedCount)),
+				helpers.FormatNumber(int64(actualCount)),
+				matchStr,
+				cfDuration)
+		}(i, cfName)
+	}
+	wg.Wait()
+
+	// Check for errors
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	// Calculate totals and check for mismatches
+	var totalActual uint64
+	for _, r := range stats.Results {
+		totalActual += r.ActualCount
+		if !r.Match {
 			stats.AllMatched = false
 			stats.Mismatches++
 		}
+	}
 
+	stats.EndTime = time.Now()
+	stats.TotalTime = time.Since(stats.StartTime)
+
+	// Log summary table (in order)
+	logger.Info("")
+	logger.Info("%-4s %15s %15s %8s %12s", "CF", "Expected", "Actual", "Match", "Time")
+	logger.Info("%-4s %15s %15s %8s %12s", "----", "---------------", "---------------", "--------", "------------")
+
+	for _, r := range stats.Results {
+		matchStr := "OK"
+		if !r.Match {
+			matchStr = "MISMATCH"
+		}
 		logger.Info("%-4s %15s %15s %8s %12v",
-			cfName,
-			helpers.FormatNumber(int64(expectedCount)),
-			helpers.FormatNumber(int64(actualCount)),
+			r.CFName,
+			helpers.FormatNumber(int64(r.ExpectedCount)),
+			helpers.FormatNumber(int64(r.ActualCount)),
 			matchStr,
-			cfDuration)
+			r.Duration)
 	}
 
 	logger.Info("%-4s %15s %15s %8s %12s", "----", "---------------", "---------------", "--------", "------------")
@@ -408,9 +472,6 @@ func VerifyCountsAfterCompaction(
 	if !totalMatch {
 		totalMatchStr = "MISMATCH"
 	}
-
-	stats.EndTime = time.Now()
-	stats.TotalTime = time.Since(stats.StartTime)
 
 	logger.Info("%-4s %15s %15s %8s %12v",
 		"TOT",
@@ -422,7 +483,7 @@ func VerifyCountsAfterCompaction(
 
 	// Log summary
 	if stats.AllMatched {
-		logger.Info("Count verification PASSED: All %d CFs match expected counts", len(cf.Names))
+		logger.Info("Count verification PASSED: All %d CFs match expected counts (parallel, %v)", len(cf.Names), stats.TotalTime)
 	} else {
 		logger.Error("Count verification FAILED: %d CF(s) have mismatched counts", stats.Mismatches)
 		logger.Error("")

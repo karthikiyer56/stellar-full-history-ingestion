@@ -5,11 +5,11 @@
 // This file implements the main workflow orchestrator that coordinates
 // all phases of the txHash ingestion pipeline:
 //
-//   Phase 1: INGESTING      - Read LFS, extract txHashes, write to RocksDB
-//   Phase 2: COMPACTING     - Full compaction of all 16 CFs
-//   Phase 3: BUILDING_RECSPLIT - Build RecSplit indexes
-//   Phase 4: VERIFYING      - Verify RecSplit against RocksDB
-//   Phase 5: COMPLETE       - Done
+//   Phase 1: INGESTING           - Read LFS, extract txHashes, write to RocksDB
+//   Phase 2: COMPACTING          - Full compaction of all 16 CFs
+//   Phase 3: BUILDING_RECSPLIT   - Build RecSplit indexes
+//   Phase 4: VERIFYING_RECSPLIT  - Verify RecSplit against RocksDB
+//   Phase 5: COMPLETE            - Done
 //
 // WORKFLOW DESIGN:
 //
@@ -28,9 +28,8 @@
 //       - Delete temp/index files and rebuild from scratch
 //       - RecSplit building is not resumable mid-CF
 //
-//     VERIFYING:
-//       - Resume from verify_cf stored in meta
-//       - Restart that CF from beginning
+//     VERIFYING_RECSPLIT:
+//       - Re-run verification for all 16 CFs (parallel, idempotent)
 //
 //     COMPLETE:
 //       - Log "already complete" and exit 0
@@ -289,7 +288,7 @@ func (w *Workflow) runFromPhase(startPhase types.Phase, startFromLedger uint32) 
 		}
 		fallthrough
 
-	case types.PhaseVerifying:
+	case types.PhaseVerifyingRecsplit:
 		if err := w.runVerification(); err != nil {
 			return err
 		}
@@ -452,8 +451,8 @@ func (w *Workflow) runRecSplitBuild() error {
 	w.stats.RecSplitTime = time.Since(phaseStart)
 
 	// Transition to next phase
-	if err := w.meta.SetPhase(types.PhaseVerifying); err != nil {
-		return fmt.Errorf("failed to set phase to VERIFYING: %w", err)
+	if err := w.meta.SetPhase(types.PhaseVerifyingRecsplit); err != nil {
+		return fmt.Errorf("failed to set phase to VERIFYING_RECSPLIT: %w", err)
 	}
 
 	w.logger.Info("")
@@ -474,7 +473,7 @@ func (w *Workflow) runVerification() error {
 
 	// Update query handler phase (SIGHUP ignored during this phase)
 	if w.queryHandler != nil {
-		w.queryHandler.SetPhase(types.PhaseVerifying)
+		w.queryHandler.SetPhase(types.PhaseVerifyingRecsplit)
 	}
 
 	// Check if resuming from a specific CF
