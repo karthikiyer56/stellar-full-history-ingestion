@@ -27,22 +27,6 @@ import (
 )
 
 // =============================================================================
-// Constants
-// =============================================================================
-
-const (
-	// BucketSize is the bucket size for RecSplit construction.
-	// Larger buckets = faster build but more memory.
-	BucketSize = 2000
-
-	// LeafSize is the leaf size for RecSplit construction.
-	LeafSize = 8
-
-	// DataVersion is the data format version stored in the index.
-	DataVersion = 1
-)
-
-// =============================================================================
 // RecSplit Builder Stats
 // =============================================================================
 
@@ -347,13 +331,13 @@ func (b *Builder) buildCFIndex(cfName string, keyCount uint64) (*CFStats, error)
 	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
 		KeyCount:           int(keyCount),
 		Enums:              false, // We store ledgerSeq values, not sequential offsets
-		LessFalsePositives: true,
-		BucketSize:         BucketSize,
-		LeafSize:           LeafSize,
+		LessFalsePositives: types.RecSplitLessFalsePositivesEnabled,
+		BucketSize:         types.RecSplitBucketSize,
+		LeafSize:           types.RecSplitLeafSize,
 		TmpDir:             cfTmpDir,
 		IndexFile:          indexPath,
 		BaseDataID:         0,
-		Version:            DataVersion,
+		Version:            types.RecSplitDataVersion,
 	}, erigonLogger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create RecSplit: %w", err)

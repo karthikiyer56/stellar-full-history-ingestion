@@ -41,6 +41,9 @@ const (
 
 	// RecSplitDataVersion is the data format version stored in the index.
 	RecSplitDataVersion = 1
+
+	// RecSplitLessFalsePositivesEnabled indicates if false positives are enabled.
+	RecSplitLessFalsePositivesEnabled = true
 )
 
 // =============================================================================
