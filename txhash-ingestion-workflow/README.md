@@ -11,9 +11,11 @@ This tool ingests transaction hashes from Stellar ledgers stored in LFS format, 
 ## Features
 
 - **Full Pipeline**: Ingestion, compaction, RecSplit indexing, and verification in one tool
-- **Crash Recovery**: Checkpoints progress every 1000 ledgers; automatically resumes from last checkpoint
+- **Crash Recovery**: Checkpoints progress every 5000 ledgers (parallel mode) or 1000 ledgers (sequential mode); automatically resumes from last checkpoint
 - **16-way Partitioning**: Distributes txHashes across 16 column families by first hex character (0-f)
-- **Parallel RecSplit**: Option to build all 16 RecSplit indexes concurrently
+- **RecSplit Index Modes**: 
+  - **Default (Single Index)**: Builds one combined `txhash.idx` file from all 16 CFs
+  - **Multi-Index** (`--multi-index-enabled`): Builds 16 separate `cf-X.idx` files in parallel
 - **Live Query Support**: Send SIGHUP during ingestion/compaction to benchmark lookups
 - **Comprehensive Metrics**: Latency percentiles (p50/p90/p95/p99), throughput, memory usage
 - **Dual Logging**: Separate log and error files with timestamps
@@ -74,7 +76,7 @@ go build -o txhash-ingestion-workflow .
 | `--query-output` | Yes | - | Path to query results CSV |
 | `--query-log` | Yes | - | Path to query statistics log |
 | `--query-error` | Yes | - | Path to query error log |
-| `--parallel-recsplit` | No | false | Build 16 RecSplit indexes in parallel |
+| `--multi-index-enabled` | No | false | Build 16 separate cf-X.idx files instead of single txhash.idx |
 | `--block-cache-mb` | No | 8192 | RocksDB block cache size in MB |
 | `--dry-run` | No | false | Validate configuration and exit |
 
@@ -94,7 +96,7 @@ go build -o txhash-ingestion-workflow .
   --query-error /var/log/txhash/query.err
 ```
 
-### With Parallel RecSplit Building
+### With Multi-Index Mode (16 Separate Index Files)
 
 ```bash
 ./txhash-ingestion-workflow \
@@ -108,7 +110,7 @@ go build -o txhash-ingestion-workflow .
   --query-output /tmp/query-results.csv \
   --query-log /var/log/txhash/query.log \
   --query-error /var/log/txhash/query.err \
-  --parallel-recsplit \
+  --multi-index-enabled \
   --block-cache-mb 16384
 ```
 
@@ -141,6 +143,8 @@ go build -o txhash-ingestion-workflow .
     │   └── ...
     ├── recsplit/
     │   ├── index/                  # RecSplit index files
+    │   │   ├── txhash.idx          # Single combined index (default mode)
+    │   │   # OR (with --multi-index-enabled):
     │   │   ├── cf-0.idx
     │   │   ├── cf-1.idx
     │   │   ├── ...
@@ -188,11 +192,11 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 │  └─────────────────────────────────────────────────────────────────────────────┘ │
 │                                      ↓                                           │
 │  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 3: BUILDING RECSPLIT (Sequential OR Parallel)                         │ │
+│  │ PHASE 3: BUILDING RECSPLIT (Single Index OR Multi-Index)                   │ │
 │  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ Sequential: One CF at a time (~9 GB RAM per CF)                        │ │ │
-│  │ │ Parallel:   All 16 CFs simultaneously (~144 GB RAM total)              │ │ │
-│  │ │             Use --parallel-recsplit flag                               │ │ │
+│  │ │ Default:       Single txhash.idx built from all 16 CFs sequentially   │ │ │
+│  │ │ Multi-Index:   16 cf-X.idx files built in parallel (~144 GB RAM)      │ │ │
+│  │ │                Use --multi-index-enabled flag                          │ │ │
 │  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
 │  │                                                                              │ │
 │  │ SIGHUP: Ignored (RecSplit library not interruptible)                        │ │
@@ -216,73 +220,6 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 │                                                                                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           WORKFLOW PIPELINE DIAGRAM                              │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 1: INGESTING                                                          │ │
-│  │ ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐       │ │
-│  │ │ Read LFS    │ → │ Extract     │ → │ Partition   │ → │ Write to    │       │ │
-│  │ │ Ledgers     │   │ TxHashes    │   │ by 1st Hex  │   │ RocksDB CFs │       │ │
-│  │ └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘       │ │
-│  │                                                                              │ │
-│  │ Checkpoint: Every 1000 ledgers (last_committed_ledger, cfCounts)            │ │
-│  │ SIGHUP: Enabled (queries run against partial data)                          │ │
-│  │ Timing: IngestionTime                                                        │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 2A: COMPACTING (RocksDB)                                              │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ For each CF (0-f): Run full compaction → deduplicate → merge SST files │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ SIGHUP: Enabled (queries run against compacting data)                       │ │
-│  │ Timing: CompactionTime                                                       │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 2B: COUNT VERIFICATION                                                │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ For each CF: Iterate RocksDB → Count entries → Compare with cfCounts   │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ Purpose: Early detection of count mismatches before RecSplit build          │ │
-│  │ Timing: CountVerifyTime                                                      │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 3: BUILDING RECSPLIT                                                  │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ For each CF: Iterate RocksDB → Add keys to RecSplit → Build index      │ │ │
-│  │ │                                                                         │ │ │
-│  │ │ Mode: Sequential (one CF at a time) OR Parallel (all 16 CFs)           │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ SIGHUP: Ignored (RecSplit library not interruptible)                        │ │
-│  │ Timing: RecSplitTime                                                         │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 4: VERIFYING_RECSPLIT                                                          │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ For each CF: Iterate RocksDB → Lookup in RecSplit → Verify match       │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ Checkpoint: After each CF (verify_cf)                                       │ │
-│  │ SIGHUP: Ignored (verification must complete without side effects)          │ │
-│  │ Timing: VerificationTime                                                     │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 5: COMPLETE                                                           │ │
-│  │                                                                              │ │
-│  │ All phases finished successfully. Indexes are ready for use.                │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
 
 ### Phase Summary Table
 
@@ -291,7 +228,7 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 | 1 | `INGESTING` | Read LFS ledgers, extract txHashes, write to 16 RocksDB CFs | Yes (16 workers + 4 readers) | Every 5000 ledgers | Enabled |
 | 2A | `COMPACTING` | Run full compaction on all 16 CFs | Yes (16 goroutines) | None (idempotent) | Enabled |
 | 2B | (sub-phase) | Count verification after compaction | Yes (16 goroutines) | None | N/A |
-| 3 | `BUILDING_RECSPLIT` | Build RecSplit perfect hash indexes | Optional (`--parallel-recsplit`) | None | Ignored |
+| 3 | `BUILDING_RECSPLIT` | Build RecSplit perfect hash indexes | Default: single index; `--multi-index-enabled`: 16 parallel | None | Ignored |
 | 4 | `VERIFYING_RECSPLIT` | Verify RecSplit indexes against RocksDB | Yes (16 goroutines) | None (idempotent) | Ignored |
 | 5 | `COMPLETE` | All phases finished successfully | N/A | Final state | N/A |
 
@@ -480,18 +417,32 @@ scanOpts.SetFillCache(false)                 // Don't pollute block cache
 ### Phase 3: RecSplit Building
 
 **Input**: Compacted RocksDB with verified counts  
-**Output**: 16 RecSplit index files (`cf-0.idx` through `cf-f.idx`)
+**Output**: RecSplit index file(s)
+  - Default mode: Single `txhash.idx` file (all CFs combined)
+  - Multi-index mode: 16 separate `cf-0.idx` through `cf-f.idx` files
 
-#### Sequential vs Parallel Mode
+#### Single-Index vs Multi-Index Mode
 
-| Mode | Flag | Memory Required | Time |
-|------|------|-----------------|------|
-| Sequential | (default) | ~9 GB | ~2-3 hours |
-| Parallel | `--parallel-recsplit` | ~144 GB (16 × 9 GB) | ~15-20 minutes |
+| Mode | Flag | Output | Memory Required | Build Time |
+|------|------|--------|-----------------|------------|
+| Single Index | (default) | `txhash.idx` | ~9 GB | ~2-3 hours |
+| Multi-Index | `--multi-index-enabled` | 16 `cf-X.idx` files | ~144 GB (16 × 9 GB) | ~15-20 minutes |
 
-#### Parallel Implementation
+**Single-Index Mode (Default)**:
+- Builds one combined index from all 16 CFs sequentially
+- Each CF is processed one at a time, adding keys to the same RecSplit builder
+- Lower memory requirement (~9 GB peak)
+- Verification uses a shared reader across 16 parallel goroutines
 
-With `--parallel-recsplit`, all 16 CFs are built simultaneously:
+**Multi-Index Mode** (`--multi-index-enabled`):
+- Builds 16 separate indexes in parallel
+- Each CF gets its own `cf-X.idx` file
+- Higher memory requirement (~144 GB)
+- Faster build time due to parallelism
+
+#### Multi-Index Parallel Implementation
+
+With `--multi-index-enabled`, all 16 CFs are built simultaneously:
 
 ```go
 var wg sync.WaitGroup
@@ -537,12 +488,23 @@ On restart during RecSplit building:
 
 ### Phase 4: RecSplit Verification
 
-**Input**: RocksDB + RecSplit indexes  
+**Input**: RocksDB + RecSplit index(es)  
 **Output**: Verification report (pass/fail counts)
 
-#### Parallel Verification Implementation
+#### Verification Modes
 
-All 16 CFs are verified **in parallel** using goroutines:
+Verification automatically adapts to the index mode used during build:
+
+| Index Mode | Verification Behavior |
+|------------|----------------------|
+| Single Index | Opens `txhash.idx` once, shares reader across 16 parallel goroutines |
+| Multi-Index | Each goroutine opens its own `cf-X.idx` file |
+
+Both modes verify all 16 CFs in parallel using 16 goroutines.
+
+#### Parallel Verification Implementation (Multi-Index Mode)
+
+With multi-index mode, each goroutine opens its own index:
 
 ```go
 var wg sync.WaitGroup
@@ -551,7 +513,7 @@ for i, cfName := range cf.Names {
     go func(idx int, name string) {
         defer wg.Done()
         
-        // Open RecSplit index
+        // Open RecSplit index for this CF
         idx, _ := recsplit.OpenIndex(indexPath)
         reader := recsplit.NewIndexReader(idx)
         
@@ -570,6 +532,27 @@ for i, cfName := range cf.Names {
             }
             keysVerified++
         }
+    }(i, cfName)
+}
+wg.Wait()
+```
+
+#### Single-Index Verification
+
+With single-index mode, the index is opened once and the reader is shared (RecSplit readers are thread-safe):
+
+```go
+// Open combined index once
+idx, _ := recsplit.OpenIndex("txhash.idx")
+reader := recsplit.NewIndexReader(idx)  // Thread-safe
+
+var wg sync.WaitGroup
+for i, cfName := range cf.Names {
+    wg.Add(1)
+    go func(idx int, name string) {
+        defer wg.Done()
+        // Use shared reader for lookups
+        // Each goroutine iterates its own CF in RocksDB
     }(i, cfName)
 }
 wg.Wait()
@@ -706,7 +689,7 @@ The key insight is that **counts are checkpointed atomically with ledger progres
 
 ### Checkpoint Mechanism
 
-1. **Checkpoint Frequency**: Every 1000 ledgers during ingestion
+1. **Checkpoint Frequency**: Every 5000 ledgers during ingestion (parallel mode) or 1000 ledgers (sequential mode)
 2. **Atomic Checkpoint**: RocksDB batch write completes, THEN meta store update
 3. **Meta Store Contents**:
    - `phase`: Current pipeline phase (INGESTING, COMPACTING, etc.)
@@ -796,11 +779,11 @@ Counts remain accurate through crashes because of **atomic checkpointing** and *
 #### The Mechanism
 
 ```
-Batch Processing (every 1000 ledgers):
-  1. Accumulate txHashes for ledgers N to N+999
+Batch Processing (every 5000 ledgers in parallel mode, 1000 in sequential):
+  1. Accumulate txHashes for ledgers N to N+4999 (or N+999 in sequential mode)
   2. Write batch to RocksDB
   3. Update in-memory cfCounts: cfCounts[cf] += batchCounts[cf]
-  4. Checkpoint to meta store: (last_committed_ledger=N+999, cfCounts) <- ATOMIC
+  4. Checkpoint to meta store: (last_committed_ledger=N+4999, cfCounts) <- ATOMIC
   
 On Resume After Crash:
   1. Load cfCounts from meta store       <- Restored to last checkpoint
@@ -1101,7 +1084,7 @@ The RecSplit library has limits on bucket sizes. This is rare with txHash distri
 ### High Memory Usage
 
 1. Reduce `--block-cache-mb`
-2. Avoid `--parallel-recsplit` on memory-constrained systems
+2. Use single-index mode (default) instead of `--multi-index-enabled`
 3. Monitor with `htop` or `top` during operation
 
 ### Slow Ingestion
@@ -1227,7 +1210,10 @@ b2c3d4e5f6a1...,-1,38       # -1 means not found
 
 Builds RecSplit minimal perfect hash indexes from a compacted RocksDB store. This is a standalone alternative to the RecSplit phase in the main workflow.
 
-**Key Feature**: Discovers key counts by iterating each CF (no meta store dependency). This makes it truly standalone and useful for building indexes from any compatible RocksDB store.
+**Key Features**:
+- Discovers key counts by iterating all 16 CFs **in parallel** (no meta store dependency)
+- Supports two index modes: single combined index (default) or 16 separate indexes
+- Optional compaction and verification
 
 #### Building
 
@@ -1239,7 +1225,7 @@ go build .
 #### Usage
 
 ```bash
-# Sequential mode (lower memory, one CF at a time)
+# Default mode: Single combined txhash.idx file
 ./build-recsplit \
   --rocksdb-path /path/to/rocksdb \
   --output-dir /path/to/indexes \
@@ -1247,13 +1233,23 @@ go build .
   --error /path/to/build.err \
   --block-cache-mb 8192
 
-# Parallel mode (higher memory, all 16 CFs simultaneously)
+# Multi-index mode: 16 separate cf-X.idx files (built in parallel)
 ./build-recsplit \
   --rocksdb-path /path/to/rocksdb \
   --output-dir /path/to/indexes \
   --log /path/to/build.log \
   --error /path/to/build.err \
-  --parallel \
+  --multi-index-enabled \
+  --block-cache-mb 8192
+
+# With compaction and verification
+./build-recsplit \
+  --rocksdb-path /path/to/rocksdb \
+  --output-dir /path/to/indexes \
+  --log /path/to/build.log \
+  --error /path/to/build.err \
+  --compact \
+  --verify \
   --block-cache-mb 8192
 ```
 
@@ -1265,7 +1261,9 @@ go build .
 | `--output-dir` | Yes | - | Directory for RecSplit index files |
 | `--log` | Yes | - | Path to log file |
 | `--error` | Yes | - | Path to error log file |
-| `--parallel` | No | false | Build 16 indexes in parallel |
+| `--multi-index-enabled` | No | false | Build 16 separate cf-X.idx files instead of single txhash.idx |
+| `--compact` | No | false | Compact RocksDB before building |
+| `--verify` | No | false | Verify indexes after building |
 | `--block-cache-mb` | No | 8192 | RocksDB block cache size in MB |
 
 #### Output
@@ -1273,6 +1271,8 @@ go build .
 ```
 <output-dir>/
 ├── index/
+│   ├── txhash.idx          # Single combined index (default mode)
+│   # OR (with --multi-index-enabled):
 │   ├── cf-0.idx
 │   ├── cf-1.idx
 │   ├── ...
@@ -1284,13 +1284,13 @@ go build .
 
 | Mode | Peak Memory | Notes |
 |------|-------------|-------|
-| Sequential | ~9 GB | One CF at a time (~40 bytes/key) |
-| Parallel | ~144 GB | All 16 CFs simultaneously |
+| Single Index (default) | ~9 GB | Builds one combined index sequentially |
+| Multi-Index | ~144 GB | All 16 CFs simultaneously |
 
 #### Log Output
 
 The log file includes:
-- Key count discovery phase (per-CF iteration)
+- Key count discovery phase (parallel, all 16 CFs)
 - Memory estimates before build
 - Per-CF build progress and timing
 - Final summary with total keys, build time, and index sizes

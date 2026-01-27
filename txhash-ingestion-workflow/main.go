@@ -217,7 +217,7 @@ func parseFlags() *Config {
 	flag.Uint64Var(&endLedger, "end-ledger", 0, "Last ledger to ingest (must match Y0000000 pattern)")
 
 	// Optional flags
-	flag.BoolVar(&config.ParallelRecsplit, "parallel-recsplit", false, "Build 16 RecSplit indexes in parallel (requires ~144GB RAM)")
+	flag.BoolVar(&config.MultiIndexEnabled, "multi-index-enabled", false, "Build 16 separate RecSplit indexes (one per CF) instead of one combined index")
 	flag.BoolVar(&config.SequentialIngestion, "sequential", false, "Use sequential (single-threaded) ingestion instead of parallel")
 	flag.IntVar(&config.ParallelWorkers, "parallel-workers", DefaultParallelWorkers, "Number of parallel workers for decompress/unmarshal/extract")
 	flag.IntVar(&config.ParallelReaders, "parallel-readers", DefaultParallelReaders, "Number of parallel LFS readers")
@@ -249,7 +249,7 @@ func parseFlags() *Config {
 		fmt.Fprintf(os.Stderr, "  --parallel-workers N  Number of parallel workers (default: %d)\n", DefaultParallelWorkers)
 		fmt.Fprintf(os.Stderr, "  --parallel-readers N  Number of parallel LFS readers (default: %d)\n", DefaultParallelReaders)
 		fmt.Fprintf(os.Stderr, "  --batch-size N        Number of ledgers per batch (default: %d)\n", DefaultParallelBatchSize)
-		fmt.Fprintf(os.Stderr, "  --parallel-recsplit   Build 16 RecSplit indexes in parallel (~144GB RAM)\n")
+		fmt.Fprintf(os.Stderr, "  --multi-index-enabled Build 16 separate RecSplit indexes (~144GB RAM)\n")
 		fmt.Fprintf(os.Stderr, "  --block-cache-mb N    RocksDB block cache size in MB (default: %d)\n", DefaultBlockCacheMB)
 		fmt.Fprintf(os.Stderr, "  --dry-run             Validate configuration and exit\n")
 		fmt.Fprintf(os.Stderr, "  --version             Show version and exit\n")

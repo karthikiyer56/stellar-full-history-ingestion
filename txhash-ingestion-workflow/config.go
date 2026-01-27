@@ -199,14 +199,15 @@ type Config struct {
 	// Optional Flags
 	// =========================================================================
 
-	// ParallelRecsplit enables building 16 RecSplit indexes in parallel.
-	// Default: false (build single combined index)
+	// MultiIndexEnabled enables building 16 separate RecSplit indexes (one per CF).
+	// Default: false (build single combined index file: txhash.idx)
+	// When true: Build 16 separate index files (cf-0.idx through cf-f.idx) in parallel
 	//
 	// MEMORY WARNING:
-	//   Parallel mode requires ~9 GB per CF during build.
+	//   Multi-index mode requires ~9 GB per CF during build.
 	//   With 16 CFs building simultaneously: ~144 GB peak.
 	//
-	ParallelRecsplit bool
+	MultiIndexEnabled bool
 
 	// SequentialIngestion uses the old single-threaded ingestion mode.
 	// Default: false (use parallel ingestion)
@@ -427,10 +428,20 @@ func (c *Config) TotalLedgers() uint32 {
 	return c.EndLedger - c.StartLedger + 1
 }
 
-// TotalBatches returns the total number of 1000-ledger batches.
+// BatchSize returns the batch size based on ingestion mode.
+// Returns ParallelBatchSize for parallel mode, LedgersPerBatch for sequential mode.
+func (c *Config) BatchSize() uint32 {
+	if c.SequentialIngestion {
+		return LedgersPerBatch
+	}
+	return uint32(c.ParallelBatchSize)
+}
+
+// TotalBatches returns the total number of batches based on ingestion mode.
 func (c *Config) TotalBatches() uint32 {
 	total := c.TotalLedgers()
-	return (total + LedgersPerBatch - 1) / LedgersPerBatch
+	batchSize := c.BatchSize()
+	return (total + batchSize - 1) / batchSize
 }
 
 // =============================================================================
@@ -448,7 +459,7 @@ func (c *Config) PrintConfig(logger interfaces.Logger) {
 	logger.Info("  Start Ledger:        %d", c.StartLedger)
 	logger.Info("  End Ledger:          %d", c.EndLedger)
 	logger.Info("  Total Ledgers:       %d", c.TotalLedgers())
-	logger.Info("  Total Batches:       %d (1000 ledgers each)", c.TotalBatches())
+	logger.Info("  Total Batches:       %d (%d ledgers each)", c.TotalBatches(), c.BatchSize())
 	logger.Info("")
 	logger.Info("OUTPUT:")
 	logger.Info("  Output Dir:          %s", c.OutputDir)
@@ -468,7 +479,7 @@ func (c *Config) PrintConfig(logger interfaces.Logger) {
 	logger.Info("  Query Error:         %s", c.QueryError)
 	logger.Info("")
 	logger.Info("OPTIONS:")
-	logger.Info("  Parallel RecSplit:   %v", c.ParallelRecsplit)
+	logger.Info("  Multi-Index Mode:    %v", c.MultiIndexEnabled)
 	logger.Info("  Sequential Ingest:   %v", c.SequentialIngestion)
 	logger.Info("  Dry Run:             %v", c.DryRun)
 	logger.Info("")

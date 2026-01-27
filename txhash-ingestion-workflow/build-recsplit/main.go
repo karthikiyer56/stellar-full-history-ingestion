@@ -13,20 +13,21 @@
 //	  --log /path/to/build.log \
 //	  --error /path/to/build.err \
 //	  [--compact] \
-//	  [--parallel] \
+//	  [--multi-index-enabled] \
 //	  [--verify] \
 //	  [--block-cache-mb 8192]
 //
 // FEATURES:
 //
-//   - Discovers key counts by iterating each CF (no meta store dependency)
+//   - Discovers key counts by iterating each CF in parallel
 //   - Optional compaction before building (--compact)
 //   - Optional verification after building (--verify)
-//   - Sequential or parallel building (--parallel)
+//   - Single combined index (default) or multi-index mode (--multi-index-enabled)
 //
 // OUTPUT:
 //
-//	16 index files: cf-0.idx through cf-f.idx
+//	Default mode:      Single txhash.idx file (all CFs combined)
+//	Multi-index mode:  16 index files: cf-0.idx through cf-f.idx
 //
 // =============================================================================
 
@@ -37,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
@@ -379,7 +381,8 @@ func (m *NoOpMetaStore) Close()                            {}
 // =============================================================================
 
 func countKeys(store *Store, cfName string) (uint64, error) {
-	iter := store.NewIteratorCF(cfName)
+	// Use scan-optimized iterator for full count (avoids cache pollution, uses readahead)
+	iter := store.NewScanIteratorCF(cfName)
 	defer iter.Close()
 
 	var count uint64
@@ -402,7 +405,7 @@ func main() {
 	outputDir := flag.String("output-dir", "", "Directory for RecSplit index files (required)")
 	logPath := flag.String("log", "", "Path to log file (required)")
 	errorPath := flag.String("error", "", "Path to error file (required)")
-	parallel := flag.Bool("parallel", false, "Build 16 indexes in parallel")
+	multiIndexEnabled := flag.Bool("multi-index-enabled", false, "Build 16 separate cf-X.idx files instead of single txhash.idx")
 	doCompact := flag.Bool("compact", false, "Compact RocksDB before building")
 	doVerify := flag.Bool("verify", false, "Verify indexes after building")
 	blockCacheMB := flag.Int("block-cache-mb", 8192, "RocksDB block cache size in MB")
@@ -435,7 +438,7 @@ func main() {
 	logger.Info("Configuration:")
 	logger.Info("  RocksDB Path:    %s", *rocksdbPath)
 	logger.Info("  Output Dir:      %s", *outputDir)
-	logger.Info("  Parallel Mode:   %v", *parallel)
+	logger.Info("  Multi-Index:     %v", *multiIndexEnabled)
 	logger.Info("  Compact First:   %v", *doCompact)
 	logger.Info("  Verify After:    %v", *doVerify)
 	logger.Info("  Block Cache:     %d MB", *blockCacheMB)
@@ -478,27 +481,56 @@ func main() {
 		logger.Info("")
 	}
 
-	// Discover key counts
+	// Discover key counts in parallel
 	logger.Separator()
-	logger.Info("                    DISCOVERING KEY COUNTS")
+	logger.Info("                    DISCOVERING KEY COUNTS (PARALLEL)")
 	logger.Separator()
 	logger.Info("")
 
 	cfCounts := make(map[string]uint64)
+	var mu sync.Mutex
 	var totalKeys uint64
 	countStart := time.Now()
 
+	// Count all CFs in parallel
+	type countResult struct {
+		cfName   string
+		count    uint64
+		duration time.Duration
+		err      error
+	}
+	results := make([]countResult, len(cf.Names))
+
+	var wg sync.WaitGroup
 	for i, cfName := range cf.Names {
-		countCFStart := time.Now()
-		count, err := countKeys(store, cfName)
-		if err != nil {
-			logger.Error("Failed to count keys in CF %s: %v", cfName, err)
+		wg.Add(1)
+		go func(idx int, name string) {
+			defer wg.Done()
+			start := time.Now()
+			count, err := countKeys(store, name)
+			results[idx] = countResult{
+				cfName:   name,
+				count:    count,
+				duration: time.Since(start),
+				err:      err,
+			}
+		}(i, cfName)
+	}
+	wg.Wait()
+
+	// Collect results and check for errors
+	for i, cfName := range cf.Names {
+		r := results[i]
+		if r.err != nil {
+			logger.Error("Failed to count keys in CF %s: %v", cfName, r.err)
 			os.Exit(1)
 		}
-		cfCounts[cfName] = count
-		totalKeys += count
+		mu.Lock()
+		cfCounts[cfName] = r.count
+		totalKeys += r.count
+		mu.Unlock()
 		logger.Info("[%2d/16] CF [%s]: %s keys (counted in %v)",
-			i+1, cfName, helpers.FormatNumber(int64(count)), time.Since(countCFStart))
+			i+1, cfName, helpers.FormatNumber(int64(r.count)), r.duration)
 	}
 
 	logger.Info("")
@@ -516,7 +548,7 @@ func main() {
 		cfCounts,
 		indexPath,
 		tmpPath,
-		*parallel,
+		*multiIndexEnabled,
 		logger,
 		memMonitor,
 	)
@@ -536,6 +568,7 @@ func main() {
 			noOpMeta,
 			indexPath,
 			"", // no resume
+			*multiIndexEnabled,
 			logger,
 			memMonitor,
 		)

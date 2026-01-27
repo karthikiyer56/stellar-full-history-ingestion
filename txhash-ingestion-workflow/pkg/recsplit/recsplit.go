@@ -5,6 +5,20 @@
 // This package implements the RecSplit building phase that creates perfect hash
 // function indexes from the RocksDB data.
 //
+// TWO MODES:
+//
+//   1. Combined Index (default, multiIndex=false):
+//      - Reads all 16 CFs sequentially
+//      - Feeds all keys into ONE RecSplit builder
+//      - Produces single file: txhash.idx
+//      - Lower memory usage (~9 GB for entire build)
+//
+//   2. Multi-Index (multiIndex=true):
+//      - Reads all 16 CFs in parallel
+//      - Each CF has its own RecSplit builder
+//      - Produces 16 files: cf-0.idx through cf-f.idx
+//      - Higher memory usage (~144 GB peak)
+//
 // =============================================================================
 
 package recsplit
@@ -27,6 +41,15 @@ import (
 )
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+const (
+	// CombinedIndexFileName is the name of the single combined index file
+	CombinedIndexFileName = "txhash.idx"
+)
+
+// =============================================================================
 // RecSplit Builder Stats
 // =============================================================================
 
@@ -38,7 +61,7 @@ type Stats struct {
 	// EndTime when building completed
 	EndTime time.Time
 
-	// PerCFStats holds per-CF statistics
+	// PerCFStats holds per-CF statistics (key addition time for combined mode)
 	PerCFStats map[string]*CFStats
 
 	// TotalTime is the total build time
@@ -47,25 +70,37 @@ type Stats struct {
 	// TotalKeys is the total number of keys indexed
 	TotalKeys uint64
 
-	// Parallel indicates if parallel mode was used
-	Parallel bool
+	// MultiIndex indicates if multi-index mode was used
+	MultiIndex bool
+
+	// IndexBuildTime is the time spent building the index (combined mode only)
+	IndexBuildTime time.Duration
+
+	// KeyAddTime is the total time spent adding keys (combined mode only)
+	KeyAddTime time.Duration
+
+	// IndexSize is the total size of index file(s)
+	IndexSize int64
+
+	// IndexPath is the path to the index file (combined mode) or directory (multi-index mode)
+	IndexPath string
 }
 
 // CFStats holds per-CF RecSplit statistics.
 type CFStats struct {
 	CFName     string
 	KeyCount   uint64
-	BuildTime  time.Duration
-	IndexSize  int64
-	IndexPath  string
-	KeyAddTime time.Duration
+	BuildTime  time.Duration // Full build time (multi-index) or key-add time (combined)
+	IndexSize  int64         // Only set in multi-index mode
+	IndexPath  string        // Only set in multi-index mode
+	KeyAddTime time.Duration // Time to add keys from this CF
 }
 
 // NewStats creates a new Stats.
-func NewStats(parallel bool) *Stats {
+func NewStats(multiIndex bool) *Stats {
 	return &Stats{
 		PerCFStats: make(map[string]*CFStats),
-		Parallel:   parallel,
+		MultiIndex: multiIndex,
 	}
 }
 
@@ -76,35 +111,67 @@ func (rs *Stats) LogSummary(logger interfaces.Logger) {
 	logger.Separator()
 	logger.Info("")
 
-	if rs.Parallel {
-		logger.Info("Mode: Parallel (16 CFs simultaneously)")
+	if rs.MultiIndex {
+		logger.Info("Mode: Multi-Index (16 separate index files)")
 	} else {
-		logger.Info("Mode: Sequential (one CF at a time)")
+		logger.Info("Mode: Combined (single index file: %s)", CombinedIndexFileName)
 	}
 	logger.Info("")
 
-	logger.Info("PER-CF STATISTICS:")
-	logger.Info("%-4s %15s %12s %12s", "CF", "Keys", "Build Time", "Index Size")
-	logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
+	if rs.MultiIndex {
+		// Multi-index mode: show per-CF build time and size
+		logger.Info("PER-CF STATISTICS:")
+		logger.Info("%-4s %15s %12s %12s", "CF", "Keys", "Build Time", "Index Size")
+		logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
 
-	var totalKeys uint64
-	var totalSize int64
+		var totalKeys uint64
+		var totalSize int64
 
-	for _, cfName := range cf.Names {
-		stats := rs.PerCFStats[cfName]
-		if stats != nil {
-			logger.Info("%-4s %15s %12v %12s",
-				cfName,
-				helpers.FormatNumber(int64(stats.KeyCount)),
-				stats.BuildTime,
-				helpers.FormatBytes(stats.IndexSize))
-			totalKeys += stats.KeyCount
-			totalSize += stats.IndexSize
+		for _, cfName := range cf.Names {
+			stats := rs.PerCFStats[cfName]
+			if stats != nil {
+				logger.Info("%-4s %15s %12v %12s",
+					cfName,
+					helpers.FormatNumber(int64(stats.KeyCount)),
+					stats.BuildTime,
+					helpers.FormatBytes(stats.IndexSize))
+				totalKeys += stats.KeyCount
+				totalSize += stats.IndexSize
+			}
 		}
+
+		logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
+		logger.Info("%-4s %15s %12v %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), rs.TotalTime, helpers.FormatBytes(totalSize))
+	} else {
+		// Combined mode: show per-CF key-add time, then overall build time
+		logger.Info("KEY ADDITION BY CF:")
+		logger.Info("%-4s %15s %12s", "CF", "Keys Added", "Add Time")
+		logger.Info("%-4s %15s %12s", "----", "---------------", "------------")
+
+		var totalKeys uint64
+
+		for _, cfName := range cf.Names {
+			stats := rs.PerCFStats[cfName]
+			if stats != nil {
+				logger.Info("%-4s %15s %12v",
+					cfName,
+					helpers.FormatNumber(int64(stats.KeyCount)),
+					stats.KeyAddTime)
+				totalKeys += stats.KeyCount
+			}
+		}
+
+		logger.Info("%-4s %15s %12s", "----", "---------------", "------------")
+		logger.Info("%-4s %15s %12v", "TOT", helpers.FormatNumber(int64(totalKeys)), rs.KeyAddTime)
+		logger.Info("")
+		logger.Info("INDEX BUILD:")
+		logger.Info("  Build Time:    %v", rs.IndexBuildTime)
+		logger.Info("  Index Size:    %s", helpers.FormatBytes(rs.IndexSize))
+		logger.Info("  Index Path:    %s", rs.IndexPath)
+		logger.Info("")
+		logger.Info("TOTAL TIME:      %v", rs.TotalTime)
 	}
 
-	logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
-	logger.Info("%-4s %15s %12v %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), rs.TotalTime, helpers.FormatBytes(totalSize))
 	logger.Info("")
 }
 
@@ -114,14 +181,14 @@ func (rs *Stats) LogSummary(logger interfaces.Logger) {
 
 // Builder handles building RecSplit indexes from RocksDB data.
 type Builder struct {
-	store     interfaces.TxHashStore
-	cfCounts  map[string]uint64
-	indexPath string
-	tmpPath   string
-	parallel  bool
-	logger    interfaces.Logger
-	memory    interfaces.MemoryMonitor
-	stats     *Stats
+	store      interfaces.TxHashStore
+	cfCounts   map[string]uint64
+	indexPath  string
+	tmpPath    string
+	multiIndex bool
+	logger     interfaces.Logger
+	memory     interfaces.MemoryMonitor
+	stats      *Stats
 }
 
 // NewBuilder creates a new RecSplit Builder.
@@ -131,7 +198,7 @@ type Builder struct {
 //   - cfCounts: Per-CF key counts (from meta store)
 //   - indexPath: Directory for output index files
 //   - tmpPath: Directory for temporary files during build
-//   - parallel: Whether to build indexes in parallel
+//   - multiIndex: If true, build 16 separate indexes; if false, build one combined index
 //   - logger: Logger instance
 //   - mem: Memory monitor
 func NewBuilder(
@@ -139,19 +206,19 @@ func NewBuilder(
 	cfCounts map[string]uint64,
 	indexPath string,
 	tmpPath string,
-	parallel bool,
+	multiIndex bool,
 	logger interfaces.Logger,
 	mem interfaces.MemoryMonitor,
 ) *Builder {
 	return &Builder{
-		store:     store,
-		cfCounts:  cfCounts,
-		indexPath: indexPath,
-		tmpPath:   tmpPath,
-		parallel:  parallel,
-		logger:    logger,
-		memory:    mem,
-		stats:     NewStats(parallel),
+		store:      store,
+		cfCounts:   cfCounts,
+		indexPath:  indexPath,
+		tmpPath:    tmpPath,
+		multiIndex: multiIndex,
+		logger:     logger,
+		memory:     mem,
+		stats:      NewStats(multiIndex),
 	}
 }
 
@@ -170,14 +237,14 @@ func (b *Builder) Run() (*Stats, error) {
 	}
 
 	// Log memory estimate
-	memory.LogRecSplitMemoryEstimate(b.logger, b.cfCounts, b.parallel)
+	memory.LogRecSplitMemoryEstimate(b.logger, b.cfCounts, b.multiIndex)
 
-	// Build indexes
+	// Build indexes based on mode
 	var err error
-	if b.parallel {
-		err = b.buildParallel()
+	if b.multiIndex {
+		err = b.buildMultiIndex()
 	} else {
-		err = b.buildSequential()
+		err = b.buildCombinedIndex()
 	}
 
 	if err != nil {
@@ -227,39 +294,167 @@ func (b *Builder) cleanupDirectories() error {
 	return nil
 }
 
-// buildSequential builds indexes one CF at a time.
-func (b *Builder) buildSequential() error {
-	b.logger.Info("Building indexes sequentially (one CF at a time)...")
+// =============================================================================
+// Combined Index Mode (default)
+// =============================================================================
+
+// buildCombinedIndex builds a single combined index from all 16 CFs.
+func (b *Builder) buildCombinedIndex() error {
+	b.logger.Info("Building combined index (single file: %s)...", CombinedIndexFileName)
 	b.logger.Info("")
+
+	// Calculate total key count
+	var totalKeys uint64
+	for _, count := range b.cfCounts {
+		totalKeys += count
+	}
+
+	if totalKeys == 0 {
+		b.logger.Info("No keys to index")
+		return nil
+	}
+
+	b.logger.Info("Total keys to index: %s", helpers.FormatNumber(int64(totalKeys)))
+	b.logger.Info("")
+
+	// Determine output path
+	indexFilePath := filepath.Join(b.indexPath, CombinedIndexFileName)
+	b.stats.IndexPath = indexFilePath
+
+	// Create RecSplit builder with total key count
+	erigonLogger := erigonlog.New()
+
+	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
+		KeyCount:           int(totalKeys),
+		Enums:              false, // We store ledgerSeq values, not sequential offsets
+		LessFalsePositives: types.RecSplitLessFalsePositivesEnabled,
+		BucketSize:         types.RecSplitBucketSize,
+		LeafSize:           types.RecSplitLeafSize,
+		TmpDir:             b.tmpPath,
+		IndexFile:          indexFilePath,
+		BaseDataID:         0,
+		Version:            types.RecSplitDataVersion,
+	}, erigonLogger)
+	if err != nil {
+		return fmt.Errorf("failed to create RecSplit: %w", err)
+	}
+	defer rs.Close()
+
+	// Add keys from all CFs sequentially
+	b.logger.Info("Adding keys from 16 column families...")
+	b.logger.Info("")
+
+	keyAddStart := time.Now()
+	var totalKeysAdded uint64
 
 	for i, cfName := range cf.Names {
 		keyCount := b.cfCounts[cfName]
 		if keyCount == 0 {
 			b.logger.Info("[%2d/16] CF [%s]: No keys, skipping", i+1, cfName)
+			b.stats.PerCFStats[cfName] = &CFStats{
+				CFName:   cfName,
+				KeyCount: 0,
+			}
 			continue
 		}
 
-		b.logger.Info("[%2d/16] CF [%s]: Building index for %s keys...",
-			i+1, cfName, helpers.FormatNumber(int64(keyCount)))
+		cfStart := time.Now()
 
-		stats, err := b.buildCFIndex(cfName, keyCount)
-		if err != nil {
-			return fmt.Errorf("failed to build index for CF %s: %w", cfName, err)
+		// Iterate over CF and add keys using scan-optimized iterator
+		iter := b.store.NewScanIteratorCF(cfName)
+		keysAdded := uint64(0)
+
+		for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+			key := iter.Key()
+			value := iter.Value()
+
+			// Parse ledger sequence from value
+			ledgerSeq := types.ParseLedgerSeq(value)
+
+			// Add to RecSplit
+			if err := rs.AddKey(key, uint64(ledgerSeq)); err != nil {
+				iter.Close()
+				return fmt.Errorf("failed to add key from CF %s: %w", cfName, err)
+			}
+			keysAdded++
 		}
 
-		b.stats.PerCFStats[cfName] = stats
-		b.logger.Info("        Completed in %v, size: %s",
-			stats.BuildTime, helpers.FormatBytes(stats.IndexSize))
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return fmt.Errorf("iterator error for CF %s: %w", cfName, err)
+		}
+		iter.Close()
+
+		// Verify key count matches expected
+		if keysAdded != keyCount {
+			return fmt.Errorf("CF %s: key count mismatch: expected %d, got %d", cfName, keyCount, keysAdded)
+		}
+
+		cfAddTime := time.Since(cfStart)
+		totalKeysAdded += keysAdded
+
+		b.stats.PerCFStats[cfName] = &CFStats{
+			CFName:     cfName,
+			KeyCount:   keysAdded,
+			KeyAddTime: cfAddTime,
+		}
+
+		b.logger.Info("[%2d/16] CF [%s]: Added %s keys in %v",
+			i+1, cfName, helpers.FormatNumber(int64(keysAdded)), cfAddTime)
 
 		// Check memory after each CF
 		b.memory.Check()
 	}
 
+	b.stats.KeyAddTime = time.Since(keyAddStart)
+
+	b.logger.Info("")
+	b.logger.Info("Key addition complete: %s keys in %v",
+		helpers.FormatNumber(int64(totalKeysAdded)), b.stats.KeyAddTime)
+	b.logger.Info("")
+
+	// Verify total key count
+	if totalKeysAdded != totalKeys {
+		return fmt.Errorf("total key count mismatch: expected %d, got %d", totalKeys, totalKeysAdded)
+	}
+
+	// Build the index
+	b.logger.Info("Building combined index...")
+	buildStart := time.Now()
+
+	ctx := context.Background()
+	if err := rs.Build(ctx); err != nil {
+		if err == recsplit.ErrCollision {
+			return fmt.Errorf("hash collision detected (rare, try rebuilding)")
+		}
+		return fmt.Errorf("failed to build index: %w", err)
+	}
+
+	b.stats.IndexBuildTime = time.Since(buildStart)
+
+	// Get index file size
+	if info, err := os.Stat(indexFilePath); err == nil {
+		b.stats.IndexSize = info.Size()
+	}
+
+	b.logger.Info("Index built in %v, size: %s",
+		b.stats.IndexBuildTime, helpers.FormatBytes(b.stats.IndexSize))
+	b.logger.Info("")
+
+	// Clean up temp directory
+	if err := os.RemoveAll(b.tmpPath); err != nil {
+		b.logger.Info("Warning: Failed to clean up temp directory: %v", err)
+	}
+
 	return nil
 }
 
-// buildParallel builds all 16 CF indexes in parallel.
-func (b *Builder) buildParallel() error {
+// =============================================================================
+// Multi-Index Mode
+// =============================================================================
+
+// buildMultiIndex builds 16 separate CF indexes in parallel.
+func (b *Builder) buildMultiIndex() error {
 	b.logger.Info("Building indexes in parallel (16 CFs simultaneously)...")
 	b.logger.Info("")
 	b.logger.Info("WARNING: This requires ~144 GB of RAM!")
@@ -300,6 +495,16 @@ func (b *Builder) buildParallel() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// Calculate total index size
+	for _, stats := range b.stats.PerCFStats {
+		b.stats.IndexSize += stats.IndexSize
+	}
+
+	// Clean up temp directory
+	if err := os.RemoveAll(b.tmpPath); err != nil {
+		b.logger.Info("Warning: Failed to clean up temp directory: %v", err)
 	}
 
 	return nil
@@ -391,7 +596,7 @@ func (b *Builder) buildCFIndex(cfName string, keyCount uint64) (*CFStats, error)
 		stats.IndexSize = info.Size()
 	}
 
-	// Clean up temp directory for this CF
+	// Clean up temp directory for this CF (best-effort, parent cleanup will catch stragglers)
 	os.RemoveAll(cfTmpDir)
 
 	return stats, nil

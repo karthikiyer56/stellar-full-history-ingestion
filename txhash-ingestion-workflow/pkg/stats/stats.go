@@ -166,7 +166,7 @@ func (s LatencySummary) String() string {
 
 // BatchStats tracks statistics for a single batch of ledgers.
 //
-// A batch is typically 1000 ledgers. Statistics include:
+// A batch is typically 5000 ledgers (parallel mode) or 1000 ledgers (sequential mode). Statistics include:
 //   - Parse time (reading and deserializing ledgers)
 //   - Write time (writing to RocksDB)
 //   - Transaction counts per column family

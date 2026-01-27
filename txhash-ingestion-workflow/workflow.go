@@ -439,7 +439,7 @@ func (w *Workflow) runRecSplitBuild() error {
 		cfCounts,
 		w.config.RecsplitIndexPath,
 		w.config.RecsplitTmpPath,
-		w.config.ParallelRecsplit,
+		w.config.MultiIndexEnabled,
 		w.logger,
 		w.memory,
 	)
@@ -487,6 +487,7 @@ func (w *Workflow) runVerification() error {
 		w.meta,
 		w.config.RecsplitIndexPath,
 		resumeFromCF,
+		w.config.MultiIndexEnabled,
 		w.logger,
 		w.memory,
 	)
