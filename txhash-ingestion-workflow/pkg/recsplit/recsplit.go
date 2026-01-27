@@ -344,9 +344,9 @@ func (b *Builder) buildCFIndex(cfName string, keyCount uint64) (*CFStats, error)
 	}
 	defer rs.Close()
 
-	// Iterate over CF and add keys
+	// Iterate over CF and add keys using scan-optimized iterator
 	keyAddStart := time.Now()
-	iter := b.store.NewIteratorCF(cfName)
+	iter := b.store.NewScanIteratorCF(cfName)
 	defer iter.Close()
 
 	keysAdded := 0

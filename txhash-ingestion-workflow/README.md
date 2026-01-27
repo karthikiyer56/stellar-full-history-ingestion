@@ -519,11 +519,12 @@ wg.Wait()
 
 1. Create temp directory for CF
 2. Create RecSplit builder with **exact** key count from meta store
-3. Iterate RocksDB CF, add each key with its ledgerSeq value
-4. **Verify**: `keysAdded == expectedCount` (definitive check - build fails if mismatch)
-5. Finalize perfect hash function
-6. Write index file
-7. Clean up temp directory
+3. Iterate RocksDB CF using **scan-optimized iterator** (2MB readahead, no cache fill)
+4. Add each key with its ledgerSeq value to RecSplit
+5. **Verify**: `keysAdded == expectedCount` (definitive check - build fails if mismatch)
+6. Finalize perfect hash function
+7. Write index file
+8. Clean up temp directory
 
 #### Crash Recovery
 
@@ -607,10 +608,27 @@ All phases leverage parallelism for maximum performance:
 | **Ingestion** | 4 readers + 16 workers | N/A | ~2-3 hours for 56M ledgers |
 | **Compaction** | 16 goroutines | ~50-60 min | ~4-5 min |
 | **Count Verification** | 16 goroutines + scan iterator | ~70 min | ~1-2 min |
-| **RecSplit Build** | Optional 16 goroutines | ~2-3 hours | ~15-20 min (parallel) |
+| **RecSplit Build** | Optional 16 goroutines + scan iterator | ~2-3 hours | ~15-20 min (parallel) |
 | **RecSplit Verify** | 16 goroutines + scan iterator | ~70 min | ~4-5 min |
 
 **Total pipeline time (with parallel RecSplit)**: ~3-4 hours for 56M ledgers / 3.5B txHashes
+
+### Scan-Optimized Iterator Usage
+
+All full-scan operations use `NewScanIteratorCF()` with optimized read options:
+
+```go
+scanOpts.SetReadaheadSize(2 * 1024 * 1024)  // 2MB readahead prefetch
+scanOpts.SetFillCache(false)                 // Don't pollute block cache
+```
+
+| Operation | File | Why Scan Iterator |
+|-----------|------|-------------------|
+| Count Verification | `pkg/compact/compact.go` | Iterates all entries to count |
+| RecSplit Building | `pkg/recsplit/recsplit.go` | Iterates all entries to add keys |
+| RecSplit Verification | `pkg/verify/verify.go` | Iterates all entries to verify |
+
+Point lookups (e.g., SIGHUP queries) use the standard `NewIteratorCF()` which fills the block cache for repeated access.
 
 ### Final Summary Output
 
