@@ -89,11 +89,11 @@ func (vs *Stats) LogSummary(logger interfaces.Logger) {
 	for _, cfName := range cf.Names {
 		stats := vs.PerCFStats[cfName]
 		if stats != nil {
-			logger.Info("%-4s %15s %10d %12v %15.0f",
+			logger.Info("%-4s %15s %10s %12s %15.0f",
 				cfName,
 				helpers.FormatNumber(int64(stats.KeysVerified)),
-				stats.Failures,
-				stats.VerifyTime,
+				helpers.FormatNumber(int64(stats.Failures)),
+				helpers.FormatDuration(stats.VerifyTime),
 				stats.KeysPerSecond)
 			totalKeys += stats.KeysVerified
 			totalFailures += stats.Failures
@@ -102,23 +102,23 @@ func (vs *Stats) LogSummary(logger interfaces.Logger) {
 
 	logger.Info("%-4s %15s %10s %12s %15s",
 		"----", "---------------", "----------", "------------", "---------------")
-	logger.Info("%-4s %15s %10d %12v",
+	logger.Info("%-4s %15s %10s %12s",
 		"TOT",
 		helpers.FormatNumber(int64(totalKeys)),
-		totalFailures,
-		vs.TotalTime)
+		helpers.FormatNumber(int64(totalFailures)),
+		helpers.FormatDuration(vs.TotalTime))
 
 	logger.Info("")
 
 	if totalKeys > 0 {
 		successRate := 100.0 * float64(totalKeys-totalFailures) / float64(totalKeys)
-		logger.Info("SUCCESS RATE: %.6f%% (%d/%d)",
-			successRate, totalKeys-totalFailures, totalKeys)
+		logger.Info("SUCCESS RATE: %.6f%% (%s/%s)",
+			successRate, helpers.FormatNumber(int64(totalKeys-totalFailures)), helpers.FormatNumber(int64(totalKeys)))
 
 		if totalFailures == 0 {
 			logger.Info("STATUS: ALL VERIFICATIONS PASSED")
 		} else {
-			logger.Info("STATUS: %d FAILURES DETECTED (check error log)", totalFailures)
+			logger.Info("STATUS: %s FAILURES DETECTED (check error log)", helpers.FormatNumber(int64(totalFailures)))
 		}
 	}
 
@@ -236,12 +236,12 @@ func (v *Verifier) runSingleIndex() (*Stats, error) {
 			}
 
 			results[idx] = stats
-			v.logger.Info("  CF [%s] verified: %s keys in %v (%.0f keys/sec), failures: %d",
+			v.logger.Info("  CF [%s] verified: %s keys in %s (%.0f keys/sec), failures: %s",
 				name,
 				helpers.FormatNumber(int64(stats.KeysVerified)),
-				stats.VerifyTime,
+				helpers.FormatDuration(stats.VerifyTime),
 				stats.KeysPerSecond,
-				stats.Failures)
+				helpers.FormatNumber(int64(stats.Failures)))
 		}(i, cfName)
 	}
 	wg.Wait()
@@ -334,12 +334,12 @@ func (v *Verifier) runMultiIndex() (*Stats, error) {
 			}
 
 			results[idx] = stats
-			v.logger.Info("  CF [%s] verified: %s keys in %v (%.0f keys/sec), failures: %d",
+			v.logger.Info("  CF [%s] verified: %s keys in %s (%.0f keys/sec), failures: %s",
 				name,
 				helpers.FormatNumber(int64(stats.KeysVerified)),
-				stats.VerifyTime,
+				helpers.FormatDuration(stats.VerifyTime),
 				stats.KeysPerSecond,
-				stats.Failures)
+				helpers.FormatNumber(int64(stats.Failures)))
 		}(i, cfName)
 	}
 	wg.Wait()

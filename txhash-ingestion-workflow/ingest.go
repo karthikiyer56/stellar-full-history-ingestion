@@ -228,7 +228,7 @@ func (i *Ingester) Run() error {
 	if err := i.store.FlushAll(); err != nil {
 		return fmt.Errorf("failed to flush MemTables: %w", err)
 	}
-	i.logger.Info("Flush completed in %v", time.Since(flushStart))
+	i.logger.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
 
 	// Log summary
 	i.aggStats.LogSummary(i.logger)

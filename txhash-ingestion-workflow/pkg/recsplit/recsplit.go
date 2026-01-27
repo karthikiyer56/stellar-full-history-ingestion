@@ -130,10 +130,10 @@ func (rs *Stats) LogSummary(logger interfaces.Logger) {
 		for _, cfName := range cf.Names {
 			stats := rs.PerCFStats[cfName]
 			if stats != nil {
-				logger.Info("%-4s %15s %12v %12s",
+				logger.Info("%-4s %15s %12s %12s",
 					cfName,
 					helpers.FormatNumber(int64(stats.KeyCount)),
-					stats.BuildTime,
+					helpers.FormatDuration(stats.BuildTime),
 					helpers.FormatBytes(stats.IndexSize))
 				totalKeys += stats.KeyCount
 				totalSize += stats.IndexSize
@@ -141,7 +141,7 @@ func (rs *Stats) LogSummary(logger interfaces.Logger) {
 		}
 
 		logger.Info("%-4s %15s %12s %12s", "----", "---------------", "------------", "------------")
-		logger.Info("%-4s %15s %12v %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), rs.TotalTime, helpers.FormatBytes(totalSize))
+		logger.Info("%-4s %15s %12s %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), helpers.FormatDuration(rs.TotalTime), helpers.FormatBytes(totalSize))
 	} else {
 		// Combined mode: show per-CF key-add time, then overall build time
 		logger.Info("KEY ADDITION BY CF:")
@@ -153,23 +153,23 @@ func (rs *Stats) LogSummary(logger interfaces.Logger) {
 		for _, cfName := range cf.Names {
 			stats := rs.PerCFStats[cfName]
 			if stats != nil {
-				logger.Info("%-4s %15s %12v",
+				logger.Info("%-4s %15s %12s",
 					cfName,
 					helpers.FormatNumber(int64(stats.KeyCount)),
-					stats.KeyAddTime)
+					helpers.FormatDuration(stats.KeyAddTime))
 				totalKeys += stats.KeyCount
 			}
 		}
 
 		logger.Info("%-4s %15s %12s", "----", "---------------", "------------")
-		logger.Info("%-4s %15s %12v", "TOT", helpers.FormatNumber(int64(totalKeys)), rs.KeyAddTime)
+		logger.Info("%-4s %15s %12s", "TOT", helpers.FormatNumber(int64(totalKeys)), helpers.FormatDuration(rs.KeyAddTime))
 		logger.Info("")
 		logger.Info("INDEX BUILD:")
-		logger.Info("  Build Time:    %v", rs.IndexBuildTime)
+		logger.Info("  Build Time:    %s", helpers.FormatDuration(rs.IndexBuildTime))
 		logger.Info("  Index Size:    %s", helpers.FormatBytes(rs.IndexSize))
 		logger.Info("  Index Path:    %s", rs.IndexPath)
 		logger.Info("")
-		logger.Info("TOTAL TIME:      %v", rs.TotalTime)
+		logger.Info("TOTAL TIME:      %s", helpers.FormatDuration(rs.TotalTime))
 	}
 
 	logger.Info("")
@@ -399,8 +399,8 @@ func (b *Builder) buildCombinedIndex() error {
 			KeyAddTime: cfAddTime,
 		}
 
-		b.logger.Info("[%2d/16] CF [%s]: Added %s keys in %v",
-			i+1, cfName, helpers.FormatNumber(int64(keysAdded)), cfAddTime)
+		b.logger.Info("[%2d/16] CF [%s]: Added %s keys in %s",
+			i+1, cfName, helpers.FormatNumber(int64(keysAdded)), helpers.FormatDuration(cfAddTime))
 
 		// Check memory after each CF
 		b.memory.Check()
@@ -409,8 +409,8 @@ func (b *Builder) buildCombinedIndex() error {
 	b.stats.KeyAddTime = time.Since(keyAddStart)
 
 	b.logger.Info("")
-	b.logger.Info("Key addition complete: %s keys in %v",
-		helpers.FormatNumber(int64(totalKeysAdded)), b.stats.KeyAddTime)
+	b.logger.Info("Key addition complete: %s keys in %s",
+		helpers.FormatNumber(int64(totalKeysAdded)), helpers.FormatDuration(b.stats.KeyAddTime))
 	b.logger.Info("")
 
 	// Verify total key count
@@ -437,8 +437,8 @@ func (b *Builder) buildCombinedIndex() error {
 		b.stats.IndexSize = info.Size()
 	}
 
-	b.logger.Info("Index built in %v, size: %s",
-		b.stats.IndexBuildTime, helpers.FormatBytes(b.stats.IndexSize))
+	b.logger.Info("Index built in %s, size: %s",
+		helpers.FormatDuration(b.stats.IndexBuildTime), helpers.FormatBytes(b.stats.IndexSize))
 	b.logger.Info("")
 
 	// Clean up temp directory
@@ -482,8 +482,8 @@ func (b *Builder) buildMultiIndex() error {
 
 			mu.Lock()
 			b.stats.PerCFStats[cfn] = stats
-			b.logger.Info("CF [%s] completed: %s keys in %v",
-				cfn, helpers.FormatNumber(int64(stats.KeyCount)), stats.BuildTime)
+			b.logger.Info("CF [%s] completed: %s keys in %s",
+				cfn, helpers.FormatNumber(int64(stats.KeyCount)), helpers.FormatDuration(stats.BuildTime))
 			mu.Unlock()
 		}(i, cfName)
 	}

@@ -53,14 +53,14 @@ func CompactAllCFs(store Compactable, logger interfaces.Logger) time.Duration {
 			defer wg.Done()
 			cfStart := time.Now()
 			store.CompactCF(name)
-			logger.Info("  CF [%s] compacted in %v", name, time.Since(cfStart))
+			logger.Info("  CF [%s] compacted in %s", name, helpers.FormatDuration(time.Since(cfStart)))
 		}(cfName)
 	}
 	wg.Wait()
 
 	totalTime := time.Since(totalStart)
 	logger.Info("")
-	logger.Info("All column families compacted in %v (parallel)", totalTime)
+	logger.Info("All column families compacted in %s (parallel)", helpers.FormatDuration(totalTime))
 
 	return totalTime
 }
@@ -108,10 +108,10 @@ func (cs *CompactionStats) LogSummary(logger interfaces.Logger) {
 	logger.Info("COMPACTION TIME BY COLUMN FAMILY:")
 	for _, cfName := range cf.Names {
 		elapsed := cs.PerCFTime[cfName]
-		logger.Info("  CF %s: %v", cfName, elapsed)
+		logger.Info("  CF %s: %s", cfName, helpers.FormatDuration(elapsed))
 	}
 	logger.Info("")
-	logger.Info("Total Compaction Time: %v", cs.TotalTime)
+	logger.Info("Total Compaction Time: %s", helpers.FormatDuration(cs.TotalTime))
 	logger.Info("")
 }
 
@@ -257,7 +257,7 @@ func (c *Compactor) Run() (*CompactionStats, error) {
 			c.stats.PerCFTime[name] = cfElapsed
 			statsMu.Unlock()
 
-			c.logger.Info("  CF [%s] compacted in %v", name, cfElapsed)
+			c.logger.Info("  CF [%s] compacted in %s", name, helpers.FormatDuration(cfElapsed))
 		}(cfName)
 	}
 	wg.Wait()
@@ -269,7 +269,7 @@ func (c *Compactor) Run() (*CompactionStats, error) {
 	c.stats.EndTime = time.Now()
 
 	c.logger.Info("")
-	c.logger.Info("All column families compacted in %v (parallel)", c.stats.TotalTime)
+	c.logger.Info("All column families compacted in %s (parallel)", helpers.FormatDuration(c.stats.TotalTime))
 	c.logger.Info("")
 
 	// Collect after stats
@@ -419,12 +419,12 @@ func VerifyCountsAfterCompaction(
 				matchStr = "MISMATCH"
 			}
 
-			logger.Info("  CF [%s] verified: expected=%s, actual=%s, %s, %v",
+			logger.Info("  CF [%s] verified: expected=%s, actual=%s, %s, %s",
 				name,
 				helpers.FormatNumber(int64(expectedCount)),
 				helpers.FormatNumber(int64(actualCount)),
 				matchStr,
-				cfDuration)
+				helpers.FormatDuration(cfDuration))
 		}(i, cfName)
 	}
 	wg.Wait()
@@ -457,12 +457,12 @@ func VerifyCountsAfterCompaction(
 		if !r.Match {
 			matchStr = "MISMATCH"
 		}
-		logger.Info("%-4s %15s %15s %8s %12v",
+		logger.Info("%-4s %15s %15s %8s %12s",
 			r.CFName,
 			helpers.FormatNumber(int64(r.ExpectedCount)),
 			helpers.FormatNumber(int64(r.ActualCount)),
 			matchStr,
-			r.Duration)
+			helpers.FormatDuration(r.Duration))
 	}
 
 	logger.Info("%-4s %15s %15s %8s %12s", "----", "---------------", "---------------", "--------", "------------")
@@ -473,17 +473,17 @@ func VerifyCountsAfterCompaction(
 		totalMatchStr = "MISMATCH"
 	}
 
-	logger.Info("%-4s %15s %15s %8s %12v",
+	logger.Info("%-4s %15s %15s %8s %12s",
 		"TOT",
 		helpers.FormatNumber(int64(totalExpected)),
 		helpers.FormatNumber(int64(totalActual)),
 		totalMatchStr,
-		stats.TotalTime)
+		helpers.FormatDuration(stats.TotalTime))
 	logger.Info("")
 
 	// Log summary
 	if stats.AllMatched {
-		logger.Info("Count verification PASSED: All %d CFs match expected counts (parallel, %v)", len(cf.Names), stats.TotalTime)
+		logger.Info("Count verification PASSED: All %d CFs match expected counts (parallel, %s)", len(cf.Names), helpers.FormatDuration(stats.TotalTime))
 	} else {
 		logger.Error("Count verification FAILED: %d CF(s) have mismatched counts", stats.Mismatches)
 		logger.Error("")

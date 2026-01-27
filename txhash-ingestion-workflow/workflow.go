@@ -354,7 +354,7 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 	}
 
 	w.logger.Info("")
-	w.logger.Info("Ingestion phase completed in %v", w.stats.IngestionTime)
+	w.logger.Info("Ingestion phase completed in %s", helpers.FormatDuration(w.stats.IngestionTime))
 	w.logger.Info("Total keys ingested: %s", helpers.FormatNumber(int64(totalKeys)))
 	w.logger.Info("")
 	w.logger.Sync()
@@ -405,8 +405,8 @@ func (w *Workflow) runCompaction() error {
 
 	w.logger.Info("")
 	w.logger.Info("Compaction phase completed:")
-	w.logger.Info("  RocksDB compaction: %v", w.stats.CompactionTime)
-	w.logger.Info("  Count verification: %v", w.stats.CountVerifyTime)
+	w.logger.Info("  RocksDB compaction: %s", helpers.FormatDuration(w.stats.CompactionTime))
+	w.logger.Info("  Count verification: %s", helpers.FormatDuration(w.stats.CountVerifyTime))
 	w.logger.Info("")
 	w.logger.Sync()
 
@@ -456,7 +456,7 @@ func (w *Workflow) runRecSplitBuild() error {
 	}
 
 	w.logger.Info("")
-	w.logger.Info("RecSplit build completed in %v", stats.TotalTime)
+	w.logger.Info("RecSplit build completed in %s", helpers.FormatDuration(stats.TotalTime))
 	w.logger.Info("Total keys indexed: %s", helpers.FormatNumber(int64(stats.TotalKeys)))
 	w.logger.Info("")
 	w.logger.Sync()
@@ -511,7 +511,7 @@ func (w *Workflow) runVerification() error {
 	}
 
 	w.logger.Info("")
-	w.logger.Info("Verification completed in %v", stats.TotalTime)
+	w.logger.Info("Verification completed in %s", helpers.FormatDuration(stats.TotalTime))
 	w.logger.Info("Keys verified: %s", helpers.FormatNumber(int64(stats.TotalKeysVerified)))
 	if stats.TotalFailures > 0 {
 		w.logger.Error("Verification failures: %d", stats.TotalFailures)
@@ -538,7 +538,7 @@ func (w *Workflow) logFinalSummary() {
 	w.logger.Info("OVERALL STATISTICS:")
 	w.logger.Info("  Start Time:        %s", w.stats.StartTime.Format("2006-01-02 15:04:05"))
 	w.logger.Info("  End Time:          %s", w.stats.EndTime.Format("2006-01-02 15:04:05"))
-	w.logger.Info("  Total Duration:    %v", w.stats.TotalTime)
+	w.logger.Info("  Total Duration:    %s", helpers.FormatDuration(w.stats.TotalTime))
 	w.logger.Info("")
 
 	if w.stats.IsResume {
@@ -547,11 +547,11 @@ func (w *Workflow) logFinalSummary() {
 
 	w.logger.Info("")
 	w.logger.Info("PHASE DURATIONS:")
-	w.logger.Info("  Ingestion:         %v", w.stats.IngestionTime)
-	w.logger.Info("  Compaction:        %v", w.stats.CompactionTime)
-	w.logger.Info("  Count Verify:      %v", w.stats.CountVerifyTime)
-	w.logger.Info("  RecSplit Build:    %v", w.stats.RecSplitTime)
-	w.logger.Info("  Verification:      %v", w.stats.VerificationTime)
+	w.logger.Info("  Ingestion:         %s", helpers.FormatDuration(w.stats.IngestionTime))
+	w.logger.Info("  Compaction:        %s", helpers.FormatDuration(w.stats.CompactionTime))
+	w.logger.Info("  Count Verify:      %s", helpers.FormatDuration(w.stats.CountVerifyTime))
+	w.logger.Info("  RecSplit Build:    %s", helpers.FormatDuration(w.stats.RecSplitTime))
+	w.logger.Info("  Verification:      %s", helpers.FormatDuration(w.stats.VerificationTime))
 	w.logger.Info("")
 
 	w.logger.Info("DATA STATISTICS:")

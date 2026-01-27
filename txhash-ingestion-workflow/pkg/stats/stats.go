@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
 )
@@ -235,9 +236,11 @@ func (bs *BatchStats) TxPerSecond() float64 {
 
 // LogSummary logs a summary of the batch to the logger.
 func (bs *BatchStats) LogSummary(logger interfaces.Logger) {
-	logger.Info("Batch %d: ledgers %d-%d | %d txs | parse=%v write=%v | %.1f ledgers/sec | %.1f tx/sec",
+	logger.Info("Batch %d: ledgers %d-%d | %s txs | parse=%s write=%s | %.1f ledgers/sec | %.1f tx/sec",
 		bs.BatchNumber, bs.StartLedger, bs.EndLedger,
-		bs.TxCount, bs.ParseTime, bs.WriteTime,
+		helpers.FormatNumber(int64(bs.TxCount)),
+		helpers.FormatDuration(bs.ParseTime),
+		helpers.FormatDuration(bs.WriteTime),
 		bs.LedgersPerSecond(), bs.TxPerSecond())
 }
 
@@ -368,14 +371,14 @@ func (as *AggregatedStats) LogSummary(logger interfaces.Logger) {
 	logger.Separator()
 	logger.Info("")
 	logger.Info("TOTALS:")
-	logger.Info("  Batches:          %d", as.TotalBatches)
-	logger.Info("  Ledgers:          %d", as.TotalLedgers)
-	logger.Info("  Transactions:     %d", as.TotalTx)
+	logger.Info("  Batches:          %s", helpers.FormatNumber(int64(as.TotalBatches)))
+	logger.Info("  Ledgers:          %s", helpers.FormatNumber(int64(as.TotalLedgers)))
+	logger.Info("  Transactions:     %s", helpers.FormatNumber(int64(as.TotalTx)))
 	logger.Info("")
 	logger.Info("TIME:")
-	logger.Info("  Parse Time:       %v", as.TotalParseTime)
-	logger.Info("  Write Time:       %v", as.TotalWriteTime)
-	logger.Info("  Total Time:       %v", elapsed)
+	logger.Info("  Parse Time:       %s", helpers.FormatDuration(as.TotalParseTime))
+	logger.Info("  Write Time:       %s", helpers.FormatDuration(as.TotalWriteTime))
+	logger.Info("  Total Time:       %s", helpers.FormatDuration(elapsed))
 	logger.Info("")
 	logger.Info("THROUGHPUT:")
 	logger.Info("  Ledgers/sec:      %.1f", float64(as.TotalLedgers)/elapsed.Seconds())
@@ -507,11 +510,11 @@ func (qs *QueryStats) LogSummary(logger interfaces.Logger) {
 
 	logger.Info("")
 	logger.Info("QUERY SUMMARY:")
-	logger.Info("  Total Queries:     %d", total)
-	logger.Info("  Found:             %d (%.2f%%)", qs.FoundCount, float64(qs.FoundCount)/float64(total)*100)
-	logger.Info("  Not Found:         %d (%.2f%%)", qs.NotFoundCount, float64(qs.NotFoundCount)/float64(total)*100)
-	logger.Info("  Parse Errors:      %d", qs.ParseErrorCount)
-	logger.Info("  Duration:          %v", qs.EndTime.Sub(qs.StartTime))
+	logger.Info("  Total Queries:     %s", helpers.FormatNumber(int64(total)))
+	logger.Info("  Found:             %s (%.2f%%)", helpers.FormatNumber(int64(qs.FoundCount)), float64(qs.FoundCount)/float64(total)*100)
+	logger.Info("  Not Found:         %s (%.2f%%)", helpers.FormatNumber(int64(qs.NotFoundCount)), float64(qs.NotFoundCount)/float64(total)*100)
+	logger.Info("  Parse Errors:      %s", helpers.FormatNumber(int64(qs.ParseErrorCount)))
+	logger.Info("  Duration:          %s", helpers.FormatDuration(qs.EndTime.Sub(qs.StartTime)))
 	logger.Info("")
 
 	if qs.FoundCount > 0 {
@@ -623,6 +626,8 @@ func (pt *ProgressTracker) LogProgress(logger interfaces.Logger, label string) {
 		}
 	}
 
-	logger.Info("%s: %d/%d (%.1f%%) | elapsed=%v | ETA=%v",
-		label, pt.Completed, pt.Total, pct, elapsed.Truncate(time.Second), eta.Truncate(time.Second))
+	logger.Info("%s: %d/%d (%.1f%%) | elapsed=%s | ETA=%s",
+		label, pt.Completed, pt.Total, pct,
+		helpers.FormatDuration(elapsed.Truncate(time.Second)),
+		helpers.FormatDuration(eta.Truncate(time.Second)))
 }

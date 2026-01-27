@@ -529,12 +529,12 @@ func main() {
 		cfCounts[cfName] = r.count
 		totalKeys += r.count
 		mu.Unlock()
-		logger.Info("[%2d/16] CF [%s]: %s keys (counted in %v)",
-			i+1, cfName, helpers.FormatNumber(int64(r.count)), r.duration)
+		logger.Info("[%2d/16] CF [%s]: %s keys (counted in %s)",
+			i+1, cfName, helpers.FormatNumber(int64(r.count)), helpers.FormatDuration(r.duration))
 	}
 
 	logger.Info("")
-	logger.Info("Total keys: %s (discovered in %v)", helpers.FormatNumber(int64(totalKeys)), time.Since(countStart))
+	logger.Info("Total keys: %s (discovered in %s)", helpers.FormatNumber(int64(totalKeys)), helpers.FormatDuration(time.Since(countStart)))
 	logger.Info("Current RSS: %.2f GB", memMonitor.CurrentRSSGB())
 	logger.Info("")
 
@@ -592,7 +592,7 @@ func main() {
 	// Clean up temp directory
 	os.RemoveAll(tmpPath)
 
-	fmt.Printf("Build complete: %s keys in %v\n", helpers.FormatNumber(int64(buildStats.TotalKeys)), buildStats.TotalTime)
+	fmt.Printf("Build complete: %s keys in %s\n", helpers.FormatNumber(int64(buildStats.TotalKeys)), helpers.FormatDuration(buildStats.TotalTime))
 	fmt.Printf("Index files: %s\n", indexPath)
 
 	// Calculate total size

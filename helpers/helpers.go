@@ -39,29 +39,115 @@ func FormatBytesWithPrecision(bytes int64, precision int) string {
 	return fmt.Sprintf(format, float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// FormatDuration formats duration into human-readable format
+// FormatDuration formats duration into human-readable format.
+//
+// Formatting rules:
+//   - Nanoseconds: whole number, no decimals (e.g., "123ns")
+//   - Microseconds: whole number, no decimals (e.g., "456µs")
+//   - Milliseconds: up to 3 decimal places (e.g., "123.456ms")
+//   - Seconds: up to 2 decimal places (e.g., "45.67s")
+//   - Minutes+: compound format (e.g., "3m 45.67s", "2h 30m 15s")
+//   - Days+: compound format (e.g., "5d 12h 30m", "2y 3mo 15d")
 func FormatDuration(d time.Duration) string {
+	// Handle negative durations
+	if d < 0 {
+		return "-" + FormatDuration(-d)
+	}
+
+	// Handle zero
+	if d == 0 {
+		return "0s"
+	}
+
+	// Nanoseconds (< 1µs): whole number
 	if d < time.Microsecond {
 		return fmt.Sprintf("%dns", d.Nanoseconds())
 	}
+
+	// Microseconds (< 1ms): whole number
 	if d < time.Millisecond {
-		return fmt.Sprintf("%.3fµs", float64(d.Nanoseconds())/1000)
+		return fmt.Sprintf("%dµs", d.Microseconds())
 	}
+
+	// Milliseconds (< 1s): up to 3 decimal places
 	if d < time.Second {
-		return fmt.Sprintf("%.3fms", float64(d.Microseconds())/1000)
+		ms := float64(d.Nanoseconds()) / float64(time.Millisecond)
+		return formatFloat(ms, 3) + "ms"
 	}
+
+	// Seconds (< 1m): up to 2 decimal places
 	if d < time.Minute {
-		return fmt.Sprintf("%.3fs", d.Seconds())
+		secs := float64(d.Nanoseconds()) / float64(time.Second)
+		return formatFloat(secs, 2) + "s"
 	}
+
+	// Minutes (< 1h): Xm + seconds with 2 decimal places
 	if d < time.Hour {
 		mins := int(d.Minutes())
-		secs := int(d.Seconds()) % 60
-		return fmt.Sprintf("%dm%ds", mins, secs)
+		remainingSecs := float64(d-time.Duration(mins)*time.Minute) / float64(time.Second)
+		if remainingSecs < 0.01 {
+			return fmt.Sprintf("%dm", mins)
+		}
+		return fmt.Sprintf("%dm %ss", mins, formatFloat(remainingSecs, 2))
 	}
-	hours := int(d.Hours())
-	mins := int(d.Minutes()) % 60
-	secs := int(d.Seconds()) % 60
-	return fmt.Sprintf("%dh%dm%ds", hours, mins, secs)
+
+	// Hours (< 1 day): Xh Ym Zs (whole seconds)
+	const day = 24 * time.Hour
+	if d < day {
+		hours := int(d.Hours())
+		mins := int(d.Minutes()) % 60
+		secs := int(d.Seconds()) % 60
+		if secs == 0 && mins == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		if secs == 0 {
+			return fmt.Sprintf("%dh %dm", hours, mins)
+		}
+		return fmt.Sprintf("%dh %dm %ds", hours, mins, secs)
+	}
+
+	// Days (< 1 year): Xd Yh Zm (no seconds)
+	const year = 365 * day
+	const month = 30 * day // approximate
+	if d < year {
+		days := int(d / day)
+		remaining := d % day
+		hours := int(remaining.Hours())
+		mins := int(remaining.Minutes()) % 60
+		if hours == 0 && mins == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		if mins == 0 {
+			return fmt.Sprintf("%dd %dh", days, hours)
+		}
+		return fmt.Sprintf("%dd %dh %dm", days, hours, mins)
+	}
+
+	// Years: Xy Xmo Xd (approximate months as 30 days)
+	years := int(d / year)
+	remaining := d % year
+	months := int(remaining / month)
+	days := int((remaining % month) / day)
+	if months == 0 && days == 0 {
+		return fmt.Sprintf("%dy", years)
+	}
+	if days == 0 {
+		return fmt.Sprintf("%dy %dmo", years, months)
+	}
+	return fmt.Sprintf("%dy %dmo %dd", years, months, days)
+}
+
+// formatFloat formats a float with up to maxDecimals, trimming trailing zeros.
+func formatFloat(value float64, maxDecimals int) string {
+	format := fmt.Sprintf("%%.%df", maxDecimals)
+	s := fmt.Sprintf(format, value)
+
+	// Trim trailing zeros after decimal point
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+	}
+	return s
 }
 
 // FormatNumber formats a number with commas for readability

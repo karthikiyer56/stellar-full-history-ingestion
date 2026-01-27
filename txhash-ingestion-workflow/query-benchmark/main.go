@@ -357,7 +357,7 @@ func main() {
 	logger.Info("  Not Found:         %s (%.2f%%)", helpers.FormatNumber(int64(notFoundCount)),
 		float64(notFoundCount)/float64(totalQueries)*100)
 	logger.Info("  Parse Errors:      %d", parseErrors)
-	logger.Info("  Total Time:        %v", totalTime)
+	logger.Info("  Total Time:        %s", helpers.FormatDuration(totalTime))
 	logger.Info("  Queries/sec:       %.2f", float64(totalQueries)/totalTime.Seconds())
 	logger.Info("")
 
@@ -379,7 +379,7 @@ func main() {
 	logger.Separator()
 	logger.Sync()
 
-	fmt.Printf("Benchmark complete: %d queries in %v (%.2f qps)\n",
-		totalQueries, totalTime, float64(totalQueries)/totalTime.Seconds())
+	fmt.Printf("Benchmark complete: %s queries in %s (%.2f qps)\n",
+		helpers.FormatNumber(int64(totalQueries)), helpers.FormatDuration(totalTime), float64(totalQueries)/totalTime.Seconds())
 	fmt.Printf("Results: %s, Log: %s\n", *outputPath, *logPath)
 }

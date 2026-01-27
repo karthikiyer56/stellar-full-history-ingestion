@@ -340,14 +340,14 @@ func (s *RocksDBTxHashStore) CompactAll() time.Duration {
 
 			start := time.Now()
 			s.db.CompactRangeCFOpt(cfHandles[idx], grocksdb.Range{Start: nil, Limit: nil}, opts)
-			s.logger.Info("  CF [%s] compacted in %v", name, time.Since(start))
+			s.logger.Info("  CF [%s] compacted in %s", name, helpers.FormatDuration(time.Since(start)))
 		}(i, cfName)
 	}
 	wg.Wait()
 
 	totalTime := time.Since(totalStart)
 	s.logger.Info("")
-	s.logger.Info("All column families compacted in %v (parallel)", totalTime)
+	s.logger.Info("All column families compacted in %s (parallel)", helpers.FormatDuration(totalTime))
 
 	return totalTime
 }

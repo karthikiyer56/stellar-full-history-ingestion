@@ -313,7 +313,7 @@ func (pi *ParallelIngester) Run() error {
 	if err := pi.store.FlushAll(); err != nil {
 		return fmt.Errorf("failed to flush MemTables: %w", err)
 	}
-	pi.logger.Info("Flush completed in %v", time.Since(flushStart))
+	pi.logger.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
 
 	// Log final summary
 	pi.aggStats.LogSummary(pi.logger)
@@ -590,33 +590,33 @@ func (pi *ParallelIngester) logBatchSummary(batchNum int, startLedger, endLedger
 	// This gives a sense of "if we had 1 worker, how long would each phase take"
 	effectiveWorkers := float64(pi.config.ParallelWorkers)
 
-	pi.logger.Info("Batch %d: ledgers %d-%d | %d txs | wall=%v | %.0f ledgers/sec | %.0f tx/sec",
-		batchNum, startLedger, endLedger, timing.TxCount,
-		timing.WallClockDuration().Truncate(time.Millisecond),
+	pi.logger.Info("Batch %d: ledgers %d-%d | %s txs | wall=%s | %.0f ledgers/sec | %.0f tx/sec",
+		batchNum, startLedger, endLedger, helpers.FormatNumber(int64(timing.TxCount)),
+		helpers.FormatDuration(timing.WallClockDuration().Truncate(time.Millisecond)),
 		timing.LedgersPerSecond(), timing.TxPerSecond())
 
 	// Only log detailed timing breakdown occasionally (every ProgressLogInterval batches)
 	if batchNum%ProgressLogInterval == 0 {
 		pi.logger.Info("  Timing breakdown (cumulative across %d workers, effective=cumulative/%d):",
 			pi.config.ParallelWorkers, pi.config.ParallelWorkers)
-		pi.logger.Info("    Decompress: %v (eff: %v/ledger)",
-			timing.TotalDecompressTime,
-			time.Duration(float64(timing.TotalDecompressTime)/float64(timing.LedgerCount)))
-		pi.logger.Info("    Unmarshal:  %v (eff: %v/ledger)",
-			timing.TotalUnmarshalTime,
-			time.Duration(float64(timing.TotalUnmarshalTime)/float64(timing.LedgerCount)))
-		pi.logger.Info("    Extract:    %v (eff: %v/ledger)",
-			timing.TotalExtractTime,
-			time.Duration(float64(timing.TotalExtractTime)/float64(timing.LedgerCount)))
-		pi.logger.Info("    Write:      %v (eff: %v/ledger)",
-			timing.TotalWriteTime,
-			time.Duration(float64(timing.TotalWriteTime)/float64(timing.LedgerCount)))
-		pi.logger.Info("    Checkpoint: %v", timing.TotalCheckpointTime)
-		pi.logger.Info("  Parallelism efficiency: %.1f%% (wall=%v vs serial_work=%v)",
+		pi.logger.Info("    Decompress: %s (eff: %s/ledger)",
+			helpers.FormatDuration(timing.TotalDecompressTime),
+			helpers.FormatDuration(time.Duration(float64(timing.TotalDecompressTime)/float64(timing.LedgerCount))))
+		pi.logger.Info("    Unmarshal:  %s (eff: %s/ledger)",
+			helpers.FormatDuration(timing.TotalUnmarshalTime),
+			helpers.FormatDuration(time.Duration(float64(timing.TotalUnmarshalTime)/float64(timing.LedgerCount))))
+		pi.logger.Info("    Extract:    %s (eff: %s/ledger)",
+			helpers.FormatDuration(timing.TotalExtractTime),
+			helpers.FormatDuration(time.Duration(float64(timing.TotalExtractTime)/float64(timing.LedgerCount))))
+		pi.logger.Info("    Write:      %s (eff: %s/ledger)",
+			helpers.FormatDuration(timing.TotalWriteTime),
+			helpers.FormatDuration(time.Duration(float64(timing.TotalWriteTime)/float64(timing.LedgerCount))))
+		pi.logger.Info("    Checkpoint: %s", helpers.FormatDuration(timing.TotalCheckpointTime))
+		pi.logger.Info("  Parallelism efficiency: %.1f%% (wall=%s vs serial_work=%s)",
 			100.0*float64(timing.TotalDecompressTime+timing.TotalUnmarshalTime+timing.TotalExtractTime)/
 				(effectiveWorkers*float64(timing.WallClockDuration()-timing.TotalWriteTime-timing.TotalCheckpointTime)),
-			timing.WallClockDuration()-timing.TotalWriteTime-timing.TotalCheckpointTime,
-			timing.TotalDecompressTime+timing.TotalUnmarshalTime+timing.TotalExtractTime)
+			helpers.FormatDuration(timing.WallClockDuration()-timing.TotalWriteTime-timing.TotalCheckpointTime),
+			helpers.FormatDuration(timing.TotalDecompressTime+timing.TotalUnmarshalTime+timing.TotalExtractTime))
 	}
 }
 
@@ -637,16 +637,17 @@ func (pi *ParallelIngester) logProgress(batchNum, totalBatches int, currentLedge
 
 	pi.logger.Info("")
 	pi.logger.Separator()
-	pi.logger.Info("PROGRESS: %d/%d batches (%.1f%%) | elapsed=%v | ETA=%v",
+	pi.logger.Info("PROGRESS: %d/%d batches (%.1f%%) | elapsed=%s | ETA=%s",
 		batchNum, totalBatches, pct,
-		elapsed.Truncate(time.Second), eta.Truncate(time.Second))
+		helpers.FormatDuration(elapsed.Truncate(time.Second)),
+		helpers.FormatDuration(eta.Truncate(time.Second)))
 	pi.logger.Info("  Ledgers: %s | Transactions: %s",
 		helpers.FormatNumber(int64(stats.TotalLedgers)),
 		helpers.FormatNumber(int64(stats.TotalTx)))
 	pi.logger.Info("  Throughput: %.0f ledgers/sec | %.0f tx/sec",
 		stats.OverallLedgersPerSecond(), stats.OverallTxPerSecond())
-	pi.logger.Info("  Avg latency: %v/ledger (wall-clock)",
-		stats.AvgWallClockPerLedger())
+	pi.logger.Info("  Avg latency: %s/ledger (wall-clock)",
+		helpers.FormatDuration(stats.AvgWallClockPerLedger()))
 	pi.logger.Separator()
 	pi.logger.Info("")
 }
@@ -797,8 +798,8 @@ func (pas *ParallelAggregatedStats) LogSummary(logger interfaces.Logger) {
 	logger.Info("  Transactions:      %s", helpers.FormatNumber(int64(pas.TotalTx)))
 	logger.Info("")
 	logger.Info("WALL-CLOCK TIMING:")
-	logger.Info("  Total Elapsed:     %v", elapsed.Truncate(time.Second))
-	logger.Info("  Avg per Ledger:    %v", pas.TotalWallClock/time.Duration(pas.TotalLedgers))
+	logger.Info("  Total Elapsed:     %s", helpers.FormatDuration(elapsed.Truncate(time.Second)))
+	logger.Info("  Avg per Ledger:    %s", helpers.FormatDuration(pas.TotalWallClock/time.Duration(pas.TotalLedgers)))
 	logger.Info("")
 	logger.Info("THROUGHPUT (based on wall-clock):")
 	logger.Info("  Ledgers/sec:       %.0f", float64(pas.TotalLedgers)/elapsed.Seconds())
@@ -808,21 +809,21 @@ func (pas *ParallelAggregatedStats) LogSummary(logger interfaces.Logger) {
 	// Calculate effective times (cumulative / parallelism)
 	// This shows how much work was done per component
 	logger.Info("CUMULATIVE WORKER TIME (sum across all %d workers):", pas.ParallelWorkers)
-	logger.Info("  Decompress:        %v", pas.TotalDecompressTime)
-	logger.Info("  Unmarshal:         %v", pas.TotalUnmarshalTime)
-	logger.Info("  Extract:           %v", pas.TotalExtractTime)
-	logger.Info("  Write (serial):    %v", pas.TotalWriteTime)
-	logger.Info("  Checkpoint:        %v", pas.TotalCheckpointTime)
+	logger.Info("  Decompress:        %s", helpers.FormatDuration(pas.TotalDecompressTime))
+	logger.Info("  Unmarshal:         %s", helpers.FormatDuration(pas.TotalUnmarshalTime))
+	logger.Info("  Extract:           %s", helpers.FormatDuration(pas.TotalExtractTime))
+	logger.Info("  Write (serial):    %s", helpers.FormatDuration(pas.TotalWriteTime))
+	logger.Info("  Checkpoint:        %s", helpers.FormatDuration(pas.TotalCheckpointTime))
 	logger.Info("")
 
 	// Effective per-ledger times (cumulative / ledger count)
 	// This shows average time spent per ledger across all workers
 	if pas.TotalLedgers > 0 {
 		logger.Info("EFFECTIVE TIME PER LEDGER (cumulative / ledger count):")
-		logger.Info("  Decompress:        %v", pas.TotalDecompressTime/time.Duration(pas.TotalLedgers))
-		logger.Info("  Unmarshal:         %v", pas.TotalUnmarshalTime/time.Duration(pas.TotalLedgers))
-		logger.Info("  Extract:           %v", pas.TotalExtractTime/time.Duration(pas.TotalLedgers))
-		logger.Info("  Write:             %v", pas.TotalWriteTime/time.Duration(pas.TotalLedgers))
+		logger.Info("  Decompress:        %s", helpers.FormatDuration(pas.TotalDecompressTime/time.Duration(pas.TotalLedgers)))
+		logger.Info("  Unmarshal:         %s", helpers.FormatDuration(pas.TotalUnmarshalTime/time.Duration(pas.TotalLedgers)))
+		logger.Info("  Extract:           %s", helpers.FormatDuration(pas.TotalExtractTime/time.Duration(pas.TotalLedgers)))
+		logger.Info("  Write:             %s", helpers.FormatDuration(pas.TotalWriteTime/time.Duration(pas.TotalLedgers)))
 		logger.Info("")
 	}
 
@@ -832,8 +833,8 @@ func (pas *ParallelAggregatedStats) LogSummary(logger interfaces.Logger) {
 	if parallelizableElapsed > 0 {
 		efficiency := float64(totalWork) / (float64(pas.ParallelWorkers) * float64(parallelizableElapsed)) * 100
 		logger.Info("PARALLELISM:")
-		logger.Info("  Theoretical serial time: %v", totalWork)
-		logger.Info("  Actual parallel time:    %v", parallelizableElapsed)
+		logger.Info("  Theoretical serial time: %s", helpers.FormatDuration(totalWork))
+		logger.Info("  Actual parallel time:    %s", helpers.FormatDuration(parallelizableElapsed))
 		logger.Info("  Speedup:                 %.1fx", float64(totalWork)/float64(parallelizableElapsed))
 		logger.Info("  Efficiency:              %.1f%%", efficiency)
 		logger.Info("")
