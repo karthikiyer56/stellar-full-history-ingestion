@@ -41,11 +41,16 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"io"
 	"time"
 
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers/lfs"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/memory"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/stats"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -82,17 +87,17 @@ type IngestionConfig struct {
 //	err := ingester.Run()
 type Ingester struct {
 	config IngestionConfig
-	store  TxHashStore
-	meta   MetaStore
-	logger Logger
-	memory *MemoryMonitor
+	store  interfaces.TxHashStore
+	meta   interfaces.MetaStore
+	logger interfaces.Logger
+	memory *memory.MemoryMonitor
 
 	// Statistics
-	aggStats *AggregatedStats
+	aggStats *stats.AggregatedStats
 
 	// Current batch state
-	currentBatch   *BatchStats
-	entriesByCF    map[string][]Entry
+	currentBatch   *stats.BatchStats
+	entriesByCF    map[string][]types.Entry
 	cfCounts       map[string]uint64 // Cumulative counts from meta store
 	batchEntrySize int
 }
@@ -100,17 +105,17 @@ type Ingester struct {
 // NewIngester creates a new Ingester.
 func NewIngester(
 	config IngestionConfig,
-	store TxHashStore,
-	meta MetaStore,
-	logger Logger,
-	memory *MemoryMonitor,
+	store interfaces.TxHashStore,
+	meta interfaces.MetaStore,
+	logger interfaces.Logger,
+	memory *memory.MemoryMonitor,
 ) *Ingester {
 	// Initialize CF counts from meta store
 	cfCounts, err := meta.GetCFCounts()
 	if err != nil || cfCounts == nil {
 		cfCounts = make(map[string]uint64)
-		for _, cf := range ColumnFamilyNames {
-			cfCounts[cf] = 0
+		for _, cfName := range cf.Names {
+			cfCounts[cfName] = 0
 		}
 	}
 
@@ -120,7 +125,7 @@ func NewIngester(
 		meta:     meta,
 		logger:   logger,
 		memory:   memory,
-		aggStats: NewAggregatedStats(),
+		aggStats: stats.NewAggregatedStats(),
 		cfCounts: cfCounts,
 	}
 }
@@ -153,7 +158,7 @@ func (i *Ingester) Run() error {
 
 	// Initialize progress tracking
 	totalLedgers := int(i.config.EndLedger - i.config.StartLedger + 1)
-	progress := NewProgressTracker(totalLedgers)
+	progress := stats.NewProgressTracker(totalLedgers)
 
 	// Initialize first batch
 	i.startNewBatch(1, i.config.StartLedger)
@@ -237,10 +242,10 @@ func (i *Ingester) Run() error {
 
 // startNewBatch initializes a new batch.
 func (i *Ingester) startNewBatch(batchNum int, startLedger uint32) {
-	i.currentBatch = NewBatchStats(batchNum, startLedger, startLedger)
-	i.entriesByCF = make(map[string][]Entry)
-	for _, cf := range ColumnFamilyNames {
-		i.entriesByCF[cf] = make([]Entry, 0, 1024)
+	i.currentBatch = stats.NewBatchStats(batchNum, startLedger, startLedger)
+	i.entriesByCF = make(map[string][]types.Entry)
+	for _, cfName := range cf.Names {
+		i.entriesByCF[cfName] = make([]types.Entry, 0, 1024)
 	}
 	i.batchEntrySize = 0
 }
@@ -273,10 +278,10 @@ func (i *Ingester) extractTransactions(lcm xdr.LedgerCloseMeta, ledgerSeq uint32
 		txHash := tx.Result.TransactionHash[:]
 
 		// Determine column family
-		cfName := GetColumnFamilyName(txHash)
+		cfName := cf.GetName(txHash)
 
 		// Add to batch
-		i.entriesByCF[cfName] = append(i.entriesByCF[cfName], Entry{
+		i.entriesByCF[cfName] = append(i.entriesByCF[cfName], types.Entry{
 			Key:   copyBytes(txHash),
 			Value: copyBytes(ledgerSeqBytes),
 		})
@@ -321,7 +326,7 @@ func (i *Ingester) commitBatch() error {
 }
 
 // GetAggregatedStats returns the aggregated statistics.
-func (i *Ingester) GetAggregatedStats() *AggregatedStats {
+func (i *Ingester) GetAggregatedStats() *stats.AggregatedStats {
 	return i.aggStats
 }
 
@@ -364,10 +369,10 @@ func copyBytes(src []byte) []byte {
 //   - error if ingestion fails
 func RunIngestion(
 	config *Config,
-	store TxHashStore,
-	meta MetaStore,
-	logger Logger,
-	memory *MemoryMonitor,
+	store interfaces.TxHashStore,
+	meta interfaces.MetaStore,
+	logger interfaces.Logger,
+	memory *memory.MemoryMonitor,
 	startFromLedger uint32,
 ) error {
 	ingesterConfig := IngestionConfig{
@@ -386,7 +391,7 @@ func RunIngestion(
 // =============================================================================
 
 // LogIngestionStart logs the start of ingestion.
-func LogIngestionStart(logger Logger, config *Config, resuming bool, startFrom uint32) {
+func LogIngestionStart(logger interfaces.Logger, config *Config, resuming bool, startFrom uint32) {
 	logger.Separator()
 	logger.Info("                         INGESTION PHASE")
 	logger.Separator()

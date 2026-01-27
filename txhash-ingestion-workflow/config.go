@@ -51,49 +51,30 @@ import (
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers/lfs"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
 
 // =============================================================================
 // Constants
 // =============================================================================
 
+// Import constants from pkg/types for convenience
 const (
-	// MB is megabytes in bytes
-	MB = 1024 * 1024
+	// LedgersPerBatch is imported from pkg/types
+	LedgersPerBatch = types.LedgersPerBatch
 
-	// GB is gigabytes in bytes
-	GB = 1024 * 1024 * 1024
+	// DefaultBlockCacheMB is imported from pkg/types
+	DefaultBlockCacheMB = types.DefaultBlockCacheMB
 
-	// LedgersPerBatch is the number of ledgers processed before checkpointing.
-	// After each batch, progress is saved to the meta store.
-	//
-	// WHY 1000 LEDGERS:
-	//   - Provides frequent enough checkpoints for crash recovery
-	//   - Not so frequent that checkpoint overhead dominates
-	//   - Allows detailed progress metrics at regular intervals
-	//
-	LedgersPerBatch = 1000
-
-	// DefaultBlockCacheMB is the default block cache size in megabytes.
-	// The block cache holds uncompressed data blocks read from SST files.
-	//
-	// SIZING GUIDANCE:
-	//   - Larger cache = faster reads, more memory
-	//   - 8 GB is a good default for machines with 64+ GB RAM
-	//   - Reduce if memory is constrained
-	//
-	DefaultBlockCacheMB = 8192
-
-	// RAMWarningThresholdGB is the RSS threshold that triggers a warning.
-	// If process memory exceeds this, a warning is logged.
-	RAMWarningThresholdGB = 100
+	// RAMWarningThresholdGB is imported from pkg/types
+	RAMWarningThresholdGB = types.RAMWarningThresholdGB
 )
 
 // =============================================================================
-// RocksDBSettings - Tunable RocksDB Parameters
+// RocksDBSettings Helper Functions
 // =============================================================================
-
-// RocksDBSettings contains tunable RocksDB parameters.
 //
 // These settings are optimized for bulk ingestion with the following goals:
 //  1. High write throughput during ingestion
@@ -105,186 +86,34 @@ const (
 //   - WAL is always enabled (critical for crash recovery)
 //   - Auto-compaction is always disabled (explicit compaction phase)
 //   - Compression is disabled (values are only 4 bytes)
-type RocksDBSettings struct {
-	// =========================================================================
-	// MemTable Configuration
-	// =========================================================================
-	//
-	// MemTables are in-memory buffers where writes land first.
-	// When a MemTable fills up, it's flushed to an SST file on disk.
-	//
-	// MEMORY IMPACT:
-	//   Total MemTable RAM = WriteBufferSizeMB × MaxWriteBufferNumber × 16 CFs
-	//
-	// WAL IMPACT:
-	//   WAL size ≈ sum of all active MemTable sizes
-	//   Larger MemTables = larger WAL = longer crash recovery
-	//
-	// =========================================================================
-
-	// WriteBufferSizeMB is the size of each MemTable in megabytes.
-	//
-	// TRADE-OFFS:
-	//   Larger (e.g., 256 MB):
-	//     + Fewer flushes, better write throughput
-	//     + Larger SST files (fewer files total)
-	//     - More memory usage
-	//     - Larger WAL, longer crash recovery
-	//
-	//   Smaller (e.g., 64 MB):
-	//     + Less memory usage
-	//     + Smaller WAL, faster crash recovery
-	//     - More frequent flushes
-	//     - More, smaller SST files
-	//
-	// DEFAULT: 64 MB
-	//   Keeps WAL size manageable (~2 GB max across 16 CFs).
-	//   With deferred compaction, more L0 files is acceptable.
-	//   Crash recovery time: ~10-15 seconds.
-	//
-	WriteBufferSizeMB int
-
-	// MaxWriteBufferNumber is the max number of MemTables per column family.
-	//
-	// RocksDB can have multiple MemTables:
-	//   - 1 active (receiving writes)
-	//   - N-1 immutable (waiting to be flushed or being flushed)
-	//
-	// If all MemTables are full and flush can't keep up, writes stall.
-	//
-	// DEFAULT: 2
-	//   Allows 1 active + 1 flushing. Minimizes memory while avoiding stalls.
-	//
-	MaxWriteBufferNumber int
-
-	// MinWriteBufferNumberToMerge is how many MemTables to accumulate before flush.
-	//
-	// BEHAVIOR:
-	//   Value = 1: Flush each MemTable immediately when full
-	//   Value = N: Wait for N MemTables, then merge and flush together
-	//
-	// WHY WE USE 1:
-	//   - Simpler mental model: 1 MemTable → 1 SST file
-	//   - Faster crash recovery (less data in memory/WAL)
-	//   - We don't need the merge optimization since we do explicit compaction
-	//
-	// DEFAULT: 1
-	//
-	MinWriteBufferNumberToMerge int
-
-	// =========================================================================
-	// SST File Configuration
-	// =========================================================================
-
-	// TargetFileSizeMB is the target size for SST files.
-	//
-	// SST files are the on-disk storage format. Larger files mean:
-	//   + Fewer files to manage
-	//   + Fewer bloom filter checks per lookup
-	//   - Longer compaction times per file
-	//
-	// DEFAULT: 256 MB
-	//   Matches WriteBufferSizeMB for 1:1 MemTable→SST mapping.
-	//
-	TargetFileSizeMB int
-
-	// =========================================================================
-	// Background Operations
-	// =========================================================================
-
-	// MaxBackgroundJobs is the max concurrent background operations.
-	//
-	// Background operations include:
-	//   - MemTable flushes
-	//   - Compaction (when triggered)
-	//
-	// Higher values = faster flushes, but more CPU/disk contention.
-	//
-	// DEFAULT: 16
-	//   Good for modern multi-core systems with fast storage.
-	//
-	MaxBackgroundJobs int
-
-	// =========================================================================
-	// Read Performance
-	// =========================================================================
-
-	// BloomFilterBitsPerKey configures the bloom filter.
-	//
-	// Bloom filters are probabilistic data structures that quickly determine
-	// if a key MIGHT exist in an SST file. They avoid unnecessary disk reads.
-	//
-	// BITS PER KEY → FALSE POSITIVE RATE:
-	//   10 bits → ~1.0% false positives
-	//   12 bits → ~0.3% false positives
-	//   14 bits → ~0.1% false positives
-	//
-	// DEFAULT: 12
-	//   Good balance of space and accuracy.
-	//   For 3.5B keys: ~5.25 GB total bloom filter size
-	//
-	BloomFilterBitsPerKey int
-
-	// BlockCacheSizeMB is the size of the block cache in megabytes.
-	//
-	// The block cache holds uncompressed data blocks read from SST files.
-	// It's shared across all column families.
-	//
-	// SIZING:
-	//   Larger = more data cached, faster repeated reads
-	//   Should be sized based on available RAM
-	//
-	// DEFAULT: 8192 (8 GB)
-	//
-	BlockCacheSizeMB int
-
-	// =========================================================================
-	// File Handling
-	// =========================================================================
-
-	// MaxOpenFiles limits the number of file handles RocksDB can keep open.
-	//
-	// -1 means unlimited (keep all files open for best performance).
-	// Use a limit if running many processes or hitting ulimit.
-	//
-	// DEFAULT: -1 (unlimited)
-	//
-	MaxOpenFiles int
-}
-
-// DefaultRocksDBSettings returns the default RocksDB settings.
 //
-// MEMORY BUDGET WITH DEFAULTS:
+// MEMTABLE CONFIGURATION:
 //
-//	MemTables: 256 MB × 2 × 16 CFs = 8 GB
-//	Block Cache: 8 GB
-//	Total: ~16 GB
+//	MemTables are in-memory buffers where writes land first.
+//	When a MemTable fills up, it's flushed to an SST file on disk.
 //
-// MAX WAL SIZE WITH DEFAULTS:
+//	MEMORY IMPACT:
+//	  Total MemTable RAM = WriteBufferSizeMB × MaxWriteBufferNumber × 16 CFs
 //
-//	64 MB × 16 CFs = ~1 GB
-//	Recovery time: ~10-15 seconds
-func DefaultRocksDBSettings() RocksDBSettings {
-	return RocksDBSettings{
-		// MemTable settings
-		WriteBufferSizeMB:           64,
-		MaxWriteBufferNumber:        2,
-		MinWriteBufferNumberToMerge: 1,
-
-		// SST file settings
-		TargetFileSizeMB: 256,
-
-		// Background operations
-		MaxBackgroundJobs: 16,
-
-		// Read performance
-		BloomFilterBitsPerKey: 12,
-		BlockCacheSizeMB:      DefaultBlockCacheMB,
-
-		// File handling
-		MaxOpenFiles: -1, // Unlimited
-	}
-}
+//	WAL IMPACT:
+//	  WAL size ≈ sum of all active MemTable sizes
+//	  Larger MemTables = larger WAL = longer crash recovery
+//
+// SST FILE CONFIGURATION:
+//
+//	SST files are the on-disk storage format. Larger files mean:
+//	  + Fewer files to manage
+//	  + Fewer bloom filter checks per lookup
+//	  - Longer compaction times per file
+//
+// BLOOM FILTER CONFIGURATION:
+//
+//	BITS PER KEY → FALSE POSITIVE RATE:
+//	  10 bits → ~1.0% false positives
+//	  12 bits → ~0.3% false positives
+//	  14 bits → ~0.1% false positives
+//
+// =============================================================================
 
 // CalculateMemoryUsage returns the estimated memory usage in megabytes.
 //
@@ -292,8 +121,8 @@ func DefaultRocksDBSettings() RocksDBSettings {
 //   - memtables: Total MemTable memory across all CFs
 //   - blockCache: Block cache size
 //   - total: memtables + blockCache
-func (s *RocksDBSettings) CalculateMemoryUsage() (memtables, blockCache, total int) {
-	memtables = s.WriteBufferSizeMB * s.MaxWriteBufferNumber * len(ColumnFamilyNames)
+func CalculateMemoryUsage(s *types.RocksDBSettings) (memtables, blockCache, total int) {
+	memtables = s.WriteBufferSizeMB * s.MaxWriteBufferNumber * cf.Count
 	blockCache = s.BlockCacheSizeMB
 	total = memtables + blockCache
 	return
@@ -303,15 +132,15 @@ func (s *RocksDBSettings) CalculateMemoryUsage() (memtables, blockCache, total i
 //
 // WAL size = sum of all active MemTables
 // Worst case = all CFs have a full MemTable waiting to be flushed
-func (s *RocksDBSettings) MaxWALSize() int {
-	return s.WriteBufferSizeMB * len(ColumnFamilyNames)
+func MaxWALSize(s *types.RocksDBSettings) int {
+	return s.WriteBufferSizeMB * cf.Count
 }
 
 // EstimatedRecoveryTime returns the estimated WAL recovery time.
 //
 // Based on ~300 MB/s WAL replay speed (typical for SSDs).
-func (s *RocksDBSettings) EstimatedRecoveryTime() string {
-	maxWALMB := s.MaxWALSize()
+func EstimatedRecoveryTime(s *types.RocksDBSettings) string {
+	maxWALMB := MaxWALSize(s)
 	seconds := float64(maxWALMB) / 300.0 // ~300 MB/s replay
 	if seconds < 60 {
 		return fmt.Sprintf("~%.0f seconds", seconds)
@@ -419,7 +248,7 @@ type Config struct {
 	// =========================================================================
 
 	// RocksDB contains the RocksDB configuration.
-	RocksDB RocksDBSettings
+	RocksDB types.RocksDBSettings
 
 	// =========================================================================
 	// Derived Paths (Set During Validation)
@@ -609,7 +438,7 @@ func (c *Config) TotalBatches() uint32 {
 // =============================================================================
 
 // PrintConfig prints the configuration to the logger.
-func (c *Config) PrintConfig(logger Logger) {
+func (c *Config) PrintConfig(logger interfaces.Logger) {
 	logger.Separator()
 	logger.Info("                         CONFIGURATION")
 	logger.Separator()
@@ -653,9 +482,9 @@ func (c *Config) PrintConfig(logger Logger) {
 }
 
 // PrintRocksDBConfig prints the RocksDB configuration to the logger.
-func (c *Config) PrintRocksDBConfig(logger Logger) {
+func (c *Config) PrintRocksDBConfig(logger interfaces.Logger) {
 	s := &c.RocksDB
-	memtables, blockCache, total := s.CalculateMemoryUsage()
+	memtables, blockCache, total := CalculateMemoryUsage(s)
 
 	logger.Separator()
 	logger.Info("                      ROCKSDB CONFIGURATION")
@@ -686,11 +515,11 @@ func (c *Config) PrintRocksDBConfig(logger Logger) {
 	logger.Info("")
 	logger.Info("MEMORY BUDGET:")
 	logger.Info("  MemTables:           %d MB × %d × %d CFs = %d MB",
-		s.WriteBufferSizeMB, s.MaxWriteBufferNumber, len(ColumnFamilyNames), memtables)
+		s.WriteBufferSizeMB, s.MaxWriteBufferNumber, cf.Count, memtables)
 	logger.Info("  Block Cache:         %d MB", blockCache)
 	logger.Info("  Total RocksDB:       %d MB (~%d GB)", total, total/1024)
 	logger.Info("")
 	logger.Info("MAX WAL SIZE:")
-	logger.Info("  %d MB (recovery time: %s)", s.MaxWALSize(), s.EstimatedRecoveryTime())
+	logger.Info("  %d MB (recovery time: %s)", MaxWALSize(s), EstimatedRecoveryTime(s))
 	logger.Info("")
 }

@@ -58,11 +58,14 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 	"github.com/linxGnu/grocksdb"
 )
 
@@ -142,7 +145,7 @@ func OpenRocksDBMetaStore(path string) (*RocksDBMetaStore, error) {
 	opts.SetErrorIfExists(false)
 
 	// Minimal settings for meta store (small data, simple access pattern)
-	opts.SetWriteBufferSize(4 * MB)
+	opts.SetWriteBufferSize(4 * types.MB)
 	opts.SetMaxWriteBufferNumber(2)
 	opts.SetMaxOpenFiles(10)
 
@@ -217,7 +220,7 @@ func (m *RocksDBMetaStore) SetConfig(startLedger, endLedger uint32) error {
 	batch.Put([]byte(metaKeyStartLedger), encodeUint32(startLedger))
 	batch.Put([]byte(metaKeyEndLedger), encodeUint32(endLedger))
 	batch.Put([]byte(metaKeyInitialized), []byte("true"))
-	batch.Put([]byte(metaKeyPhase), []byte(PhaseIngesting))
+	batch.Put([]byte(metaKeyPhase), []byte(types.PhaseIngesting))
 
 	return m.db.Write(m.writeOpts, batch)
 }
@@ -228,23 +231,23 @@ func (m *RocksDBMetaStore) SetConfig(startLedger, endLedger uint32) error {
 
 // GetPhase returns the current workflow phase.
 // Returns PhaseIngesting if not set.
-func (m *RocksDBMetaStore) GetPhase() (Phase, error) {
+func (m *RocksDBMetaStore) GetPhase() (types.Phase, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	value, err := m.getStringLocked(metaKeyPhase)
 	if err != nil {
-		return PhaseIngesting, err
+		return types.PhaseIngesting, err
 	}
 	if value == "" {
-		return PhaseIngesting, nil
+		return types.PhaseIngesting, nil
 	}
 
-	return Phase(value), nil
+	return types.Phase(value), nil
 }
 
 // SetPhase updates the current workflow phase.
-func (m *RocksDBMetaStore) SetPhase(phase Phase) error {
+func (m *RocksDBMetaStore) SetPhase(phase types.Phase) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -275,8 +278,8 @@ func (m *RocksDBMetaStore) GetCFCounts() (map[string]uint64, error) {
 	if value == "" {
 		// Return empty counts
 		counts := make(map[string]uint64)
-		for _, cf := range ColumnFamilyNames {
-			counts[cf] = 0
+		for _, cfName := range cf.Names {
+			counts[cfName] = 0
 		}
 		return counts, nil
 	}
@@ -346,7 +349,7 @@ func (m *RocksDBMetaStore) Exists() bool {
 }
 
 // LogState logs the current meta store state for debugging/monitoring.
-func (m *RocksDBMetaStore) LogState(logger Logger) {
+func (m *RocksDBMetaStore) LogState(logger interfaces.Logger) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -376,8 +379,8 @@ func (m *RocksDBMetaStore) LogState(logger Logger) {
 
 		// Show breakdown if requested (verbose)
 		logger.Info("  CF Counts:")
-		for _, cf := range ColumnFamilyNames {
-			logger.Info("    %s: %s", cf, helpers.FormatNumber(int64(cfCounts[cf])))
+		for _, cfName := range cf.Names {
+			logger.Info("    %s: %s", cfName, helpers.FormatNumber(int64(cfCounts[cfName])))
 		}
 	}
 	logger.Info("")
@@ -474,9 +477,9 @@ func encodeUint64(v uint64) []byte {
 // Example: "0:125000,1:123500,2:124000,...,f:126000"
 func serializeCFCounts(counts map[string]uint64) string {
 	var parts []string
-	for _, cf := range ColumnFamilyNames {
-		count := counts[cf]
-		parts = append(parts, fmt.Sprintf("%s:%d", cf, count))
+	for _, cfName := range cf.Names {
+		count := counts[cfName]
+		parts = append(parts, fmt.Sprintf("%s:%d", cfName, count))
 	}
 	return strings.Join(parts, ",")
 }
@@ -486,8 +489,8 @@ func parseCFCounts(s string) map[string]uint64 {
 	counts := make(map[string]uint64)
 
 	// Initialize with zeros
-	for _, cf := range ColumnFamilyNames {
-		counts[cf] = 0
+	for _, cfName := range cf.Names {
+		counts[cfName] = 0
 	}
 
 	if s == "" {
@@ -515,7 +518,7 @@ func parseCFCounts(s string) map[string]uint64 {
 // Compile-Time Interface Check
 // =============================================================================
 
-var _ MetaStore = (*RocksDBMetaStore)(nil)
+var _ interfaces.MetaStore = (*RocksDBMetaStore)(nil)
 
 // =============================================================================
 // Resume Helper Functions
@@ -528,10 +531,10 @@ var _ MetaStore = (*RocksDBMetaStore)(nil)
 //   - startFrom: the ledger to start from (last_committed + 1 or config start)
 //   - phase: the phase to resume from
 //   - error: if there's a configuration mismatch or other issue
-func CheckResumability(meta MetaStore, configStart, configEnd uint32) (canResume bool, startFrom uint32, phase Phase, err error) {
+func CheckResumability(meta interfaces.MetaStore, configStart, configEnd uint32) (canResume bool, startFrom uint32, phase types.Phase, err error) {
 	if !meta.Exists() {
 		// Fresh start
-		return false, configStart, PhaseIngesting, nil
+		return false, configStart, types.PhaseIngesting, nil
 	}
 
 	// Check config match
@@ -561,7 +564,7 @@ func CheckResumability(meta MetaStore, configStart, configEnd uint32) (canResume
 
 	// Determine start point based on phase
 	switch phase {
-	case PhaseIngesting:
+	case types.PhaseIngesting:
 		lastCommitted, err := meta.GetLastCommittedLedger()
 		if err != nil {
 			return false, 0, "", fmt.Errorf("failed to read last committed ledger: %w", err)
@@ -572,11 +575,11 @@ func CheckResumability(meta MetaStore, configStart, configEnd uint32) (canResume
 			startFrom = lastCommitted + 1
 		}
 
-	case PhaseCompacting, PhaseBuildingRecsplit, PhaseVerifying:
+	case types.PhaseCompacting, types.PhaseBuildingRecsplit, types.PhaseVerifying:
 		// These phases restart from the beginning of the phase
 		startFrom = 0 // Not applicable for these phases
 
-	case PhaseComplete:
+	case types.PhaseComplete:
 		// Already done
 		startFrom = 0
 	}
@@ -585,7 +588,7 @@ func CheckResumability(meta MetaStore, configStart, configEnd uint32) (canResume
 }
 
 // LogResumeState logs information about resuming a workflow.
-func LogResumeState(meta MetaStore, logger Logger, resumeFrom uint32, phase Phase) {
+func LogResumeState(meta interfaces.MetaStore, logger interfaces.Logger, resumeFrom uint32, phase types.Phase) {
 	logger.Separator()
 	logger.Info("                        RESUMING WORKFLOW")
 	logger.Separator()
@@ -595,7 +598,7 @@ func LogResumeState(meta MetaStore, logger Logger, resumeFrom uint32, phase Phas
 	logger.Info("  Resume Phase:          %s", phase)
 
 	switch phase {
-	case PhaseIngesting:
+	case types.PhaseIngesting:
 		logger.Info("  Resume From Ledger:    %d", resumeFrom)
 		lastCommitted, _ := meta.GetLastCommittedLedger()
 		if lastCommitted > 0 {
@@ -608,17 +611,17 @@ func LogResumeState(meta MetaStore, logger Logger, resumeFrom uint32, phase Phas
 			logger.Info("  Entries So Far:        %s", helpers.FormatNumber(int64(total)))
 		}
 
-	case PhaseCompacting:
+	case types.PhaseCompacting:
 		logger.Info("  Action:                Restart compaction for all CFs")
 
-	case PhaseBuildingRecsplit:
+	case types.PhaseBuildingRecsplit:
 		logger.Info("  Action:                Rebuild all RecSplit indexes")
 
-	case PhaseVerifying:
+	case types.PhaseVerifying:
 		verifyCF, _ := meta.GetVerifyCF()
 		logger.Info("  Resume From CF:        %s", verifyCF)
 
-	case PhaseComplete:
+	case types.PhaseComplete:
 		logger.Info("  Status:                Already complete")
 	}
 

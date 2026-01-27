@@ -49,8 +49,16 @@ package main
 
 import (
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"time"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/compact"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/memory"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/recsplit"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/store"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/verify"
 )
 
 // =============================================================================
@@ -79,16 +87,16 @@ type Workflow struct {
 	config *Config
 
 	// logger is the main workflow logger
-	logger Logger
+	logger interfaces.Logger
 
 	// store is the RocksDB data store
-	store TxHashStore
+	store interfaces.TxHashStore
 
 	// meta is the meta store for checkpointing
-	meta MetaStore
+	meta interfaces.MetaStore
 
 	// memory is the memory monitor
-	memory *MemoryMonitor
+	memory *memory.MemoryMonitor
 
 	// queryHandler is the SIGHUP query handler (optional)
 	queryHandler *QueryHandler
@@ -115,7 +123,7 @@ type WorkflowStats struct {
 	IsResume bool
 
 	// ResumedFromPhase is the phase we resumed from
-	ResumedFromPhase Phase
+	ResumedFromPhase types.Phase
 
 	// IngestionTime is the time spent in ingestion phase
 	IngestionTime time.Duration
@@ -153,10 +161,10 @@ type WorkflowStats struct {
 // RETURNS:
 //   - A new Workflow instance
 //   - An error if initialization fails
-func NewWorkflow(config *Config, logger Logger) (*Workflow, error) {
+func NewWorkflow(config *Config, logger interfaces.Logger) (*Workflow, error) {
 	// Open RocksDB data store
 	logger.Info("Opening RocksDB data store...")
-	store, err := OpenRocksDBTxHashStore(config.RocksDBPath, &config.RocksDB, logger)
+	txStore, err := store.OpenRocksDBTxHashStore(config.RocksDBPath, &config.RocksDB, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open data store: %w", err)
 	}
@@ -165,19 +173,19 @@ func NewWorkflow(config *Config, logger Logger) (*Workflow, error) {
 	logger.Info("Opening meta store...")
 	meta, err := OpenRocksDBMetaStore(config.MetaStorePath)
 	if err != nil {
-		store.Close()
+		txStore.Close()
 		return nil, fmt.Errorf("failed to open meta store: %w", err)
 	}
 
 	// Create memory monitor
-	memory := NewMemoryMonitor(logger, RAMWarningThresholdGB)
+	memMon := memory.NewMemoryMonitor(logger, RAMWarningThresholdGB)
 
 	return &Workflow{
 		config:    config,
 		logger:    logger,
-		store:     store,
+		store:     txStore,
 		meta:      meta,
-		memory:    memory,
+		memory:    memMon,
 		stats:     &WorkflowStats{},
 		startTime: time.Now(),
 	}, nil
@@ -219,7 +227,7 @@ func (w *Workflow) Run() error {
 		LogResumeState(w.meta, w.logger, startFrom, phase)
 
 		// Check if already complete
-		if phase == PhaseComplete {
+		if phase == types.PhaseComplete {
 			w.logger.Info("Workflow already complete. Nothing to do.")
 			w.logger.Info("")
 			return nil
@@ -230,12 +238,12 @@ func (w *Workflow) Run() error {
 		if err := w.meta.SetConfig(w.config.StartLedger, w.config.EndLedger); err != nil {
 			return fmt.Errorf("failed to set config: %w", err)
 		}
-		phase = PhaseIngesting
+		phase = types.PhaseIngesting
 		startFrom = w.config.StartLedger
 	}
 
 	// Take initial memory snapshot
-	snapshot := TakeMemorySnapshot()
+	snapshot := memory.TakeMemorySnapshot()
 	snapshot.Log(w.logger, "Initial")
 
 	// Start query handler if available
@@ -260,34 +268,34 @@ func (w *Workflow) Run() error {
 }
 
 // runFromPhase executes the workflow from a specific phase.
-func (w *Workflow) runFromPhase(startPhase Phase, startFromLedger uint32) error {
+func (w *Workflow) runFromPhase(startPhase types.Phase, startFromLedger uint32) error {
 	// Execute phases in order, starting from startPhase
 	switch startPhase {
-	case PhaseIngesting:
+	case types.PhaseIngesting:
 		if err := w.runIngestion(startFromLedger); err != nil {
 			return err
 		}
 		fallthrough
 
-	case PhaseCompacting:
+	case types.PhaseCompacting:
 		if err := w.runCompaction(); err != nil {
 			return err
 		}
 		fallthrough
 
-	case PhaseBuildingRecsplit:
+	case types.PhaseBuildingRecsplit:
 		if err := w.runRecSplitBuild(); err != nil {
 			return err
 		}
 		fallthrough
 
-	case PhaseVerifying:
+	case types.PhaseVerifying:
 		if err := w.runVerification(); err != nil {
 			return err
 		}
 		fallthrough
 
-	case PhaseComplete:
+	case types.PhaseComplete:
 		// Already handled above
 	}
 
@@ -307,7 +315,7 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 
 	// Update query handler phase
 	if w.queryHandler != nil {
-		w.queryHandler.SetPhase(PhaseIngesting)
+		w.queryHandler.SetPhase(types.PhaseIngesting)
 	}
 
 	// Log start state
@@ -342,7 +350,7 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 	w.stats.TotalKeysIngested = totalKeys
 
 	// Transition to next phase
-	if err := w.meta.SetPhase(PhaseCompacting); err != nil {
+	if err := w.meta.SetPhase(types.PhaseCompacting); err != nil {
 		return fmt.Errorf("failed to set phase to COMPACTING: %w", err)
 	}
 
@@ -364,14 +372,12 @@ func (w *Workflow) runCompaction() error {
 
 	// Update query handler phase
 	if w.queryHandler != nil {
-		w.queryHandler.SetPhase(PhaseCompacting)
+		w.queryHandler.SetPhase(types.PhaseCompacting)
 	}
-
-	LogCompactionStart(w.logger)
 
 	// Run compaction (track time separately)
 	compactionStart := time.Now()
-	_, err := RunCompaction(w.store, w.logger, w.memory)
+	_, err := compact.RunCompaction(w.store, w.logger, w.memory)
 	if err != nil {
 		return fmt.Errorf("compaction failed: %w", err)
 	}
@@ -379,7 +385,7 @@ func (w *Workflow) runCompaction() error {
 
 	// Verify counts match after compaction (track time separately)
 	// This catches count mismatches early before RecSplit build
-	verifyStats, err := VerifyCountsAfterCompaction(w.store, w.meta, w.logger)
+	verifyStats, err := compact.VerifyCountsAfterCompaction(w.store, w.meta, w.logger)
 	if err != nil {
 		return fmt.Errorf("post-compaction count verification failed: %w", err)
 	}
@@ -394,7 +400,7 @@ func (w *Workflow) runCompaction() error {
 	}
 
 	// Transition to next phase
-	if err := w.meta.SetPhase(PhaseBuildingRecsplit); err != nil {
+	if err := w.meta.SetPhase(types.PhaseBuildingRecsplit); err != nil {
 		return fmt.Errorf("failed to set phase to BUILDING_RECSPLIT: %w", err)
 	}
 
@@ -417,13 +423,28 @@ func (w *Workflow) runRecSplitBuild() error {
 
 	// Update query handler phase (SIGHUP ignored during this phase)
 	if w.queryHandler != nil {
-		w.queryHandler.SetPhase(PhaseBuildingRecsplit)
+		w.queryHandler.SetPhase(types.PhaseBuildingRecsplit)
 	}
 
 	phaseStart := time.Now()
 
-	// Run RecSplit build
-	stats, err := RunRecSplitBuild(w.store, w.meta, w.config, w.logger, w.memory)
+	// Get CF counts from meta store
+	cfCounts, err := w.meta.GetCFCounts()
+	if err != nil {
+		return fmt.Errorf("failed to get CF counts: %w", err)
+	}
+
+	// Build RecSplit indexes
+	builder := recsplit.NewBuilder(
+		w.store,
+		cfCounts,
+		w.config.RecsplitIndexPath,
+		w.config.RecsplitTmpPath,
+		w.config.ParallelRecsplit,
+		w.logger,
+		w.memory,
+	)
+	stats, err := builder.Run()
 	if err != nil {
 		return fmt.Errorf("RecSplit build failed: %w", err)
 	}
@@ -431,7 +452,7 @@ func (w *Workflow) runRecSplitBuild() error {
 	w.stats.RecSplitTime = time.Since(phaseStart)
 
 	// Transition to next phase
-	if err := w.meta.SetPhase(PhaseVerifying); err != nil {
+	if err := w.meta.SetPhase(types.PhaseVerifying); err != nil {
 		return fmt.Errorf("failed to set phase to VERIFYING: %w", err)
 	}
 
@@ -453,7 +474,7 @@ func (w *Workflow) runVerification() error {
 
 	// Update query handler phase (SIGHUP ignored during this phase)
 	if w.queryHandler != nil {
-		w.queryHandler.SetPhase(PhaseVerifying)
+		w.queryHandler.SetPhase(types.PhaseVerifying)
 	}
 
 	// Check if resuming from a specific CF
@@ -461,8 +482,16 @@ func (w *Workflow) runVerification() error {
 
 	phaseStart := time.Now()
 
-	// Run verification
-	stats, err := RunVerification(w.store, w.meta, w.config, w.logger, w.memory, resumeFromCF)
+	// Create verifier and run verification
+	verifier := verify.NewVerifier(
+		w.store,
+		w.meta,
+		w.config.RecsplitIndexPath,
+		resumeFromCF,
+		w.logger,
+		w.memory,
+	)
+	stats, err := verifier.Run()
 	if err != nil {
 		return fmt.Errorf("verification failed: %w", err)
 	}
@@ -472,13 +501,13 @@ func (w *Workflow) runVerification() error {
 	w.stats.VerificationFailures = stats.TotalFailures
 
 	// Transition to complete phase
-	if err := w.meta.SetPhase(PhaseComplete); err != nil {
+	if err := w.meta.SetPhase(types.PhaseComplete); err != nil {
 		return fmt.Errorf("failed to set phase to COMPLETE: %w", err)
 	}
 
 	// Update query handler phase
 	if w.queryHandler != nil {
-		w.queryHandler.SetPhase(PhaseComplete)
+		w.queryHandler.SetPhase(types.PhaseComplete)
 	}
 
 	w.logger.Info("")
@@ -598,12 +627,12 @@ func (w *Workflow) Close() {
 // =============================================================================
 
 // GetStore returns the data store.
-func (w *Workflow) GetStore() TxHashStore {
+func (w *Workflow) GetStore() interfaces.TxHashStore {
 	return w.store
 }
 
 // GetMeta returns the meta store.
-func (w *Workflow) GetMeta() MetaStore {
+func (w *Workflow) GetMeta() interfaces.MetaStore {
 	return w.meta
 }
 
@@ -613,7 +642,7 @@ func (w *Workflow) GetConfig() *Config {
 }
 
 // GetLogger returns the logger.
-func (w *Workflow) GetLogger() Logger {
+func (w *Workflow) GetLogger() interfaces.Logger {
 	return w.logger
 }
 

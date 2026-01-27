@@ -1,36 +1,16 @@
 // =============================================================================
-// stats.go - Statistics, Percentiles, and Histograms
+// pkg/stats/stats.go - Statistics, Percentiles, and Progress Tracking
 // =============================================================================
 //
-// This file provides statistical utilities for tracking and reporting metrics:
+// This package provides statistical utilities for tracking and reporting metrics:
 //   - Latency tracking with percentile calculations (p50, p90, p95, p99)
 //   - Throughput calculations
-//   - Histogram generation
 //   - Batch-level statistics for ingestion
-//
-// DESIGN PHILOSOPHY:
-//
-//   Statistics are collected in-memory and reported at checkpoints.
-//   This provides detailed visibility into performance without impacting
-//   throughput with excessive disk I/O.
-//
-// MEMORY USAGE:
-//
-//   - LatencyStats: O(n) where n = number of samples (for accurate percentiles)
-//   - For large sample counts, consider using a digest algorithm
-//   - Current design assumes thousands of samples per batch, not millions
-//
-// PERCENTILE CALCULATION:
-//
-//   Uses the "nearest rank" method:
-//   - Sort samples
-//   - p50 = sample at position ceil(n * 0.50)
-//   - p90 = sample at position ceil(n * 0.90)
-//   - etc.
+//   - Progress tracking with ETA calculations
 //
 // =============================================================================
 
-package main
+package stats
 
 import (
 	"fmt"
@@ -39,6 +19,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
 )
 
 // =============================================================================
@@ -51,19 +34,6 @@ import (
 //
 //	LatencyStats is safe for concurrent use from multiple goroutines.
 //	All operations are protected by a mutex.
-//
-// USAGE:
-//
-//	stats := NewLatencyStats()
-//	stats.Add(42 * time.Microsecond)
-//	stats.Add(38 * time.Microsecond)
-//	...
-//	summary := stats.Summary()
-//
-// RESETTING:
-//
-//	Call Reset() to clear all samples and start fresh.
-//	Typically called after each batch or checkpoint.
 type LatencyStats struct {
 	mu      sync.Mutex
 	samples []time.Duration
@@ -182,10 +152,6 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 }
 
 // String returns a formatted string of the latency summary.
-//
-// Format:
-//
-//	count=1000 min=10µs max=500µs avg=42µs±15µs p50=38µs p90=80µs p95=120µs p99=250µs
 func (s LatencySummary) String() string {
 	if s.Count == 0 {
 		return "count=0 (no samples)"
@@ -268,7 +234,7 @@ func (bs *BatchStats) TxPerSecond() float64 {
 }
 
 // LogSummary logs a summary of the batch to the logger.
-func (bs *BatchStats) LogSummary(logger Logger) {
+func (bs *BatchStats) LogSummary(logger interfaces.Logger) {
 	logger.Info("Batch %d: ledgers %d-%d | %d txs | parse=%v write=%v | %.1f ledgers/sec | %.1f tx/sec",
 		bs.BatchNumber, bs.StartLedger, bs.EndLedger,
 		bs.TxCount, bs.ParseTime, bs.WriteTime,
@@ -276,11 +242,11 @@ func (bs *BatchStats) LogSummary(logger Logger) {
 }
 
 // LogCFBreakdown logs the transaction count per column family.
-func (bs *BatchStats) LogCFBreakdown(logger Logger) {
+func (bs *BatchStats) LogCFBreakdown(logger interfaces.Logger) {
 	var parts []string
-	for _, cf := range ColumnFamilyNames {
-		count := bs.TxCountByCF[cf]
-		parts = append(parts, fmt.Sprintf("%s:%d", cf, count))
+	for _, cfName := range cf.Names {
+		count := bs.TxCountByCF[cfName]
+		parts = append(parts, fmt.Sprintf("%s:%d", cfName, count))
 	}
 	logger.Info("  CF breakdown: %s", strings.Join(parts, " "))
 }
@@ -290,15 +256,6 @@ func (bs *BatchStats) LogCFBreakdown(logger Logger) {
 // =============================================================================
 
 // AggregatedStats accumulates statistics across multiple batches.
-//
-// USAGE:
-//
-//	agg := NewAggregatedStats()
-//	for batch := range batches {
-//	    stats := processBatch(batch)
-//	    agg.AddBatch(stats)
-//	}
-//	agg.LogSummary(logger)
 type AggregatedStats struct {
 	mu sync.Mutex
 
@@ -330,8 +287,8 @@ type AggregatedStats struct {
 // NewAggregatedStats creates a new AggregatedStats.
 func NewAggregatedStats() *AggregatedStats {
 	txCounts := make(map[string]uint64)
-	for _, cf := range ColumnFamilyNames {
-		txCounts[cf] = 0
+	for _, cfName := range cf.Names {
+		txCounts[cfName] = 0
 	}
 	return &AggregatedStats{
 		TxCountByCF: txCounts,
@@ -351,8 +308,8 @@ func (as *AggregatedStats) AddBatch(batch *BatchStats) {
 	as.TotalWriteTime += batch.WriteTime
 	as.LastBatchEnd = time.Now()
 
-	for cf, count := range batch.TxCountByCF {
-		as.TxCountByCF[cf] += uint64(count)
+	for cfName, count := range batch.TxCountByCF {
+		as.TxCountByCF[cfName] += uint64(count)
 	}
 }
 
@@ -363,8 +320,8 @@ func (as *AggregatedStats) GetCFCounts() map[string]uint64 {
 	defer as.mu.Unlock()
 
 	counts := make(map[string]uint64)
-	for cf, count := range as.TxCountByCF {
-		counts[cf] = count
+	for cfName, count := range as.TxCountByCF {
+		counts[cfName] = count
 	}
 	return counts
 }
@@ -401,7 +358,7 @@ func (as *AggregatedStats) OverallTxPerSecond() float64 {
 }
 
 // LogSummary logs an aggregated summary to the logger.
-func (as *AggregatedStats) LogSummary(logger Logger) {
+func (as *AggregatedStats) LogSummary(logger interfaces.Logger) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
@@ -427,15 +384,15 @@ func (as *AggregatedStats) LogSummary(logger Logger) {
 }
 
 // LogCFSummary logs the per-CF transaction counts.
-func (as *AggregatedStats) LogCFSummary(logger Logger) {
+func (as *AggregatedStats) LogCFSummary(logger interfaces.Logger) {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
 	logger.Info("TRANSACTIONS BY COLUMN FAMILY:")
-	for _, cf := range ColumnFamilyNames {
-		count := as.TxCountByCF[cf]
+	for _, cfName := range cf.Names {
+		count := as.TxCountByCF[cfName]
 		pct := float64(count) / float64(as.TotalTx) * 100
-		logger.Info("  CF %s: %12d (%.2f%%)", cf, count, pct)
+		logger.Info("  CF %s: %12d (%.2f%%)", cfName, count, pct)
 	}
 	logger.Info("")
 }
@@ -521,6 +478,16 @@ func (qs *QueryStats) TotalQueries() int {
 	return qs.FoundCount + qs.NotFoundCount
 }
 
+// FoundLatenciesSummary returns the latency summary for found queries.
+func (qs *QueryStats) FoundLatenciesSummary() LatencySummary {
+	return qs.foundLatencies.Summary()
+}
+
+// NotFoundLatenciesSummary returns the latency summary for not-found queries.
+func (qs *QueryStats) NotFoundLatenciesSummary() LatencySummary {
+	return qs.notFoundLatencies.Summary()
+}
+
 // Duration returns the total duration of the query batch.
 func (qs *QueryStats) Duration() time.Duration {
 	qs.mu.Lock()
@@ -532,7 +499,7 @@ func (qs *QueryStats) Duration() time.Duration {
 }
 
 // LogSummary logs a summary of query statistics.
-func (qs *QueryStats) LogSummary(logger Logger) {
+func (qs *QueryStats) LogSummary(logger interfaces.Logger) {
 	qs.mu.Lock()
 	defer qs.mu.Unlock()
 
@@ -640,7 +607,7 @@ func (pt *ProgressTracker) ETA() time.Duration {
 }
 
 // LogProgress logs the current progress with ETA.
-func (pt *ProgressTracker) LogProgress(logger Logger, label string) {
+func (pt *ProgressTracker) LogProgress(logger interfaces.Logger, label string) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 

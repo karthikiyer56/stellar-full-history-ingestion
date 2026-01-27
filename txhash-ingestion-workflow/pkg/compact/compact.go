@@ -1,51 +1,63 @@
 // =============================================================================
-// compact.go - RocksDB Compaction Phase
+// pkg/compact/compact.go - RocksDB Compaction Phase
 // =============================================================================
 //
-// This file implements the compaction phase that runs after ingestion completes.
-//
-// WHY COMPACTION IS NECESSARY:
-//
-//	During ingestion, auto-compaction is disabled to maximize write throughput.
-//	This results in all data landing in L0 (level 0) as overlapping SST files.
-//
-//	Compaction:
-//	  1. Merges L0 files into sorted, non-overlapping files
-//	  2. Removes duplicate keys (from crash recovery re-ingestion)
-//	  3. Organizes data into levels (typically L6 after full compaction)
-//	  4. Optimizes read performance for RecSplit building
-//
-// COMPACTION STRATEGY:
-//
-//	We perform full compaction on all 16 column families sequentially.
-//	This is simpler than parallel compaction and sufficient for our use case.
-//
-// CRASH RECOVERY:
-//
-//	If compaction is interrupted, we restart it from the beginning.
-//	Compaction is idempotent - re-compacting already-compacted data is safe.
-//
-// STATISTICS COLLECTED:
-//
-//	Before compaction:
-//	  - SST file counts per level per CF
-//	  - Total data size per CF
-//	  - Estimated key counts
-//
-//	After compaction:
-//	  - Same metrics (to show reduction)
-//	  - Compaction time per CF
-//	  - Total compaction time
+// This package implements the compaction phase that runs after ingestion completes.
 //
 // =============================================================================
 
-package main
+package compact
 
 import (
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"time"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/memory"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/store"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
+
+// =============================================================================
+// Compactable - Minimal Interface for Compaction
+// =============================================================================
+
+// Compactable is a minimal interface for any store that supports compaction.
+// This allows the compaction logic to be reused by different store implementations
+// (e.g., the main workflow store and the standalone build-recsplit tool).
+type Compactable interface {
+	CompactCF(cfName string) time.Duration
+}
+
+// CompactAllCFs compacts all 16 column families.
+// This is a lightweight helper for tools that don't need full compaction statistics.
+//
+// Parameters:
+//   - store: Any store implementing the Compactable interface
+//   - logger: Logger for progress output
+//
+// Returns the total time taken for all compactions.
+func CompactAllCFs(store Compactable, logger interfaces.Logger) time.Duration {
+	logger.Info("Compacting all column families...")
+	logger.Info("")
+
+	totalStart := time.Now()
+
+	for i, cfName := range cf.Names {
+		logger.Info("[%2d/16] Compacting CF [%s]...", i+1, cfName)
+		cfStart := time.Now()
+		store.CompactCF(cfName)
+		logger.Info("        Completed in %v", time.Since(cfStart))
+	}
+
+	totalTime := time.Since(totalStart)
+	logger.Info("")
+	logger.Info("All column families compacted in %v", totalTime)
+
+	return totalTime
+}
 
 // =============================================================================
 // CompactionStats - Statistics for Compaction Phase
@@ -66,10 +78,10 @@ type CompactionStats struct {
 	TotalTime time.Duration
 
 	// BeforeStats holds CF stats before compaction
-	BeforeStats []CFStats
+	BeforeStats []types.CFStats
 
 	// AfterStats holds CF stats after compaction
-	AfterStats []CFStats
+	AfterStats []types.CFStats
 }
 
 // NewCompactionStats creates a new CompactionStats.
@@ -80,7 +92,7 @@ func NewCompactionStats() *CompactionStats {
 }
 
 // LogSummary logs a summary of compaction statistics.
-func (cs *CompactionStats) LogSummary(logger Logger) {
+func (cs *CompactionStats) LogSummary(logger interfaces.Logger) {
 	logger.Separator()
 	logger.Info("                    COMPACTION SUMMARY")
 	logger.Separator()
@@ -88,9 +100,9 @@ func (cs *CompactionStats) LogSummary(logger Logger) {
 
 	// Per-CF times
 	logger.Info("COMPACTION TIME BY COLUMN FAMILY:")
-	for _, cf := range ColumnFamilyNames {
-		elapsed := cs.PerCFTime[cf]
-		logger.Info("  CF %s: %v", cf, elapsed)
+	for _, cfName := range cf.Names {
+		elapsed := cs.PerCFTime[cfName]
+		logger.Info("  CF %s: %v", cfName, elapsed)
 	}
 	logger.Info("")
 	logger.Info("Total Compaction Time: %v", cs.TotalTime)
@@ -98,13 +110,13 @@ func (cs *CompactionStats) LogSummary(logger Logger) {
 }
 
 // LogBeforeAfterComparison logs a before/after comparison.
-func (cs *CompactionStats) LogBeforeAfterComparison(logger Logger) {
+func (cs *CompactionStats) LogBeforeAfterComparison(logger interfaces.Logger) {
 	logger.Info("BEFORE/AFTER COMPARISON:")
 	logger.Info("")
 
 	// Build maps for easy lookup
-	beforeMap := make(map[string]CFStats)
-	afterMap := make(map[string]CFStats)
+	beforeMap := make(map[string]types.CFStats)
+	afterMap := make(map[string]types.CFStats)
 	for _, s := range cs.BeforeStats {
 		beforeMap[s.Name] = s
 	}
@@ -120,12 +132,12 @@ func (cs *CompactionStats) LogBeforeAfterComparison(logger Logger) {
 
 	var totalFilesBefore, totalFilesAfter, totalSizeBefore, totalSizeAfter int64
 
-	for _, cf := range ColumnFamilyNames {
-		before := beforeMap[cf]
-		after := afterMap[cf]
+	for _, cfName := range cf.Names {
+		before := beforeMap[cfName]
+		after := afterMap[cfName]
 
 		logger.Info("%-4s %12d %12d %12s %12s",
-			cf,
+			cfName,
 			before.TotalFiles,
 			after.TotalFiles,
 			helpers.FormatBytes(before.TotalSize),
@@ -171,18 +183,18 @@ func (cs *CompactionStats) LogBeforeAfterComparison(logger Logger) {
 
 // Compactor handles the compaction phase.
 type Compactor struct {
-	store  TxHashStore
-	logger Logger
-	memory *MemoryMonitor
+	store  interfaces.TxHashStore
+	logger interfaces.Logger
+	memory interfaces.MemoryMonitor
 	stats  *CompactionStats
 }
 
 // NewCompactor creates a new Compactor.
-func NewCompactor(store TxHashStore, logger Logger, memory *MemoryMonitor) *Compactor {
+func NewCompactor(s interfaces.TxHashStore, logger interfaces.Logger, mem interfaces.MemoryMonitor) *Compactor {
 	return &Compactor{
-		store:  store,
+		store:  s,
 		logger: logger,
-		memory: memory,
+		memory: mem,
 		stats:  NewCompactionStats(),
 	}
 }
@@ -201,14 +213,14 @@ func (c *Compactor) Run() (*CompactionStats, error) {
 	// Collect before stats
 	c.logger.Info("Collecting pre-compaction statistics...")
 	c.stats.BeforeStats = c.store.GetAllCFStats()
-	LogAllCFStats(c.store, c.logger, "PRE-COMPACTION STATISTICS")
+	store.LogAllCFStats(c.store, c.logger, "PRE-COMPACTION STATISTICS")
 
 	// Log level distribution before
 	c.logger.Info("Level distribution BEFORE compaction:")
-	LogCFLevelStats(c.store, c.logger)
+	store.LogCFLevelStats(c.store, c.logger)
 
 	// Take memory snapshot
-	beforeMem := TakeMemorySnapshot()
+	beforeMem := memory.TakeMemorySnapshot()
 	beforeMem.Log(c.logger, "Pre-Compaction")
 
 	// Compact each CF
@@ -219,7 +231,7 @@ func (c *Compactor) Run() (*CompactionStats, error) {
 
 	totalStart := time.Now()
 
-	for i, cfName := range ColumnFamilyNames {
+	for i, cfName := range cf.Names {
 		c.logger.Info("[%2d/16] Compacting CF [%s]...", i+1, cfName)
 
 		cfStart := time.Now()
@@ -245,17 +257,17 @@ func (c *Compactor) Run() (*CompactionStats, error) {
 	// Collect after stats
 	c.logger.Info("Collecting post-compaction statistics...")
 	c.stats.AfterStats = c.store.GetAllCFStats()
-	LogAllCFStats(c.store, c.logger, "POST-COMPACTION STATISTICS")
+	store.LogAllCFStats(c.store, c.logger, "POST-COMPACTION STATISTICS")
 
 	// Log level distribution after
 	c.logger.Info("Level distribution AFTER compaction:")
-	LogCFLevelStats(c.store, c.logger)
+	store.LogCFLevelStats(c.store, c.logger)
 
 	// Log comparison
 	c.stats.LogBeforeAfterComparison(c.logger)
 
 	// Take memory snapshot
-	afterMem := TakeMemorySnapshot()
+	afterMem := memory.TakeMemorySnapshot()
 	afterMem.Log(c.logger, "Post-Compaction")
 
 	// Log summary
@@ -276,42 +288,9 @@ func (c *Compactor) GetStats() *CompactionStats {
 // =============================================================================
 
 // RunCompaction is a convenience function to run the compaction phase.
-func RunCompaction(store TxHashStore, logger Logger, memory *MemoryMonitor) (*CompactionStats, error) {
-	compactor := NewCompactor(store, logger, memory)
+func RunCompaction(s interfaces.TxHashStore, logger interfaces.Logger, mem interfaces.MemoryMonitor) (*CompactionStats, error) {
+	compactor := NewCompactor(s, logger, mem)
 	return compactor.Run()
-}
-
-// =============================================================================
-// Compaction Progress Logging
-// =============================================================================
-
-// LogCompactionStart logs the start of compaction.
-func LogCompactionStart(logger Logger) {
-	logger.Separator()
-	logger.Info("                         COMPACTION PHASE")
-	logger.Separator()
-	logger.Info("")
-	logger.Info("Starting compaction of all 16 column families...")
-	logger.Info("")
-	logger.Info("WHAT COMPACTION DOES:")
-	logger.Info("  1. Merges L0 files into sorted, non-overlapping files")
-	logger.Info("  2. Removes duplicate keys (from crash recovery)")
-	logger.Info("  3. Organizes data into levels (L6 after full compaction)")
-	logger.Info("  4. Optimizes read performance for RecSplit building")
-	logger.Info("")
-}
-
-// EstimateCompactionTime provides a rough estimate of compaction time.
-//
-// Based on empirical observations:
-//   - ~10-30 seconds per GB of data
-//   - ~5-10 minutes for a typical CF with ~20GB of data
-//   - ~1-2 hours for all 16 CFs with ~320GB total
-func EstimateCompactionTime(totalSizeBytes int64) time.Duration {
-	// Estimate ~20 seconds per GB
-	sizeGB := float64(totalSizeBytes) / float64(GB)
-	estimatedSeconds := sizeGB * 20
-	return time.Duration(estimatedSeconds) * time.Second
 }
 
 // =============================================================================
@@ -339,31 +318,10 @@ type CountVerificationStats struct {
 
 // VerifyCountsAfterCompaction iterates through each CF in RocksDB and verifies
 // that the actual count matches the expected count from meta store.
-//
-// WHY THIS IS IMPORTANT:
-//
-//	After compaction, duplicates should be removed. The count in RocksDB should
-//	exactly match cfCounts stored in meta store. If there's a mismatch, it
-//	indicates a bug or data corruption that would cause RecSplit build to fail.
-//
-// WHAT THIS DOES:
-//
-//	For each of the 16 column families:
-//	  1. Get expected count from meta store (cfCounts)
-//	  2. Iterate through RocksDB CF and count actual entries
-//	  3. Compare and log any mismatches
-//
-// RETURNS:
-//   - stats: Verification statistics including any mismatches
-//   - error: Only if there's an iteration error (not for count mismatches)
-//
-// NOTE: Count mismatches are logged as errors but do NOT abort the process.
-// The RecSplit build phase will fail if counts don't match, which is the
-// definitive check. This early verification helps catch issues sooner.
 func VerifyCountsAfterCompaction(
-	store TxHashStore,
-	meta MetaStore,
-	logger Logger,
+	s interfaces.TxHashStore,
+	meta interfaces.MetaStore,
+	logger interfaces.Logger,
 ) (*CountVerificationStats, error) {
 	stats := &CountVerificationStats{
 		StartTime:  time.Now(),
@@ -398,14 +356,14 @@ func VerifyCountsAfterCompaction(
 
 	var totalActual uint64
 
-	for _, cfName := range ColumnFamilyNames {
+	for _, cfName := range cf.Names {
 		cfStart := time.Now()
 
 		expectedCount := expectedCounts[cfName]
 
 		// Iterate and count actual entries
 		actualCount := uint64(0)
-		iter := store.NewIteratorCF(cfName)
+		iter := s.NewIteratorCF(cfName)
 		for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 			actualCount++
 		}
@@ -464,7 +422,7 @@ func VerifyCountsAfterCompaction(
 
 	// Log summary
 	if stats.AllMatched {
-		logger.Info("Count verification PASSED: All %d CFs match expected counts", len(ColumnFamilyNames))
+		logger.Info("Count verification PASSED: All %d CFs match expected counts", len(cf.Names))
 	} else {
 		logger.Error("Count verification FAILED: %d CF(s) have mismatched counts", stats.Mismatches)
 		logger.Error("")
@@ -489,4 +447,17 @@ func VerifyCountsAfterCompaction(
 	logger.Sync()
 
 	return stats, nil
+}
+
+// EstimateCompactionTime provides a rough estimate of compaction time.
+//
+// Based on empirical observations:
+//   - ~10-30 seconds per GB of data
+//   - ~5-10 minutes for a typical CF with ~20GB of data
+//   - ~1-2 hours for all 16 CFs with ~320GB total
+func EstimateCompactionTime(totalSizeBytes int64) time.Duration {
+	// Estimate ~20 seconds per GB
+	sizeGB := float64(totalSizeBytes) / float64(types.GB)
+	estimatedSeconds := sizeGB * 20
+	return time.Duration(estimatedSeconds) * time.Second
 }

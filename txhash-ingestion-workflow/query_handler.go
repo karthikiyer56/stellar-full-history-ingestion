@@ -70,6 +70,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/logging"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/stats"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
 
 // =============================================================================
@@ -96,19 +101,19 @@ type QueryHandler struct {
 	config *Config
 
 	// store is the RocksDB store to query
-	store TxHashStore
+	store interfaces.TxHashStore
 
 	// mainLogger is the primary workflow logger (for phase-level logging)
-	mainLogger Logger
+	mainLogger interfaces.Logger
 
 	// queryLogger is the specialized logger for query results/stats
-	queryLogger *QueryLogger
+	queryLogger *logging.QueryLogger
 
 	// mu protects currentPhase and isRunning
 	mu sync.Mutex
 
 	// currentPhase is the workflow phase (determines if queries are allowed)
-	currentPhase Phase
+	currentPhase types.Phase
 
 	// isRunning indicates if the handler is active
 	isRunning bool
@@ -149,9 +154,9 @@ type QueryHandler struct {
 // RETURNS:
 //   - A new QueryHandler (not yet started)
 //   - An error if query logger creation fails
-func NewQueryHandler(config *Config, store TxHashStore, mainLogger Logger) (*QueryHandler, error) {
+func NewQueryHandler(config *Config, store interfaces.TxHashStore, mainLogger interfaces.Logger) (*QueryHandler, error) {
 	// Create query logger with the configured paths
-	queryLogger, err := NewQueryLogger(
+	queryLogger, err := logging.NewQueryLogger(
 		config.QueryOutput,
 		config.QueryLog,
 		config.QueryError,
@@ -165,7 +170,7 @@ func NewQueryHandler(config *Config, store TxHashStore, mainLogger Logger) (*Que
 		store:        store,
 		mainLogger:   mainLogger,
 		queryLogger:  queryLogger,
-		currentPhase: PhaseIngesting,
+		currentPhase: types.PhaseIngesting,
 		triggerChan:  make(chan struct{}, 10), // Buffer to prevent blocking
 		stopChan:     make(chan struct{}),
 		doneChan:     make(chan struct{}),
@@ -222,7 +227,7 @@ func (qh *QueryHandler) Stop() {
 // SetPhase updates the current workflow phase.
 //
 // Queries are only processed during INGESTING and COMPACTING phases.
-func (qh *QueryHandler) SetPhase(phase Phase) {
+func (qh *QueryHandler) SetPhase(phase types.Phase) {
 	qh.mu.Lock()
 	defer qh.mu.Unlock()
 	qh.currentPhase = phase
@@ -265,8 +270,8 @@ func (qh *QueryHandler) TriggerQuery() {
 }
 
 // isQueryPhase returns true if queries are allowed in the given phase.
-func (qh *QueryHandler) isQueryPhase(phase Phase) bool {
-	return phase == PhaseIngesting || phase == PhaseCompacting
+func (qh *QueryHandler) isQueryPhase(phase types.Phase) bool {
+	return phase == types.PhaseIngesting || phase == types.PhaseCompacting
 }
 
 // runLoop is the main handler goroutine.
@@ -329,7 +334,7 @@ func (qh *QueryHandler) processQueryBatch() {
 	defer file.Close()
 
 	// Create statistics collector
-	stats := NewQueryStats()
+	qStats := stats.NewQueryStats()
 
 	// Process each line
 	scanner := bufio.NewScanner(file)
@@ -345,15 +350,15 @@ func (qh *QueryHandler) processQueryBatch() {
 		}
 
 		// Parse hex string
-		txHashBytes := HexToBytes(line)
+		txHashBytes := types.HexToBytes(line)
 		if txHashBytes == nil || len(txHashBytes) != 32 {
 			qh.queryLogger.Error("Line %d: invalid txHash hex: %s", lineNum, truncateForLog(line, 70))
-			stats.AddParseError()
+			qStats.AddParseError()
 			continue
 		}
 
 		// Execute query
-		qh.executeQuery(line, txHashBytes, stats)
+		qh.executeQuery(line, txHashBytes, qStats)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -361,17 +366,17 @@ func (qh *QueryHandler) processQueryBatch() {
 	}
 
 	// Mark batch complete
-	stats.Finish()
+	qStats.Finish()
 	batchDuration := time.Since(startTime)
 
 	// Update cumulative statistics
-	totalQueries := stats.TotalQueries()
+	totalQueries := qStats.TotalQueries()
 	atomic.AddInt64(&qh.totalQueries, int64(totalQueries))
-	atomic.AddInt64(&qh.totalFound, int64(stats.FoundCount))
-	atomic.AddInt64(&qh.totalNotFound, int64(stats.NotFoundCount))
+	atomic.AddInt64(&qh.totalFound, int64(qStats.FoundCount))
+	atomic.AddInt64(&qh.totalNotFound, int64(qStats.NotFoundCount))
 
 	// Log batch statistics
-	qh.logBatchStats(batchNum, stats, batchDuration)
+	qh.logBatchStats(batchNum, qStats, batchDuration)
 
 	// Flush logs
 	qh.queryLogger.Sync()
@@ -386,7 +391,7 @@ func (qh *QueryHandler) processQueryBatch() {
 // RESULT FORMAT:
 //   - Found: txHash,ledgerSeq,queryTimeUs
 //   - Not found: txHash,-1,queryTimeUs
-func (qh *QueryHandler) executeQuery(txHashHex string, txHashBytes []byte, stats *QueryStats) {
+func (qh *QueryHandler) executeQuery(txHashHex string, txHashBytes []byte, qStats *stats.QueryStats) {
 	// Time the query
 	queryStart := time.Now()
 	value, found, err := qh.store.Get(txHashBytes)
@@ -395,48 +400,48 @@ func (qh *QueryHandler) executeQuery(txHashHex string, txHashBytes []byte, stats
 	if err != nil {
 		// RocksDB error - log and count as not found
 		qh.queryLogger.Error("Query error for %s: %v", txHashHex, err)
-		stats.AddNotFound(queryTime)
+		qStats.AddNotFound(queryTime)
 		qh.queryLogger.NotFound(txHashHex, queryTime.Microseconds())
 		return
 	}
 
 	if found {
-		ledgerSeq := ParseLedgerSeq(value)
-		stats.AddFound(queryTime)
+		ledgerSeq := types.ParseLedgerSeq(value)
+		qStats.AddFound(queryTime)
 		qh.queryLogger.Result(txHashHex, ledgerSeq, queryTime.Microseconds())
 	} else {
-		stats.AddNotFound(queryTime)
+		qStats.AddNotFound(queryTime)
 		qh.queryLogger.NotFound(txHashHex, queryTime.Microseconds())
 	}
 }
 
 // logBatchStats logs detailed statistics for a query batch.
-func (qh *QueryHandler) logBatchStats(batchNum int, stats *QueryStats, duration time.Duration) {
+func (qh *QueryHandler) logBatchStats(batchNum int, qStats *stats.QueryStats, duration time.Duration) {
 	qh.queryLogger.Stats("")
 	qh.queryLogger.Stats("--- QUERY BATCH %d COMPLETE ---", batchNum)
 	qh.queryLogger.Stats("")
 	qh.queryLogger.Stats("SUMMARY:")
-	qh.queryLogger.Stats("  Total Queries:    %d", stats.TotalQueries())
+	qh.queryLogger.Stats("  Total Queries:    %d", qStats.TotalQueries())
 	qh.queryLogger.Stats("  Found:            %d (%.2f%%)",
-		stats.FoundCount,
-		safePercent(stats.FoundCount, stats.TotalQueries()))
+		qStats.FoundCount,
+		safePercent(qStats.FoundCount, qStats.TotalQueries()))
 	qh.queryLogger.Stats("  Not Found:        %d (%.2f%%)",
-		stats.NotFoundCount,
-		safePercent(stats.NotFoundCount, stats.TotalQueries()))
-	qh.queryLogger.Stats("  Parse Errors:     %d", stats.ParseErrorCount)
+		qStats.NotFoundCount,
+		safePercent(qStats.NotFoundCount, qStats.TotalQueries()))
+	qh.queryLogger.Stats("  Parse Errors:     %d", qStats.ParseErrorCount)
 	qh.queryLogger.Stats("  Batch Duration:   %v", duration)
 
 	// Calculate throughput
 	if duration.Seconds() > 0 {
-		qps := float64(stats.TotalQueries()) / duration.Seconds()
+		qps := float64(qStats.TotalQueries()) / duration.Seconds()
 		qh.queryLogger.Stats("  Throughput:       %.1f queries/sec", qps)
 	}
 
 	// Log latency statistics for found queries
-	if stats.FoundCount > 0 {
+	if qStats.FoundCount > 0 {
 		qh.queryLogger.Stats("")
 		qh.queryLogger.Stats("FOUND QUERY LATENCIES:")
-		summary := stats.foundLatencies.Summary()
+		summary := qStats.FoundLatenciesSummary()
 		qh.queryLogger.Stats("  Count:   %d", summary.Count)
 		qh.queryLogger.Stats("  Min:     %v", summary.Min)
 		qh.queryLogger.Stats("  Max:     %v", summary.Max)
@@ -448,10 +453,10 @@ func (qh *QueryHandler) logBatchStats(batchNum int, stats *QueryStats, duration 
 	}
 
 	// Log latency statistics for not-found queries
-	if stats.NotFoundCount > 0 {
+	if qStats.NotFoundCount > 0 {
 		qh.queryLogger.Stats("")
 		qh.queryLogger.Stats("NOT-FOUND QUERY LATENCIES:")
-		summary := stats.notFoundLatencies.Summary()
+		summary := qStats.NotFoundLatenciesSummary()
 		qh.queryLogger.Stats("  Count:   %d", summary.Count)
 		qh.queryLogger.Stats("  Min:     %v", summary.Min)
 		qh.queryLogger.Stats("  Max:     %v", summary.Max)

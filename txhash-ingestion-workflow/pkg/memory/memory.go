@@ -1,53 +1,27 @@
 // =============================================================================
-// memory.go - RAM Monitoring and Memory Utilities
+// pkg/memory/memory.go - RAM Monitoring and Memory Utilities
 // =============================================================================
 //
-// This file provides utilities for monitoring process memory usage:
+// This package provides utilities for monitoring process memory usage:
 //   - RSS (Resident Set Size) monitoring
 //   - Memory threshold warnings (100 GB default)
 //   - Periodic memory logging
-//
-// DESIGN PHILOSOPHY:
-//
-//   Memory monitoring is critical for long-running processes that handle
-//   large datasets. This tool processes billions of records and can
-//   potentially consume 100+ GB of RAM during RecSplit building.
-//
-//   The monitoring approach is:
-//   1. Passive: Check memory at checkpoints, don't poll continuously
-//   2. Warning-based: Log warnings but don't abort (operator can decide)
-//   3. Platform-aware: Uses syscall on Darwin/Linux for accurate RSS
-//
-// MEMORY COMPONENTS:
-//
-//   During ingestion:
-//     - RocksDB MemTables: ~8 GB (configurable)
-//     - RocksDB Block Cache: ~8 GB (configurable)
-//     - Go heap: ~1-2 GB (ledger parsing buffers)
-//     - Total: ~18 GB typical
-//
-//   During RecSplit building:
-//     - RecSplit construction: ~40 bytes per key
-//     - Per CF (~220M keys): ~9 GB per CF
-//     - Parallel mode (16 CFs): ~144 GB peak
-//     - Sequential mode: ~9 GB peak + completed indexes on disk
-//
-// PLATFORM NOTES:
-//
-//   - Darwin (macOS): Uses syscall.Getrusage
-//   - Linux: Uses syscall.Getrusage
-//   - Other platforms: Falls back to runtime.ReadMemStats (less accurate)
+//   - RecSplit memory estimation
 //
 // =============================================================================
 
-package main
+package memory
 
 import (
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"runtime"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
 
 // =============================================================================
@@ -83,7 +57,7 @@ type MemoryMonitor struct {
 	mu sync.Mutex
 
 	// logger for warnings
-	logger Logger
+	logger interfaces.Logger
 
 	// warningThresholdGB is the RSS threshold for warnings
 	warningThresholdGB float64
@@ -106,7 +80,7 @@ type MemoryMonitor struct {
 // PARAMETERS:
 //   - logger: Logger for warning messages
 //   - warningThresholdGB: RSS threshold in GB for warnings
-func NewMemoryMonitor(logger Logger, warningThresholdGB float64) *MemoryMonitor {
+func NewMemoryMonitor(logger interfaces.Logger, warningThresholdGB float64) *MemoryMonitor {
 	return &MemoryMonitor{
 		logger:             logger,
 		warningThresholdGB: warningThresholdGB,
@@ -124,7 +98,7 @@ func (m *MemoryMonitor) Check() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	rss := getRSSBytes()
+	rss := GetRSSBytes()
 	m.checkCount++
 	m.lastCheck = time.Now()
 
@@ -134,7 +108,7 @@ func (m *MemoryMonitor) Check() int64 {
 	}
 
 	// Check threshold
-	rssGB := float64(rss) / float64(GB)
+	rssGB := float64(rss) / float64(types.GB)
 	if rssGB > m.warningThresholdGB && !m.warningLogged {
 		m.logger.Error("MEMORY WARNING: RSS %.2f GB exceeds threshold %.0f GB",
 			rssGB, m.warningThresholdGB)
@@ -151,26 +125,26 @@ func (m *MemoryMonitor) Check() int64 {
 
 // CurrentRSSGB returns the current RSS in gigabytes.
 func (m *MemoryMonitor) CurrentRSSGB() float64 {
-	return float64(getRSSBytes()) / float64(GB)
+	return float64(GetRSSBytes()) / float64(types.GB)
 }
 
 // PeakRSSGB returns the peak RSS observed in gigabytes.
 func (m *MemoryMonitor) PeakRSSGB() float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return float64(m.peakRSSBytes) / float64(GB)
+	return float64(m.peakRSSBytes) / float64(types.GB)
 }
 
 // LogSummary logs a summary of memory usage.
-func (m *MemoryMonitor) LogSummary(logger Logger) {
+func (m *MemoryMonitor) LogSummary(logger interfaces.Logger) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	currentRSS := getRSSBytes()
+	currentRSS := GetRSSBytes()
 	logger.Info("")
 	logger.Info("MEMORY SUMMARY:")
-	logger.Info("  Current RSS:       %.2f GB", float64(currentRSS)/float64(GB))
-	logger.Info("  Peak RSS:          %.2f GB", float64(m.peakRSSBytes)/float64(GB))
+	logger.Info("  Current RSS:       %.2f GB", float64(currentRSS)/float64(types.GB))
+	logger.Info("  Peak RSS:          %.2f GB", float64(m.peakRSSBytes)/float64(types.GB))
 	logger.Info("  Warning Threshold: %.0f GB", m.warningThresholdGB)
 	logger.Info("  Checks Performed:  %d", m.checkCount)
 	logger.Info("")
@@ -180,6 +154,9 @@ func (m *MemoryMonitor) LogSummary(logger Logger) {
 func (m *MemoryMonitor) Stop() {
 	// No-op for now
 }
+
+// Compile-time interface check
+var _ interfaces.MemoryMonitor = (*MemoryMonitor)(nil)
 
 // =============================================================================
 // MemorySnapshot - Point-in-Time Memory Snapshot
@@ -222,7 +199,7 @@ func TakeMemorySnapshot() MemorySnapshot {
 
 	return MemorySnapshot{
 		Timestamp:    time.Now(),
-		RSS:          getRSSBytes(),
+		RSS:          GetRSSBytes(),
 		HeapAlloc:    memStats.HeapAlloc,
 		HeapSys:      memStats.HeapSys,
 		HeapInuse:    memStats.HeapInuse,
@@ -233,9 +210,9 @@ func TakeMemorySnapshot() MemorySnapshot {
 }
 
 // Log logs the snapshot to the logger.
-func (s *MemorySnapshot) Log(logger Logger, label string) {
+func (s *MemorySnapshot) Log(logger interfaces.Logger, label string) {
 	logger.Info("%s Memory Snapshot:", label)
-	logger.Info("  RSS:          %s (%.2f GB)", helpers.FormatBytes(s.RSS), float64(s.RSS)/float64(GB))
+	logger.Info("  RSS:          %s (%.2f GB)", helpers.FormatBytes(s.RSS), float64(s.RSS)/float64(types.GB))
 	logger.Info("  Heap Alloc:   %s", helpers.FormatBytes(int64(s.HeapAlloc)))
 	logger.Info("  Heap Sys:     %s", helpers.FormatBytes(int64(s.HeapSys)))
 	logger.Info("  Heap InUse:   %s", helpers.FormatBytes(int64(s.HeapInuse)))
@@ -244,16 +221,16 @@ func (s *MemorySnapshot) Log(logger Logger, label string) {
 	logger.Info("  GC Pause:     %v total", s.GCPauseTotal)
 }
 
-// RSSRB returns RSS in gigabytes.
+// RSSGB returns RSS in gigabytes.
 func (s *MemorySnapshot) RSSGB() float64 {
-	return float64(s.RSS) / float64(GB)
+	return float64(s.RSS) / float64(types.GB)
 }
 
 // =============================================================================
 // Platform-Specific RSS Reading
 // =============================================================================
 
-// getRSSBytes returns the current Resident Set Size in bytes.
+// GetRSSBytes returns the current Resident Set Size in bytes.
 //
 // PLATFORM BEHAVIOR:
 //   - Darwin/Linux: Uses syscall.Getrusage for accurate RSS
@@ -263,7 +240,7 @@ func (s *MemorySnapshot) RSSGB() float64 {
 //
 //	On macOS, Getrusage returns RSS in bytes.
 //	On Linux, Getrusage returns RSS in kilobytes (we multiply by 1024).
-func getRSSBytes() int64 {
+func GetRSSBytes() int64 {
 	var rusage syscall.Rusage
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &rusage); err != nil {
 		// Fallback to Go's memory stats
@@ -301,7 +278,7 @@ func GetGoMemStats() runtime.MemStats {
 }
 
 // LogGoMemStats logs Go memory statistics to the logger.
-func LogGoMemStats(logger Logger) {
+func LogGoMemStats(logger interfaces.Logger) {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
@@ -347,35 +324,35 @@ func EstimateRecSplitMemoryAllCFs(cfCounts map[string]uint64) int64 {
 }
 
 // LogRecSplitMemoryEstimate logs the memory estimate for RecSplit.
-func LogRecSplitMemoryEstimate(logger Logger, cfCounts map[string]uint64, parallel bool) {
+func LogRecSplitMemoryEstimate(logger interfaces.Logger, cfCounts map[string]uint64, parallel bool) {
 	logger.Info("")
 	logger.Info("RECSPLIT MEMORY ESTIMATE:")
 
 	if parallel {
 		total := EstimateRecSplitMemoryAllCFs(cfCounts)
 		logger.Info("  Mode:             Parallel (16 CFs simultaneously)")
-		logger.Info("  Estimated Memory: %s (%.2f GB)", helpers.FormatBytes(total), float64(total)/float64(GB))
+		logger.Info("  Estimated Memory: %s (%.2f GB)", helpers.FormatBytes(total), float64(total)/float64(types.GB))
 		logger.Info("")
 		logger.Info("  Per-CF estimates:")
-		for _, cf := range ColumnFamilyNames {
-			count := cfCounts[cf]
+		for _, cfName := range cf.Names {
+			count := cfCounts[cfName]
 			mem := EstimateRecSplitMemory(count)
 			logger.Info("    CF %s: %s keys → %s",
-				cf, helpers.FormatNumber(int64(count)), helpers.FormatBytes(mem))
+				cfName, helpers.FormatNumber(int64(count)), helpers.FormatBytes(mem))
 		}
 	} else {
 		var maxMem int64
 		var maxCF string
-		for cf, count := range cfCounts {
+		for cfName, count := range cfCounts {
 			mem := EstimateRecSplitMemory(count)
 			if mem > maxMem {
 				maxMem = mem
-				maxCF = cf
+				maxCF = cfName
 			}
 		}
 		logger.Info("  Mode:             Sequential (one CF at a time)")
 		logger.Info("  Peak Memory:      %s (%.2f GB) for CF %s",
-			helpers.FormatBytes(maxMem), float64(maxMem)/float64(GB), maxCF)
+			helpers.FormatBytes(maxMem), float64(maxMem)/float64(types.GB), maxCF)
 	}
 	logger.Info("")
 }

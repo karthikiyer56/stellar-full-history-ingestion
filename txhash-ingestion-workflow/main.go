@@ -54,10 +54,15 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/logging"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
 
 // =============================================================================
@@ -99,7 +104,7 @@ func main() {
 	}
 
 	// Create logger
-	logger, err := NewDualLogger(config.LogFile, config.ErrorFile)
+	logger, err := logging.NewDualLogger(config.LogFile, config.ErrorFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create logger: %v\n", err)
 		os.Exit(ExitConfigError)
@@ -193,7 +198,7 @@ func main() {
 // parseFlags parses command-line flags and returns a Config.
 func parseFlags() *Config {
 	config := &Config{
-		RocksDB: DefaultRocksDBSettings(),
+		RocksDB: types.DefaultRocksDBSettings(),
 	}
 
 	// Required flags
@@ -288,7 +293,7 @@ func parseFlags() *Config {
 //
 // SIGHUP triggers the query handler.
 // SIGINT/SIGTERM are returned on a channel for graceful shutdown.
-func setupSignalHandling(queryHandler *QueryHandler, logger Logger) chan os.Signal {
+func setupSignalHandling(queryHandler *QueryHandler, logger interfaces.Logger) chan os.Signal {
 	// Channel for termination signals
 	termChan := make(chan os.Signal, 1)
 	signal.Notify(termChan, syscall.SIGINT, syscall.SIGTERM)
@@ -313,7 +318,7 @@ func setupSignalHandling(queryHandler *QueryHandler, logger Logger) chan os.Sign
 // =============================================================================
 
 // logStartup logs startup information.
-func logStartup(logger Logger, config *Config) {
+func logStartup(logger interfaces.Logger, config *Config) {
 	logger.Separator()
 	logger.Info("                    %s v%s", ToolName, Version)
 	logger.Separator()
@@ -346,7 +351,7 @@ func mustGetwd() string {
 
 // logDryRunMetaState checks if a meta store exists and logs its state.
 // This helps users understand what would happen on resume.
-func logDryRunMetaState(config *Config, logger Logger) {
+func logDryRunMetaState(config *Config, logger interfaces.Logger) {
 	// Check if meta store directory exists
 	if _, err := os.Stat(config.MetaStorePath); os.IsNotExist(err) {
 		logger.Separator()
@@ -425,7 +430,7 @@ func logDryRunMetaState(config *Config, logger Logger) {
 
 	// Show what will happen on resume
 	switch phase {
-	case PhaseIngesting:
+	case types.PhaseIngesting:
 		if lastCommitted > 0 {
 			remaining := config.EndLedger - lastCommitted
 			logger.Info("Resume Action:")
@@ -436,20 +441,20 @@ func logDryRunMetaState(config *Config, logger Logger) {
 			logger.Info("  Will start ingestion from ledger %d", config.StartLedger)
 		}
 
-	case PhaseCompacting:
+	case types.PhaseCompacting:
 		logger.Info("Resume Action:")
 		logger.Info("  Will restart compaction for all 16 CFs")
 
-	case PhaseBuildingRecsplit:
+	case types.PhaseBuildingRecsplit:
 		logger.Info("Resume Action:")
 		logger.Info("  Will rebuild all RecSplit indexes from scratch")
 
-	case PhaseVerifying:
+	case types.PhaseVerifying:
 		verifyCF, _ := meta.GetVerifyCF()
 		logger.Info("Resume Action:")
 		logger.Info("  Will resume verification from CF: %s", verifyCF)
 
-	case PhaseComplete:
+	case types.PhaseComplete:
 		logger.Info("Status:")
 		logger.Info("  Workflow already COMPLETE - nothing to do")
 	}
@@ -459,10 +464,10 @@ func logDryRunMetaState(config *Config, logger Logger) {
 	// Show per-CF counts breakdown
 	if totalCount > 0 {
 		logger.Info("Per-CF Entry Counts:")
-		for _, cf := range ColumnFamilyNames {
-			count := cfCounts[cf]
+		for _, cfName := range cf.Names {
+			count := cfCounts[cfName]
 			pct := 100.0 * float64(count) / float64(totalCount)
-			logger.Info("  CF %s: %12s (%5.2f%%)", cf, helpers.FormatNumber(int64(count)), pct)
+			logger.Info("  CF %s: %12s (%5.2f%%)", cfName, helpers.FormatNumber(int64(count)), pct)
 		}
 		logger.Info("")
 	}

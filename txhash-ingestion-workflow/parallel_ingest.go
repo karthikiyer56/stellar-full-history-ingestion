@@ -71,6 +71,10 @@ import (
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers/lfs"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/memory"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 	"github.com/klauspost/compress/zstd"
 	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/network"
@@ -117,7 +121,7 @@ type LedgerWork struct {
 // LedgerEntries represents extracted entries from a single ledger
 type LedgerEntries struct {
 	LedgerSeq   uint32
-	EntriesByCF map[string][]Entry
+	EntriesByCF map[string][]types.Entry
 	TxCount     int
 	Timing      WorkerTiming
 }
@@ -187,10 +191,10 @@ func (bt *BatchTiming) AvgLedgerLatency() time.Duration {
 // ParallelIngester handles parallel ingestion from LFS to RocksDB
 type ParallelIngester struct {
 	config ParallelIngestionConfig
-	store  TxHashStore
-	meta   MetaStore
-	logger Logger
-	memory *MemoryMonitor
+	store  interfaces.TxHashStore
+	meta   interfaces.MetaStore
+	logger interfaces.Logger
+	memory *memory.MemoryMonitor
 
 	// Channels
 	workChan  chan LedgerWork
@@ -219,17 +223,17 @@ type ParallelIngestionConfig struct {
 // NewParallelIngester creates a new parallel ingester
 func NewParallelIngester(
 	config ParallelIngestionConfig,
-	store TxHashStore,
-	meta MetaStore,
-	logger Logger,
-	memory *MemoryMonitor,
+	store interfaces.TxHashStore,
+	meta interfaces.MetaStore,
+	logger interfaces.Logger,
+	memory *memory.MemoryMonitor,
 ) *ParallelIngester {
 	// Initialize CF counts from meta store
 	cfCounts, err := meta.GetCFCounts()
 	if err != nil || cfCounts == nil {
 		cfCounts = make(map[string]uint64)
-		for _, cf := range ColumnFamilyNames {
-			cfCounts[cf] = 0
+		for _, cfName := range cf.Names {
+			cfCounts[cfName] = 0
 		}
 	}
 
@@ -329,9 +333,9 @@ func (pi *ParallelIngester) processBatch(batchNum int, startLedger, endLedger ui
 	}
 
 	// Prepare collection structures
-	entriesByCF := make(map[string][]Entry)
-	for _, cf := range ColumnFamilyNames {
-		entriesByCF[cf] = make([]Entry, 0, timing.LedgerCount*25) // ~25 tx per ledger avg
+	entriesByCF := make(map[string][]types.Entry)
+	for _, cfName := range cf.Names {
+		entriesByCF[cfName] = make([]types.Entry, 0, timing.LedgerCount*25) // ~25 tx per ledger avg
 	}
 	txCountByCF := make(map[string]int)
 
@@ -525,9 +529,9 @@ func (pi *ParallelIngester) worker(id int, errChan chan<- error) {
 
 		// Extract transaction hashes
 		extractStart := time.Now()
-		entriesByCF := make(map[string][]Entry)
-		for _, cf := range ColumnFamilyNames {
-			entriesByCF[cf] = make([]Entry, 0, 32)
+		entriesByCF := make(map[string][]types.Entry)
+		for _, cfName := range cf.Names {
+			entriesByCF[cfName] = make([]types.Entry, 0, 32)
 		}
 
 		txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(
@@ -558,9 +562,9 @@ func (pi *ParallelIngester) worker(id int, errChan chan<- error) {
 			}
 
 			txHash := tx.Result.TransactionHash[:]
-			cfName := GetColumnFamilyName(txHash)
+			cfName := cf.GetName(txHash)
 
-			entriesByCF[cfName] = append(entriesByCF[cfName], Entry{
+			entriesByCF[cfName] = append(entriesByCF[cfName], types.Entry{
 				Key:   copyBytes(txHash),
 				Value: copyBytes(ledgerSeqBytes),
 			})
@@ -655,10 +659,10 @@ func (pi *ParallelIngester) logCFSummary() {
 	}
 
 	pi.logger.Info("TRANSACTIONS BY COLUMN FAMILY:")
-	for _, cf := range ColumnFamilyNames {
-		count := pi.cfCounts[cf]
+	for _, cfName := range cf.Names {
+		count := pi.cfCounts[cfName]
 		pct := float64(count) / float64(total) * 100
-		pi.logger.Info("  CF %s: %12s (%.2f%%)", cf, helpers.FormatNumber(int64(count)), pct)
+		pi.logger.Info("  CF %s: %12s (%.2f%%)", cfName, helpers.FormatNumber(int64(count)), pct)
 	}
 	pi.logger.Info("")
 }
@@ -773,7 +777,7 @@ func (pas *ParallelAggregatedStats) AvgWallClockPerLedger() time.Duration {
 }
 
 // LogSummary logs the final summary
-func (pas *ParallelAggregatedStats) LogSummary(logger Logger) {
+func (pas *ParallelAggregatedStats) LogSummary(logger interfaces.Logger) {
 	pas.mu.Lock()
 	defer pas.mu.Unlock()
 
@@ -854,10 +858,10 @@ func (pas *ParallelAggregatedStats) LogSummary(logger Logger) {
 //   - error if ingestion fails
 func RunParallelIngestion(
 	config *Config,
-	store TxHashStore,
-	meta MetaStore,
-	logger Logger,
-	memory *MemoryMonitor,
+	store interfaces.TxHashStore,
+	meta interfaces.MetaStore,
+	logger interfaces.Logger,
+	memory *memory.MemoryMonitor,
 	startFromLedger uint32,
 ) error {
 	ingesterConfig := ParallelIngestionConfig{

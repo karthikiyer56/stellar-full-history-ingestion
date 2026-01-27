@@ -856,6 +856,7 @@ go test ./...
 | `store.go` | RocksDB operations |
 | `meta_store.go` | Checkpoint persistence |
 | `ingest.go` | LFS reading and txHash extraction |
+| `parallel_ingest.go` | Parallel ingestion with readers/workers/collector |
 | `compact.go` | RocksDB compaction |
 | `recsplit.go` | RecSplit index building |
 | `verify.go` | Index verification |
@@ -863,6 +864,129 @@ go test ./...
 | `logger.go` | Logging infrastructure |
 | `stats.go` | Statistics collection |
 | `memory.go` | Memory monitoring |
+
+## Standalone Utilities
+
+In addition to the main workflow, this package includes two standalone utilities for working with existing RocksDB stores without running the full pipeline.
+
+### query-benchmark
+
+Benchmarks query performance against a compacted RocksDB store. Useful for testing lookup latency without running the full workflow.
+
+#### Building
+
+```bash
+cd query-benchmark
+go build .
+```
+
+#### Usage
+
+```bash
+./query-benchmark \
+  --rocksdb-path /path/to/rocksdb \
+  --query-file /path/to/queries.txt \
+  --output /path/to/results.csv \
+  --log /path/to/benchmark.log \
+  --block-cache-mb 8192
+```
+
+#### Flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--rocksdb-path` | Yes | - | Path to existing RocksDB store |
+| `--query-file` | Yes | - | Path to query file (one txHash per line, 64 hex chars) |
+| `--output` | No | query-results.csv | Path to CSV output |
+| `--log` | No | query-benchmark.log | Path to log file |
+| `--block-cache-mb` | No | 8192 | RocksDB block cache size in MB |
+
+#### Output
+
+**CSV file** (`--output`):
+```
+txHash,ledgerSeq,queryTimeUs
+a1b2c3d4e5f6...,12345678,42
+b2c3d4e5f6a1...,-1,38       # -1 means not found
+```
+
+**Log file** (`--log`):
+- Configuration summary
+- Latency statistics: min, max, avg, stddev, p50, p90, p95, p99
+- Found vs not-found breakdown
+- Queries per second
+
+### build-recsplit
+
+Builds RecSplit minimal perfect hash indexes from a compacted RocksDB store. This is a standalone alternative to the RecSplit phase in the main workflow.
+
+**Key Feature**: Discovers key counts by iterating each CF (no meta store dependency). This makes it truly standalone and useful for building indexes from any compatible RocksDB store.
+
+#### Building
+
+```bash
+cd build-recsplit
+go build .
+```
+
+#### Usage
+
+```bash
+# Sequential mode (lower memory, one CF at a time)
+./build-recsplit \
+  --rocksdb-path /path/to/rocksdb \
+  --output-dir /path/to/indexes \
+  --log /path/to/build.log \
+  --error /path/to/build.err \
+  --block-cache-mb 8192
+
+# Parallel mode (higher memory, all 16 CFs simultaneously)
+./build-recsplit \
+  --rocksdb-path /path/to/rocksdb \
+  --output-dir /path/to/indexes \
+  --log /path/to/build.log \
+  --error /path/to/build.err \
+  --parallel \
+  --block-cache-mb 8192
+```
+
+#### Flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--rocksdb-path` | Yes | - | Path to existing RocksDB store |
+| `--output-dir` | Yes | - | Directory for RecSplit index files |
+| `--log` | Yes | - | Path to log file |
+| `--error` | Yes | - | Path to error log file |
+| `--parallel` | No | false | Build 16 indexes in parallel |
+| `--block-cache-mb` | No | 8192 | RocksDB block cache size in MB |
+
+#### Output
+
+```
+<output-dir>/
+├── index/
+│   ├── cf-0.idx
+│   ├── cf-1.idx
+│   ├── ...
+│   └── cf-f.idx
+└── tmp/              # Cleaned up after build
+```
+
+#### Memory Requirements
+
+| Mode | Peak Memory | Notes |
+|------|-------------|-------|
+| Sequential | ~9 GB | One CF at a time (~40 bytes/key) |
+| Parallel | ~144 GB | All 16 CFs simultaneously |
+
+#### Log Output
+
+The log file includes:
+- Key count discovery phase (per-CF iteration)
+- Memory estimates before build
+- Per-CF build progress and timing
+- Final summary with total keys, build time, and index sizes
 
 ## License
 

@@ -1,60 +1,32 @@
 // =============================================================================
-// verify.go - RecSplit Verification Phase
+// pkg/verify/verify.go - RecSplit Verification Phase
 // =============================================================================
 //
-// This file implements the verification phase that validates RecSplit indexes
+// This package implements the verification phase that validates RecSplit indexes
 // against the RocksDB data.
-//
-// VERIFICATION APPROACH:
-//
-//	For each column family:
-//	  1. Open the RecSplit index
-//	  2. Iterate over all keys in RocksDB
-//	  3. Look up each key in RecSplit
-//	  4. Verify the returned value matches RocksDB
-//
-// ERROR HANDLING:
-//
-//	Verification failures are LOGGED but do NOT abort the process.
-//	This allows the entire dataset to be verified even if some entries fail.
-//
-//	Types of failures:
-//	  - Key not found in RecSplit (should never happen)
-//	  - Value mismatch (ledgerSeq differs)
-//	  - RecSplit returns wrong offset (indicates corruption)
-//
-// CRASH RECOVERY:
-//
-//	The verify_cf field in meta store tracks the current CF being verified.
-//	On restart, verification resumes from the beginning of that CF.
-//	(We don't track intra-CF progress since verification is fast.)
-//
-// STATISTICS:
-//
-//	- Keys verified per CF
-//	- Failures per CF
-//	- Verification time per CF
-//	- Overall success rate
 //
 // =============================================================================
 
-package main
+package verify
 
 import (
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"path/filepath"
 	"time"
 
 	"github.com/erigontech/erigon/db/recsplit"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
 
 // =============================================================================
 // Verification Stats
 // =============================================================================
 
-// VerifyStats holds statistics from the verification phase.
-type VerifyStats struct {
+// Stats holds statistics from the verification phase.
+type Stats struct {
 	// StartTime when verification began
 	StartTime time.Time
 
@@ -65,7 +37,7 @@ type VerifyStats struct {
 	TotalTime time.Duration
 
 	// PerCFStats holds per-CF verification statistics
-	PerCFStats map[string]*VerifyCFStats
+	PerCFStats map[string]*CFStats
 
 	// TotalKeysVerified is the total number of keys verified
 	TotalKeysVerified uint64
@@ -77,8 +49,8 @@ type VerifyStats struct {
 	SuccessRate float64
 }
 
-// VerifyCFStats holds per-CF verification statistics.
-type VerifyCFStats struct {
+// CFStats holds per-CF verification statistics.
+type CFStats struct {
 	CFName        string
 	KeysVerified  uint64
 	Failures      uint64
@@ -86,15 +58,15 @@ type VerifyCFStats struct {
 	KeysPerSecond float64
 }
 
-// NewVerifyStats creates a new VerifyStats.
-func NewVerifyStats() *VerifyStats {
-	return &VerifyStats{
-		PerCFStats: make(map[string]*VerifyCFStats),
+// NewStats creates a new Stats.
+func NewStats() *Stats {
+	return &Stats{
+		PerCFStats: make(map[string]*CFStats),
 	}
 }
 
 // LogSummary logs a summary of verification results.
-func (vs *VerifyStats) LogSummary(logger Logger) {
+func (vs *Stats) LogSummary(logger interfaces.Logger) {
 	logger.Separator()
 	logger.Info("                    VERIFICATION SUMMARY")
 	logger.Separator()
@@ -108,11 +80,11 @@ func (vs *VerifyStats) LogSummary(logger Logger) {
 
 	var totalKeys, totalFailures uint64
 
-	for _, cf := range ColumnFamilyNames {
-		stats := vs.PerCFStats[cf]
+	for _, cfName := range cf.Names {
+		stats := vs.PerCFStats[cfName]
 		if stats != nil {
 			logger.Info("%-4s %15s %10d %12v %15.0f",
-				cf,
+				cfName,
 				helpers.FormatNumber(int64(stats.KeysVerified)),
 				stats.Failures,
 				stats.VerifyTime,
@@ -153,12 +125,12 @@ func (vs *VerifyStats) LogSummary(logger Logger) {
 
 // Verifier handles verification of RecSplit indexes against RocksDB data.
 type Verifier struct {
-	store     TxHashStore
-	meta      MetaStore
+	store     interfaces.TxHashStore
+	meta      interfaces.MetaStore
 	indexPath string
-	logger    Logger
-	memory    *MemoryMonitor
-	stats     *VerifyStats
+	logger    interfaces.Logger
+	memory    interfaces.MemoryMonitor
+	stats     *Stats
 
 	// resumeFromCF is the CF to resume from (empty = start from beginning)
 	resumeFromCF string
@@ -172,14 +144,14 @@ type Verifier struct {
 //   - indexPath: Directory containing RecSplit index files
 //   - resumeFromCF: CF to resume from (empty = start from beginning)
 //   - logger: Logger instance
-//   - memory: Memory monitor
+//   - mem: Memory monitor
 func NewVerifier(
-	store TxHashStore,
-	meta MetaStore,
+	store interfaces.TxHashStore,
+	meta interfaces.MetaStore,
 	indexPath string,
 	resumeFromCF string,
-	logger Logger,
-	memory *MemoryMonitor,
+	logger interfaces.Logger,
+	mem interfaces.MemoryMonitor,
 ) *Verifier {
 	return &Verifier{
 		store:        store,
@@ -187,13 +159,13 @@ func NewVerifier(
 		indexPath:    indexPath,
 		resumeFromCF: resumeFromCF,
 		logger:       logger,
-		memory:       memory,
-		stats:        NewVerifyStats(),
+		memory:       mem,
+		stats:        NewStats(),
 	}
 }
 
 // Run executes the verification phase.
-func (v *Verifier) Run() (*VerifyStats, error) {
+func (v *Verifier) Run() (*Stats, error) {
 	v.stats.StartTime = time.Now()
 
 	v.logger.Separator()
@@ -209,8 +181,8 @@ func (v *Verifier) Run() (*VerifyStats, error) {
 	// Determine starting CF index
 	startIdx := 0
 	if v.resumeFromCF != "" {
-		for i, cf := range ColumnFamilyNames {
-			if cf == v.resumeFromCF {
+		for i, cfName := range cf.Names {
+			if cfName == v.resumeFromCF {
 				startIdx = i
 				break
 			}
@@ -218,8 +190,8 @@ func (v *Verifier) Run() (*VerifyStats, error) {
 	}
 
 	// Verify each CF
-	for i := startIdx; i < len(ColumnFamilyNames); i++ {
-		cfName := ColumnFamilyNames[i]
+	for i := startIdx; i < len(cf.Names); i++ {
+		cfName := cf.Names[i]
 
 		// Update progress in meta store
 		if err := v.meta.SetVerifyCF(cfName); err != nil {
@@ -272,8 +244,8 @@ func (v *Verifier) Run() (*VerifyStats, error) {
 }
 
 // verifyCF verifies a single column family.
-func (v *Verifier) verifyCF(cfName string) (*VerifyCFStats, error) {
-	stats := &VerifyCFStats{
+func (v *Verifier) verifyCF(cfName string) (*CFStats, error) {
+	stats := &CFStats{
 		CFName: cfName,
 	}
 
@@ -296,14 +268,14 @@ func (v *Verifier) verifyCF(cfName string) (*VerifyCFStats, error) {
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		expectedValue := iter.Value()
-		expectedLedgerSeq := ParseLedgerSeq(expectedValue)
+		expectedLedgerSeq := types.ParseLedgerSeq(expectedValue)
 
 		// Look up in RecSplit
 		offset, found := reader.Lookup(key)
 		if !found {
 			stats.Failures++
 			v.logger.Error("CF %s: Key %s not found in RecSplit",
-				cfName, BytesToHex(key))
+				cfName, types.BytesToHex(key))
 			continue
 		}
 
@@ -313,7 +285,7 @@ func (v *Verifier) verifyCF(cfName string) (*VerifyCFStats, error) {
 		if actualLedgerSeq != expectedLedgerSeq {
 			stats.Failures++
 			v.logger.Error("CF %s: Key %s value mismatch: expected %d, got %d",
-				cfName, BytesToHex(key), expectedLedgerSeq, actualLedgerSeq)
+				cfName, types.BytesToHex(key), expectedLedgerSeq, actualLedgerSeq)
 			continue
 		}
 
@@ -333,33 +305,8 @@ func (v *Verifier) verifyCF(cfName string) (*VerifyCFStats, error) {
 }
 
 // GetStats returns the verification statistics.
-func (v *Verifier) GetStats() *VerifyStats {
+func (v *Verifier) GetStats() *Stats {
 	return v.stats
-}
-
-// =============================================================================
-// Convenience Function
-// =============================================================================
-
-// RunVerification is a convenience function to run the verification phase.
-func RunVerification(
-	store TxHashStore,
-	meta MetaStore,
-	config *Config,
-	logger Logger,
-	memory *MemoryMonitor,
-	resumeFromCF string,
-) (*VerifyStats, error) {
-	verifier := NewVerifier(
-		store,
-		meta,
-		config.RecsplitIndexPath,
-		resumeFromCF,
-		logger,
-		memory,
-	)
-
-	return verifier.Run()
 }
 
 // =============================================================================
@@ -379,25 +326,23 @@ func RunVerification(
 // RETURNS:
 //   - failures: Number of failed verifications
 //   - error: If an unrecoverable error occurred
-func QuickVerify(store TxHashStore, indexPath string, sampleSize int, logger Logger) (int, error) {
+func QuickVerify(store interfaces.TxHashStore, indexPath string, sampleSize int, logger interfaces.Logger) (int, error) {
 	logger.Info("Running quick verification (sample size: %d per CF)...", sampleSize)
 
 	totalFailures := 0
 
-	for _, cfName := range ColumnFamilyNames {
+	for _, cfName := range cf.Names {
 		// Open RecSplit index
 		idxPath := filepath.Join(indexPath, fmt.Sprintf("cf-%s.idx", cfName))
 		idx, err := recsplit.OpenIndex(idxPath)
 		if err != nil {
 			return 0, fmt.Errorf("failed to open index for CF %s: %w", cfName, err)
 		}
-		defer idx.Close()
 
 		reader := recsplit.NewIndexReader(idx)
 
 		// Sample keys from RocksDB
 		iter := store.NewIteratorCF(cfName)
-		defer iter.Close()
 
 		sampled := 0
 		failures := 0
@@ -405,7 +350,7 @@ func QuickVerify(store TxHashStore, indexPath string, sampleSize int, logger Log
 		for iter.SeekToFirst(); iter.Valid() && sampled < sampleSize; iter.Next() {
 			key := iter.Key()
 			expectedValue := iter.Value()
-			expectedLedgerSeq := ParseLedgerSeq(expectedValue)
+			expectedLedgerSeq := types.ParseLedgerSeq(expectedValue)
 
 			offset, found := reader.Lookup(key)
 			if !found {
@@ -416,6 +361,9 @@ func QuickVerify(store TxHashStore, indexPath string, sampleSize int, logger Log
 
 			sampled++
 		}
+
+		iter.Close()
+		idx.Close()
 
 		if failures > 0 {
 			logger.Error("CF %s: %d/%d samples failed", cfName, failures, sampled)

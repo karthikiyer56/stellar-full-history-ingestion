@@ -4,6 +4,21 @@ This project contains tools for ingesting and indexing Stellar blockchain ledger
 
 ---
 
+## Code Architecture Principles
+
+### No Wrappers, No Indirection
+- **Delete duplicate code** rather than creating wrapper/re-export files
+- Consumers should import directly from the canonical source package
+- If code exists in `pkg/`, delete local copies and update imports
+- Prefer simplicity over backward compatibility shims
+
+### Single Source of Truth
+- Each type, interface, or utility should exist in exactly ONE place
+- When refactoring: delete the old location, update all consumers
+- Never maintain two copies of the same code
+
+---
+
 ## Code Reuse Requirements
 
 **CRITICAL**: Before writing new utility functions, ALWAYS check existing helpers first.

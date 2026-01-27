@@ -1,46 +1,13 @@
 // =============================================================================
-// recsplit.go - RecSplit Index Building
+// pkg/recsplit/recsplit.go - RecSplit Index Building
 // =============================================================================
 //
-// This file implements the RecSplit building phase that creates perfect hash
+// This package implements the RecSplit building phase that creates perfect hash
 // function indexes from the RocksDB data.
-//
-// WHAT IS RECSPLIT:
-//
-//	RecSplit is a minimal perfect hash function (MPHF) library that maps
-//	each key to a unique integer in [0, n) without collisions.
-//
-//	In our case, we store txHash → ledgerSeq mappings. The RecSplit index
-//	allows O(1) lookup of ledgerSeq given a txHash, with very low memory
-//	overhead (~2 bits per key).
-//
-// BUILDING OPTIONS:
-//
-//	1. Sequential (--parallel-recsplit=false):
-//	   - Build one index per CF, one at a time
-//	   - Memory: ~9 GB peak (for ~220M keys)
-//	   - Slower but lower memory
-//
-//	2. Parallel (--parallel-recsplit=true):
-//	   - Build all 16 CF indexes in parallel
-//	   - Memory: ~144 GB peak (16 × 9 GB)
-//	   - Faster but requires much more RAM
-//
-// INDEX FILE NAMING:
-//
-//	Sequential: Single index file at <recsplit-index>/txhash.idx
-//	Parallel: 16 index files at <recsplit-index>/cf-0.idx through cf-f.idx
-//
-// CRASH RECOVERY:
-//
-//	If RecSplit building is interrupted:
-//	  1. Delete all files in temp directory
-//	  2. Delete all files in index directory
-//	  3. Rebuild from scratch
 //
 // =============================================================================
 
-package main
+package recsplit
 
 import (
 	"context"
@@ -53,6 +20,10 @@ import (
 	erigonlog "github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/recsplit"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/memory"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/types"
 )
 
 // =============================================================================
@@ -60,23 +31,23 @@ import (
 // =============================================================================
 
 const (
-	// RecSplitBucketSize is the bucket size for RecSplit construction.
+	// BucketSize is the bucket size for RecSplit construction.
 	// Larger buckets = faster build but more memory.
-	RecSplitBucketSize = 2000
+	BucketSize = 2000
 
-	// RecSplitLeafSize is the leaf size for RecSplit construction.
-	RecSplitLeafSize = 8
+	// LeafSize is the leaf size for RecSplit construction.
+	LeafSize = 8
 
-	// RecSplitDataVersion is the data format version stored in the index.
-	RecSplitDataVersion = 1
+	// DataVersion is the data format version stored in the index.
+	DataVersion = 1
 )
 
 // =============================================================================
 // RecSplit Builder Stats
 // =============================================================================
 
-// RecSplitStats holds statistics for RecSplit building.
-type RecSplitStats struct {
+// Stats holds statistics for RecSplit building.
+type Stats struct {
 	// StartTime when building began
 	StartTime time.Time
 
@@ -84,7 +55,7 @@ type RecSplitStats struct {
 	EndTime time.Time
 
 	// PerCFStats holds per-CF statistics
-	PerCFStats map[string]*RecSplitCFStats
+	PerCFStats map[string]*CFStats
 
 	// TotalTime is the total build time
 	TotalTime time.Duration
@@ -96,8 +67,8 @@ type RecSplitStats struct {
 	Parallel bool
 }
 
-// RecSplitCFStats holds per-CF RecSplit statistics.
-type RecSplitCFStats struct {
+// CFStats holds per-CF RecSplit statistics.
+type CFStats struct {
 	CFName     string
 	KeyCount   uint64
 	BuildTime  time.Duration
@@ -106,16 +77,16 @@ type RecSplitCFStats struct {
 	KeyAddTime time.Duration
 }
 
-// NewRecSplitStats creates a new RecSplitStats.
-func NewRecSplitStats(parallel bool) *RecSplitStats {
-	return &RecSplitStats{
-		PerCFStats: make(map[string]*RecSplitCFStats),
+// NewStats creates a new Stats.
+func NewStats(parallel bool) *Stats {
+	return &Stats{
+		PerCFStats: make(map[string]*CFStats),
 		Parallel:   parallel,
 	}
 }
 
 // LogSummary logs a summary of RecSplit building.
-func (rs *RecSplitStats) LogSummary(logger Logger) {
+func (rs *Stats) LogSummary(logger interfaces.Logger) {
 	logger.Separator()
 	logger.Info("                    RECSPLIT BUILD SUMMARY")
 	logger.Separator()
@@ -135,11 +106,11 @@ func (rs *RecSplitStats) LogSummary(logger Logger) {
 	var totalKeys uint64
 	var totalSize int64
 
-	for _, cf := range ColumnFamilyNames {
-		stats := rs.PerCFStats[cf]
+	for _, cfName := range cf.Names {
+		stats := rs.PerCFStats[cfName]
 		if stats != nil {
 			logger.Info("%-4s %15s %12v %12s",
-				cf,
+				cfName,
 				helpers.FormatNumber(int64(stats.KeyCount)),
 				stats.BuildTime,
 				helpers.FormatBytes(stats.IndexSize))
@@ -157,19 +128,19 @@ func (rs *RecSplitStats) LogSummary(logger Logger) {
 // RecSplit Builder
 // =============================================================================
 
-// RecSplitBuilder handles building RecSplit indexes from RocksDB data.
-type RecSplitBuilder struct {
-	store     TxHashStore
+// Builder handles building RecSplit indexes from RocksDB data.
+type Builder struct {
+	store     interfaces.TxHashStore
 	cfCounts  map[string]uint64
 	indexPath string
 	tmpPath   string
 	parallel  bool
-	logger    Logger
-	memory    *MemoryMonitor
-	stats     *RecSplitStats
+	logger    interfaces.Logger
+	memory    interfaces.MemoryMonitor
+	stats     *Stats
 }
 
-// NewRecSplitBuilder creates a new RecSplitBuilder.
+// NewBuilder creates a new RecSplit Builder.
 //
 // PARAMETERS:
 //   - store: RocksDB store to read data from
@@ -178,30 +149,30 @@ type RecSplitBuilder struct {
 //   - tmpPath: Directory for temporary files during build
 //   - parallel: Whether to build indexes in parallel
 //   - logger: Logger instance
-//   - memory: Memory monitor
-func NewRecSplitBuilder(
-	store TxHashStore,
+//   - mem: Memory monitor
+func NewBuilder(
+	store interfaces.TxHashStore,
 	cfCounts map[string]uint64,
 	indexPath string,
 	tmpPath string,
 	parallel bool,
-	logger Logger,
-	memory *MemoryMonitor,
-) *RecSplitBuilder {
-	return &RecSplitBuilder{
+	logger interfaces.Logger,
+	mem interfaces.MemoryMonitor,
+) *Builder {
+	return &Builder{
 		store:     store,
 		cfCounts:  cfCounts,
 		indexPath: indexPath,
 		tmpPath:   tmpPath,
 		parallel:  parallel,
 		logger:    logger,
-		memory:    memory,
-		stats:     NewRecSplitStats(parallel),
+		memory:    mem,
+		stats:     NewStats(parallel),
 	}
 }
 
 // Run executes the RecSplit building phase.
-func (b *RecSplitBuilder) Run() (*RecSplitStats, error) {
+func (b *Builder) Run() (*Stats, error) {
 	b.stats.StartTime = time.Now()
 
 	b.logger.Separator()
@@ -215,7 +186,7 @@ func (b *RecSplitBuilder) Run() (*RecSplitStats, error) {
 	}
 
 	// Log memory estimate
-	LogRecSplitMemoryEstimate(b.logger, b.cfCounts, b.parallel)
+	memory.LogRecSplitMemoryEstimate(b.logger, b.cfCounts, b.parallel)
 
 	// Build indexes
 	var err error
@@ -247,7 +218,7 @@ func (b *RecSplitBuilder) Run() (*RecSplitStats, error) {
 }
 
 // cleanupDirectories removes existing temp and index files.
-func (b *RecSplitBuilder) cleanupDirectories() error {
+func (b *Builder) cleanupDirectories() error {
 	b.logger.Info("Cleaning up existing files...")
 
 	// Clean temp directory
@@ -273,11 +244,11 @@ func (b *RecSplitBuilder) cleanupDirectories() error {
 }
 
 // buildSequential builds indexes one CF at a time.
-func (b *RecSplitBuilder) buildSequential() error {
+func (b *Builder) buildSequential() error {
 	b.logger.Info("Building indexes sequentially (one CF at a time)...")
 	b.logger.Info("")
 
-	for i, cfName := range ColumnFamilyNames {
+	for i, cfName := range cf.Names {
 		keyCount := b.cfCounts[cfName]
 		if keyCount == 0 {
 			b.logger.Info("[%2d/16] CF [%s]: No keys, skipping", i+1, cfName)
@@ -304,7 +275,7 @@ func (b *RecSplitBuilder) buildSequential() error {
 }
 
 // buildParallel builds all 16 CF indexes in parallel.
-func (b *RecSplitBuilder) buildParallel() error {
+func (b *Builder) buildParallel() error {
 	b.logger.Info("Building indexes in parallel (16 CFs simultaneously)...")
 	b.logger.Info("")
 	b.logger.Info("WARNING: This requires ~144 GB of RAM!")
@@ -312,28 +283,28 @@ func (b *RecSplitBuilder) buildParallel() error {
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	errors := make([]error, len(ColumnFamilyNames))
+	errors := make([]error, len(cf.Names))
 
-	for i, cfName := range ColumnFamilyNames {
+	for i, cfName := range cf.Names {
 		wg.Add(1)
-		go func(idx int, cf string) {
+		go func(idx int, cfn string) {
 			defer wg.Done()
 
-			keyCount := b.cfCounts[cf]
+			keyCount := b.cfCounts[cfn]
 			if keyCount == 0 {
 				return
 			}
 
-			stats, err := b.buildCFIndex(cf, keyCount)
+			stats, err := b.buildCFIndex(cfn, keyCount)
 			if err != nil {
-				errors[idx] = fmt.Errorf("CF %s: %w", cf, err)
+				errors[idx] = fmt.Errorf("CF %s: %w", cfn, err)
 				return
 			}
 
 			mu.Lock()
-			b.stats.PerCFStats[cf] = stats
+			b.stats.PerCFStats[cfn] = stats
 			b.logger.Info("CF [%s] completed: %s keys in %v",
-				cf, helpers.FormatNumber(int64(stats.KeyCount)), stats.BuildTime)
+				cfn, helpers.FormatNumber(int64(stats.KeyCount)), stats.BuildTime)
 			mu.Unlock()
 		}(i, cfName)
 	}
@@ -351,8 +322,8 @@ func (b *RecSplitBuilder) buildParallel() error {
 }
 
 // buildCFIndex builds a RecSplit index for a single column family.
-func (b *RecSplitBuilder) buildCFIndex(cfName string, keyCount uint64) (*RecSplitCFStats, error) {
-	stats := &RecSplitCFStats{
+func (b *Builder) buildCFIndex(cfName string, keyCount uint64) (*CFStats, error) {
+	stats := &CFStats{
 		CFName:   cfName,
 		KeyCount: keyCount,
 	}
@@ -377,12 +348,12 @@ func (b *RecSplitBuilder) buildCFIndex(cfName string, keyCount uint64) (*RecSpli
 		KeyCount:           int(keyCount),
 		Enums:              false, // We store ledgerSeq values, not sequential offsets
 		LessFalsePositives: true,
-		BucketSize:         RecSplitBucketSize,
-		LeafSize:           RecSplitLeafSize,
+		BucketSize:         BucketSize,
+		LeafSize:           LeafSize,
 		TmpDir:             cfTmpDir,
 		IndexFile:          indexPath,
 		BaseDataID:         0,
-		Version:            RecSplitDataVersion,
+		Version:            DataVersion,
 	}, erigonLogger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create RecSplit: %w", err)
@@ -400,7 +371,7 @@ func (b *RecSplitBuilder) buildCFIndex(cfName string, keyCount uint64) (*RecSpli
 		value := iter.Value()
 
 		// Parse ledger sequence from value
-		ledgerSeq := ParseLedgerSeq(value)
+		ledgerSeq := types.ParseLedgerSeq(value)
 
 		// Add to RecSplit
 		if err := rs.AddKey(key, uint64(ledgerSeq)); err != nil {
@@ -443,51 +414,20 @@ func (b *RecSplitBuilder) buildCFIndex(cfName string, keyCount uint64) (*RecSpli
 }
 
 // GetStats returns the RecSplit build statistics.
-func (b *RecSplitBuilder) GetStats() *RecSplitStats {
+func (b *Builder) GetStats() *Stats {
 	return b.stats
-}
-
-// =============================================================================
-// Convenience Function
-// =============================================================================
-
-// RunRecSplitBuild is a convenience function to run RecSplit building.
-func RunRecSplitBuild(
-	store TxHashStore,
-	meta MetaStore,
-	config *Config,
-	logger Logger,
-	memory *MemoryMonitor,
-) (*RecSplitStats, error) {
-	// Get CF counts from meta store
-	cfCounts, err := meta.GetCFCounts()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get CF counts: %w", err)
-	}
-
-	builder := NewRecSplitBuilder(
-		store,
-		cfCounts,
-		config.RecsplitIndexPath,
-		config.RecsplitTmpPath,
-		config.ParallelRecsplit,
-		logger,
-		memory,
-	)
-
-	return builder.Run()
 }
 
 // =============================================================================
 // RecSplit Verification Helper
 // =============================================================================
 
-// VerifyRecSplitIndex opens and performs a basic verification of a RecSplit index.
+// VerifyIndex opens and performs a basic verification of a RecSplit index.
 //
 // RETURNS:
 //   - keyCount: Number of keys in the index
 //   - error: If the index is corrupted or unreadable
-func VerifyRecSplitIndex(indexPath string) (uint64, error) {
+func VerifyIndex(indexPath string) (uint64, error) {
 	idx, err := recsplit.OpenIndex(indexPath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open index: %w", err)
@@ -498,4 +438,14 @@ func VerifyRecSplitIndex(indexPath string) (uint64, error) {
 	keyCount := idx.KeyCount()
 
 	return keyCount, nil
+}
+
+// OpenIndex opens a RecSplit index for reading.
+func OpenIndex(indexPath string) (*recsplit.Index, error) {
+	return recsplit.OpenIndex(indexPath)
+}
+
+// NewIndexReader creates a new IndexReader for the given index.
+func NewIndexReader(idx *recsplit.Index) *recsplit.IndexReader {
+	return recsplit.NewIndexReader(idx)
 }
