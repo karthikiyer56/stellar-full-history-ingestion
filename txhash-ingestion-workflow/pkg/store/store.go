@@ -65,6 +65,12 @@ type RocksDBTxHashStore struct {
 //
 // If the store exists, it is opened with the existing column families.
 // If it doesn't exist, it is created with 16 column families.
+//
+// RECOVERY BEHAVIOR:
+// When opening an existing store, RocksDB automatically replays the WAL (Write-Ahead Log)
+// to recover any data that was written but not yet flushed to SST files. This can take
+// significant time (observed ~300 MB/s WAL replay speed). The function logs detailed
+// timing and statistics to help diagnose recovery performance.
 func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger interfaces.Logger) (*RocksDBTxHashStore, error) {
 	// Create Shared Block Cache
 	var blockCache *grocksdb.Cache
@@ -104,9 +110,14 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 	}
 
 	// Open Database with Column Families
+	// This includes WAL replay if there's pending data from a previous crash
 	logger.Info("Opening RocksDB store at: %s", path)
+	logger.Info("  (WAL recovery will occur if there's uncommitted data)")
 
+	openStart := time.Now()
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(opts, path, cfNames, cfOptsList)
+	openDuration := time.Since(openStart)
+
 	if err != nil {
 		// Cleanup on failure
 		opts.Destroy()
@@ -133,17 +144,8 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 		cfIndexMap[name] = i
 	}
 
-	// Log Configuration
-	memtables := settings.WriteBufferSizeMB * settings.MaxWriteBufferNumber * len(cf.Names)
-	logger.Info("RocksDB store opened successfully:")
-	logger.Info("  Column Families: %d", len(cfHandles)-1) // -1 for default
-	logger.Info("  MemTable RAM:    %d MB", memtables)
-	logger.Info("  Block Cache:     %d MB", settings.BlockCacheSizeMB)
-	logger.Info("  Bloom Filter:    %d bits/key", settings.BloomFilterBitsPerKey)
-	logger.Info("  WAL:             ENABLED (always)")
-	logger.Info("  Auto-Compaction: DISABLED (manual phase)")
-
-	return &RocksDBTxHashStore{
+	// Create the store instance
+	store := &RocksDBTxHashStore{
 		db:         db,
 		opts:       opts,
 		cfHandles:  cfHandles,
@@ -154,7 +156,22 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 		path:       path,
 		cfIndexMap: cfIndexMap,
 		logger:     logger,
-	}, nil
+	}
+
+	// Log Configuration
+	memtables := settings.WriteBufferSizeMB * settings.MaxWriteBufferNumber * len(cf.Names)
+	logger.Info("RocksDB store opened successfully in %s:", helpers.FormatDuration(openDuration))
+	logger.Info("  Column Families: %d", len(cfHandles)-1) // -1 for default
+	logger.Info("  MemTable RAM:    %d MB", memtables)
+	logger.Info("  Block Cache:     %d MB", settings.BlockCacheSizeMB)
+	logger.Info("  Bloom Filter:    %d bits/key", settings.BloomFilterBitsPerKey)
+	logger.Info("  WAL:             ENABLED (always)")
+	logger.Info("  Auto-Compaction: DISABLED (manual phase)")
+
+	// Log detailed store stats (SST files, WAL size, etc.)
+	store.logStoreStats(openDuration)
+
+	return store, nil
 }
 
 // createCFOptions creates options for a data column family.
@@ -501,6 +518,140 @@ func (s *RocksDBTxHashStore) Close() {
 // Path returns the filesystem path to the RocksDB store.
 func (s *RocksDBTxHashStore) Path() string {
 	return s.path
+}
+
+// =============================================================================
+// Store Statistics and Recovery Logging
+// =============================================================================
+
+// logStoreStats logs detailed RocksDB statistics after opening.
+// This is especially useful for diagnosing recovery performance.
+func (s *RocksDBTxHashStore) logStoreStats(openDuration time.Duration) {
+	s.logger.Info("")
+	s.logger.Info("ROCKSDB STORE STATISTICS (after open):")
+
+	// Get database-wide properties
+	// Note: Some properties are CF-specific, so we'll aggregate across CFs
+
+	// WAL Statistics (database-wide)
+	walFilesNum := s.db.GetProperty("rocksdb.num-live-versions")
+	curSizeActiveMemTable := s.db.GetProperty("rocksdb.cur-size-active-mem-table")
+	curSizeAllMemTables := s.db.GetProperty("rocksdb.cur-size-all-mem-tables")
+	sizeAllMemTables := s.db.GetProperty("rocksdb.size-all-mem-tables")
+	numEntriesActiveMemTable := s.db.GetProperty("rocksdb.num-entries-active-mem-table")
+	numEntriesImmMemTables := s.db.GetProperty("rocksdb.num-entries-imm-mem-tables")
+
+	s.logger.Info("")
+	s.logger.Info("  MEMTABLE STATE:")
+	s.logger.Info("    Active MemTable Size:     %s", formatPropertyBytes(curSizeActiveMemTable))
+	s.logger.Info("    All MemTables Size:       %s", formatPropertyBytes(curSizeAllMemTables))
+	s.logger.Info("    MemTables + Pending Flush: %s", formatPropertyBytes(sizeAllMemTables))
+	s.logger.Info("    Active MemTable Entries:  %s", numEntriesActiveMemTable)
+	s.logger.Info("    Immutable MemTable Entries: %s", numEntriesImmMemTables)
+	s.logger.Info("    Live Versions:            %s", walFilesNum)
+
+	// Aggregate SST stats across all CFs
+	var totalSSTFiles, totalSSTSize, totalKeys int64
+	var totalL0Files int64
+
+	for _, cfName := range cf.Names {
+		cfHandle := s.getCFHandleByName(cfName)
+
+		// SST files
+		sstFilesSize := s.db.GetPropertyCF("rocksdb.total-sst-files-size", cfHandle)
+		numSSTFiles := s.db.GetPropertyCF("rocksdb.num-files-at-level0", cfHandle)
+		estimatedKeys := s.db.GetPropertyCF("rocksdb.estimate-num-keys", cfHandle)
+
+		var size, files, keys int64
+		fmt.Sscanf(sstFilesSize, "%d", &size)
+		fmt.Sscanf(numSSTFiles, "%d", &files)
+		fmt.Sscanf(estimatedKeys, "%d", &keys)
+
+		totalSSTSize += size
+		totalL0Files += files
+		totalKeys += keys
+
+		// Count files at all levels
+		for level := 0; level <= 6; level++ {
+			numAtLevel := s.db.GetPropertyCF(fmt.Sprintf("rocksdb.num-files-at-level%d", level), cfHandle)
+			var n int64
+			fmt.Sscanf(numAtLevel, "%d", &n)
+			totalSSTFiles += n
+		}
+	}
+
+	s.logger.Info("")
+	s.logger.Info("  SST FILE STATISTICS (all CFs):")
+	s.logger.Info("    Total SST Files:          %s", helpers.FormatNumber(totalSSTFiles))
+	s.logger.Info("    L0 Files (unflushed):     %s", helpers.FormatNumber(totalL0Files))
+	s.logger.Info("    Total SST Size:           %s", helpers.FormatBytes(totalSSTSize))
+	s.logger.Info("    Estimated Total Keys:     %s", helpers.FormatNumber(totalKeys))
+
+	// Log timing analysis
+	s.logger.Info("")
+	s.logger.Info("  OPEN TIMING ANALYSIS:")
+	s.logger.Info("    Total Open Time:          %s", helpers.FormatDuration(openDuration))
+
+	// Estimate if WAL replay occurred
+	// WAL replay at ~300 MB/s, so 583 MB WAL would take ~2 seconds
+	// If open time is significantly more, there might be other factors
+	if openDuration > 5*time.Second {
+		s.logger.Info("    NOTE: Long open time may indicate WAL recovery")
+		s.logger.Info("          WAL recovery typically processes ~300 MB/s")
+		s.logger.Info("          Check the MemTable entries above for recovered data")
+	}
+
+	// Log per-CF breakdown for debugging if there are many keys
+	if totalKeys > 0 {
+		s.logger.Info("")
+		s.logger.Info("  PER-CF ESTIMATED KEYS:")
+		for _, cfName := range cf.Names {
+			cfHandle := s.getCFHandleByName(cfName)
+			estimatedKeys := s.db.GetPropertyCF("rocksdb.estimate-num-keys", cfHandle)
+			var keys int64
+			fmt.Sscanf(estimatedKeys, "%d", &keys)
+			if keys > 0 {
+				s.logger.Info("    CF [%s]: %s", cfName, helpers.FormatNumber(keys))
+			}
+		}
+	}
+
+	s.logger.Info("")
+}
+
+// GetLiveDataSize returns the total size of live data in the store.
+// This includes MemTables and SST files.
+func (s *RocksDBTxHashStore) GetLiveDataSize() int64 {
+	var totalSize int64
+
+	for _, cfName := range cf.Names {
+		cfHandle := s.getCFHandleByName(cfName)
+		sstFilesSize := s.db.GetPropertyCF("rocksdb.total-sst-files-size", cfHandle)
+		var size int64
+		fmt.Sscanf(sstFilesSize, "%d", &size)
+		totalSize += size
+	}
+
+	// Add MemTable size
+	memTableSize := s.db.GetProperty("rocksdb.cur-size-all-mem-tables")
+	var memSize int64
+	fmt.Sscanf(memTableSize, "%d", &memSize)
+	totalSize += memSize
+
+	return totalSize
+}
+
+// formatPropertyBytes formats a RocksDB property value (string bytes) as human-readable size.
+func formatPropertyBytes(propValue string) string {
+	if propValue == "" {
+		return "N/A"
+	}
+	var bytes int64
+	_, err := fmt.Sscanf(propValue, "%d", &bytes)
+	if err != nil {
+		return propValue
+	}
+	return helpers.FormatBytes(bytes)
 }
 
 // =============================================================================

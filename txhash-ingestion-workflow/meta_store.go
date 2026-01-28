@@ -588,6 +588,7 @@ func CheckResumability(meta interfaces.MetaStore, configStart, configEnd uint32)
 }
 
 // LogResumeState logs information about resuming a workflow.
+// This provides detailed information about the checkpoint state for debugging.
 func LogResumeState(meta interfaces.MetaStore, logger interfaces.Logger, resumeFrom uint32, phase types.Phase) {
 	logger.Separator()
 	logger.Info("                        RESUMING WORKFLOW")
@@ -597,9 +598,21 @@ func LogResumeState(meta interfaces.MetaStore, logger interfaces.Logger, resumeF
 	logger.Info("")
 	logger.Info("  Resume Phase:          %s", phase)
 
+	// Get stored configuration
+	storedStart, _ := meta.GetStartLedger()
+	storedEnd, _ := meta.GetEndLedger()
+
+	logger.Info("")
+	logger.Info("STORED CONFIGURATION:")
+	logger.Info("  Start Ledger:          %s", helpers.FormatNumber(int64(storedStart)))
+	logger.Info("  End Ledger:            %s", helpers.FormatNumber(int64(storedEnd)))
+	logger.Info("  Total Ledgers:         %s", helpers.FormatNumber(int64(storedEnd-storedStart+1)))
+
 	switch phase {
 	case types.PhaseIngesting:
-		logger.Info("  Resume From Ledger:    %d", resumeFrom)
+		logger.Info("")
+		logger.Info("INGESTION PROGRESS:")
+		logger.Info("  Resume From Ledger:    %s", helpers.FormatNumber(int64(resumeFrom)))
 		lastCommitted, _ := meta.GetLastCommittedLedger()
 		if lastCommitted > 0 {
 			cfCounts, _ := meta.GetCFCounts()
@@ -607,22 +620,66 @@ func LogResumeState(meta interfaces.MetaStore, logger interfaces.Logger, resumeF
 			for _, count := range cfCounts {
 				total += count
 			}
-			logger.Info("  Last Committed:        %d", lastCommitted)
-			logger.Info("  Entries So Far:        %s", helpers.FormatNumber(int64(total)))
+			logger.Info("  Last Committed:        %s", helpers.FormatNumber(int64(lastCommitted)))
+			logger.Info("  Ledgers Processed:     %s", helpers.FormatNumber(int64(lastCommitted-storedStart+1)))
+			logger.Info("  Ledgers Remaining:     %s", helpers.FormatNumber(int64(storedEnd-lastCommitted)))
+			percentDone := float64(lastCommitted-storedStart+1) / float64(storedEnd-storedStart+1) * 100
+			logger.Info("  Progress:              %.1f%%", percentDone)
+			logger.Info("  Entries Ingested:      %s", helpers.FormatNumber(int64(total)))
+
+			// Show per-CF breakdown
+			logger.Info("")
+			logger.Info("PER-CF ENTRY COUNTS (from checkpoint):")
+			for _, cfName := range cf.Names {
+				count := cfCounts[cfName]
+				logger.Info("  CF [%s]: %s", cfName, helpers.FormatNumber(int64(count)))
+			}
+		} else {
+			logger.Info("  Last Committed:        (none - starting fresh)")
 		}
 
 	case types.PhaseCompacting:
-		logger.Info("  Action:                Restart compaction for all CFs")
+		logger.Info("")
+		logger.Info("COMPACTION RECOVERY:")
+		logger.Info("  Action:                Restart compaction for all 16 CFs")
+		logger.Info("  Note:                  Compaction is idempotent, safe to restart")
+
+		// Show CF counts that will be compacted
+		cfCounts, _ := meta.GetCFCounts()
+		var total uint64
+		for _, count := range cfCounts {
+			total += count
+		}
+		logger.Info("  Total Entries:         %s", helpers.FormatNumber(int64(total)))
 
 	case types.PhaseBuildingRecsplit:
-		logger.Info("  Action:                Rebuild all RecSplit indexes")
+		logger.Info("")
+		logger.Info("RECSPLIT RECOVERY:")
+		logger.Info("  Action:                Delete temp/index files, rebuild from scratch")
+		logger.Info("  Note:                  RecSplit building is not resumable mid-build")
+
+		cfCounts, _ := meta.GetCFCounts()
+		var total uint64
+		for _, count := range cfCounts {
+			total += count
+		}
+		logger.Info("  Total Keys to Index:   %s", helpers.FormatNumber(int64(total)))
 
 	case types.PhaseVerifyingRecsplit:
+		logger.Info("")
+		logger.Info("VERIFICATION RECOVERY:")
 		verifyCF, _ := meta.GetVerifyCF()
-		logger.Info("  Resume From CF:        %s", verifyCF)
+		if verifyCF != "" {
+			logger.Info("  Resume From CF:        %s", verifyCF)
+		}
+		logger.Info("  Action:                Re-run verification for all 16 CFs")
+		logger.Info("  Note:                  Verification is idempotent")
 
 	case types.PhaseComplete:
+		logger.Info("")
+		logger.Info("STATUS:")
 		logger.Info("  Status:                Already complete")
+		logger.Info("  Action:                No work needed")
 	}
 
 	logger.Info("")
