@@ -5,6 +5,20 @@
 // This file implements the ingestion phase that reads ledgers from LFS,
 // extracts transaction hashes, and writes txHash→ledgerSeq mappings to RocksDB.
 //
+// USAGE:
+//
+//	ingester := NewIngester(ingest.Config{
+//	    LFSStorePath: "/path/to/lfs",
+//	    StartLedger:  1,
+//	    EndLedger:    1000000,
+//	    BatchSize:    1000,
+//	    Store:        txHashStore,
+//	    Meta:         metaStore,
+//	    Logger:       logger,
+//	    Memory:       memoryMonitor,
+//	})
+//	err := ingester.Run()
+//
 // INGESTION WORKFLOW:
 //
 //	1. Read ledgers from LFS store (using LedgerIterator)
@@ -34,6 +48,8 @@
 //	- RocksDB write errors: ABORT (fatal - storage issue)
 //	- Meta store errors: ABORT (fatal - crash recovery compromised)
 //
+// The Ingester uses a scoped logger with [INGEST] prefix for all log messages.
+//
 // =============================================================================
 
 package main
@@ -57,40 +73,47 @@ import (
 )
 
 // =============================================================================
-// Ingestion Configuration
+// Ingester - Main Ingestion Component
 // =============================================================================
 
-// IngestionConfig holds configuration for the ingestion phase.
+// IngestionConfig holds configuration for creating an Ingester.
 type IngestionConfig struct {
-	// LFSStorePath is the path to the LFS ledger store
+	// LFSStorePath is the path to the LFS ledger store (required)
 	LFSStorePath string
 
-	// StartLedger is the first ledger to ingest
+	// StartLedger is the first ledger to ingest (required)
 	StartLedger uint32
 
-	// EndLedger is the last ledger to ingest
+	// EndLedger is the last ledger to ingest (required)
 	EndLedger uint32
 
 	// BatchSize is the number of ledgers per checkpoint (default: 1000)
 	BatchSize int
-}
 
-// =============================================================================
-// Ingester - Main Ingestion Logic
-// =============================================================================
+	// Store is the TxHash store to write to (required)
+	Store interfaces.TxHashStore
+
+	// Meta is the meta store for checkpointing (required)
+	Meta interfaces.MetaStore
+
+	// Logger is the parent logger (required)
+	// A scoped logger with [INGEST] prefix will be created internally
+	Logger interfaces.Logger
+
+	// Memory is the memory monitor for tracking RAM usage (optional)
+	Memory interfaces.MemoryMonitor
+}
 
 // Ingester handles reading from LFS and writing to RocksDB.
 //
-// LIFECYCLE:
-//
-//	ingester := NewIngester(config, store, meta, logger)
-//	err := ingester.Run()
+// The Ingester is designed to be composable - it takes its dependencies
+// via IngestionConfig and uses a scoped logger for all output.
 type Ingester struct {
 	config IngestionConfig
 	store  interfaces.TxHashStore
 	meta   interfaces.MetaStore
-	logger interfaces.Logger
-	memory *memory.MemoryMonitor
+	log    interfaces.Logger // Scoped logger with [INGEST] prefix
+	memory interfaces.MemoryMonitor
 
 	// Statistics
 	aggStats *stats.AggregatedStats
@@ -102,16 +125,26 @@ type Ingester struct {
 	batchEntrySize int
 }
 
-// NewIngester creates a new Ingester.
-func NewIngester(
-	config IngestionConfig,
-	store interfaces.TxHashStore,
-	meta interfaces.MetaStore,
-	logger interfaces.Logger,
-	memory *memory.MemoryMonitor,
-) *Ingester {
+// NewIngester creates a new Ingester with the given configuration.
+//
+// The Ingester creates a scoped logger with [INGEST] prefix internally,
+// so all log messages are automatically prefixed.
+func NewIngester(config IngestionConfig) *Ingester {
+	if config.LFSStorePath == "" {
+		panic("NewIngester: LFSStorePath is required")
+	}
+	if config.Store == nil {
+		panic("NewIngester: Store is required")
+	}
+	if config.Meta == nil {
+		panic("NewIngester: Meta is required")
+	}
+	if config.Logger == nil {
+		panic("NewIngester: Logger is required")
+	}
+
 	// Initialize CF counts from meta store
-	cfCounts, err := meta.GetCFCounts()
+	cfCounts, err := config.Meta.GetCFCounts()
 	if err != nil || cfCounts == nil {
 		cfCounts = make(map[string]uint64)
 		for _, cfName := range cf.Names {
@@ -121,10 +154,10 @@ func NewIngester(
 
 	return &Ingester{
 		config:   config,
-		store:    store,
-		meta:     meta,
-		logger:   logger,
-		memory:   memory,
+		store:    config.Store,
+		meta:     config.Meta,
+		log:      config.Logger.WithScope("INGEST"),
+		memory:   config.Memory,
 		aggStats: stats.NewAggregatedStats(),
 		cfCounts: cfCounts,
 	}
@@ -135,15 +168,15 @@ func NewIngester(
 // Returns an error if ingestion fails. On success, all ledgers have been
 // ingested and progress has been checkpointed to the meta store.
 func (i *Ingester) Run() error {
-	i.logger.Separator()
-	i.logger.Info("                         INGESTION PHASE")
-	i.logger.Separator()
-	i.logger.Info("")
-	i.logger.Info("LFS Store:     %s", i.config.LFSStorePath)
-	i.logger.Info("Ledger Range:  %d - %d", i.config.StartLedger, i.config.EndLedger)
-	i.logger.Info("Total Ledgers: %s", helpers.FormatNumber(int64(i.config.EndLedger-i.config.StartLedger+1)))
-	i.logger.Info("Batch Size:    %d ledgers", i.config.BatchSize)
-	i.logger.Info("")
+	i.log.Separator()
+	i.log.Info("                         INGESTION PHASE")
+	i.log.Separator()
+	i.log.Info("")
+	i.log.Info("LFS Store:     %s", i.config.LFSStorePath)
+	i.log.Info("Ledger Range:  %d - %d", i.config.StartLedger, i.config.EndLedger)
+	i.log.Info("Total Ledgers: %s", helpers.FormatNumber(int64(i.config.EndLedger-i.config.StartLedger+1)))
+	i.log.Info("Batch Size:    %d ledgers", i.config.BatchSize)
+	i.log.Info("")
 
 	// Create LFS iterator
 	iterator, err := lfs.NewLedgerIterator(
@@ -205,7 +238,7 @@ func (i *Ingester) Run() error {
 
 			// Log progress every 10 batches
 			if i.currentBatch.BatchNumber%10 == 0 {
-				progress.LogProgress(i.logger, "Ingestion")
+				progress.LogProgress(i.log, "Ingestion")
 			}
 
 			// Start new batch
@@ -222,20 +255,20 @@ func (i *Ingester) Run() error {
 	}
 
 	// Flush all MemTables to disk
-	i.logger.Info("")
-	i.logger.Info("Flushing all MemTables to disk...")
+	i.log.Info("")
+	i.log.Info("Flushing all MemTables to disk...")
 	flushStart := time.Now()
 	if err := i.store.FlushAll(); err != nil {
 		return fmt.Errorf("failed to flush MemTables: %w", err)
 	}
-	i.logger.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
+	i.log.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
 
 	// Log summary
-	i.aggStats.LogSummary(i.logger)
-	i.aggStats.LogCFSummary(i.logger)
-	i.memory.LogSummary(i.logger)
+	i.aggStats.LogSummary(i.log)
+	i.aggStats.LogCFSummary(i.log)
+	i.memory.LogSummary(i.log)
 
-	i.logger.Sync()
+	i.log.Sync()
 
 	return nil
 }
@@ -320,7 +353,7 @@ func (i *Ingester) commitBatch() error {
 	i.aggStats.AddBatch(batch)
 
 	// Log batch summary
-	batch.LogSummary(i.logger)
+	batch.LogSummary(i.log)
 
 	return nil
 }
@@ -357,6 +390,9 @@ func copyBytes(src []byte) []byte {
 
 // RunIngestion is a convenience function to run the ingestion phase.
 //
+// Deprecated: Use NewIngester(IngestionConfig{...}).Run() instead.
+// This function is kept for backward compatibility.
+//
 // PARAMETERS:
 //   - config: Main configuration
 //   - store: RocksDB data store
@@ -372,17 +408,19 @@ func RunIngestion(
 	store interfaces.TxHashStore,
 	meta interfaces.MetaStore,
 	logger interfaces.Logger,
-	memory *memory.MemoryMonitor,
+	mem *memory.MemoryMonitor,
 	startFromLedger uint32,
 ) error {
-	ingesterConfig := IngestionConfig{
+	ingester := NewIngester(IngestionConfig{
 		LFSStorePath: config.LFSStorePath,
 		StartLedger:  startFromLedger,
 		EndLedger:    config.EndLedger,
 		BatchSize:    LedgersPerBatch,
-	}
-
-	ingester := NewIngester(ingesterConfig, store, meta, logger, memory)
+		Store:        store,
+		Meta:         meta,
+		Logger:       logger,
+		Memory:       mem,
+	})
 	return ingester.Run()
 }
 

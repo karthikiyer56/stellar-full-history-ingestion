@@ -5,10 +5,23 @@
 // This package implements the verification phase that validates RecSplit indexes
 // against the RocksDB data.
 //
+// USAGE:
+//
+//	verifier := verify.New(verify.Config{
+//	    Store:      txHashStore,
+//	    IndexPath:  "/path/to/indexes",
+//	    MultiIndex: false,
+//	    Logger:     logger,
+//	    Memory:     memoryMonitor,
+//	})
+//	stats, err := verifier.Run()
+//
 // Two modes are supported:
 //   - Single-Index Mode (multiIndex=false): Opens txhash.idx once, shares reader
 //     across 16 parallel goroutines verifying each CF
 //   - Multi-Index Mode (multiIndex=true): Each goroutine opens its own cf-X.idx
+//
+// The Verifier uses a scoped logger with [VERIFY] prefix for all log messages.
 //
 // =============================================================================
 
@@ -126,30 +139,77 @@ func (vs *Stats) LogSummary(logger interfaces.Logger) {
 }
 
 // =============================================================================
-// Verifier
+// Verifier - Main Verification Component
 // =============================================================================
 
+// Config holds the configuration for creating a Verifier.
+type Config struct {
+	// Store is the TxHash store to verify against (required)
+	Store interfaces.TxHashStore
+
+	// IndexPath is the directory containing RecSplit index files (required)
+	IndexPath string
+
+	// MultiIndex indicates which index format to use:
+	//   - false: expects single combined txhash.idx file
+	//   - true: expects 16 separate cf-X.idx files
+	MultiIndex bool
+
+	// Logger is the parent logger (required)
+	// A scoped logger with [VERIFY] prefix will be created internally
+	Logger interfaces.Logger
+
+	// Memory is the memory monitor for tracking RAM usage (optional)
+	Memory interfaces.MemoryMonitor
+}
+
 // Verifier handles verification of RecSplit indexes against RocksDB data.
+//
 // Verification runs in parallel across all 16 column families.
+// The Verifier is designed to be composable - it takes its dependencies
+// via Config and uses a scoped logger for all output.
 type Verifier struct {
 	store      interfaces.TxHashStore
-	meta       interfaces.MetaStore
 	indexPath  string
 	multiIndex bool
-	logger     interfaces.Logger
+	log        interfaces.Logger // Scoped logger with [VERIFY] prefix
 	memory     interfaces.MemoryMonitor
 	stats      *Stats
+}
 
-	// resumeFromCF is deprecated and ignored. Kept for backward compatibility.
-	// Parallel verification always verifies all CFs from the beginning.
-	resumeFromCF string
+// New creates a new Verifier with the given configuration.
+//
+// The Verifier creates a scoped logger with [VERIFY] prefix internally,
+// so all log messages are automatically prefixed.
+func New(cfg Config) *Verifier {
+	if cfg.Store == nil {
+		panic("verify.New: Store is required")
+	}
+	if cfg.IndexPath == "" {
+		panic("verify.New: IndexPath is required")
+	}
+	if cfg.Logger == nil {
+		panic("verify.New: Logger is required")
+	}
+
+	return &Verifier{
+		store:      cfg.Store,
+		indexPath:  cfg.IndexPath,
+		multiIndex: cfg.MultiIndex,
+		log:        cfg.Logger.WithScope("VERIFY"),
+		memory:     cfg.Memory,
+		stats:      NewStats(),
+	}
 }
 
 // NewVerifier creates a new Verifier.
 //
+// Deprecated: Use verify.New(verify.Config{...}) instead.
+// This function is kept for backward compatibility.
+//
 // PARAMETERS:
 //   - store: RocksDB store to verify against
-//   - meta: Meta store for progress tracking (not used for per-CF checkpoints)
+//   - meta: Meta store for progress tracking (DEPRECATED - ignored)
 //   - indexPath: Directory containing RecSplit index files
 //   - resumeFromCF: DEPRECATED - ignored, kept for backward compatibility
 //   - multiIndex: If true, expects 16 cf-X.idx files; if false, expects single txhash.idx
@@ -164,16 +224,14 @@ func NewVerifier(
 	logger interfaces.Logger,
 	mem interfaces.MemoryMonitor,
 ) *Verifier {
-	return &Verifier{
-		store:        store,
-		meta:         meta,
-		indexPath:    indexPath,
-		resumeFromCF: resumeFromCF,
-		multiIndex:   multiIndex,
-		logger:       logger,
-		memory:       mem,
-		stats:        NewStats(),
-	}
+	// meta and resumeFromCF are ignored - kept for backward compatibility
+	return New(Config{
+		Store:      store,
+		IndexPath:  indexPath,
+		MultiIndex: multiIndex,
+		Logger:     logger,
+		Memory:     mem,
+	})
 }
 
 // Run executes the verification phase.
@@ -197,14 +255,14 @@ func (v *Verifier) Run() (*Stats, error) {
 // runSingleIndex verifies using a single combined txhash.idx file.
 // Opens the index once and shares the reader across 16 parallel goroutines.
 func (v *Verifier) runSingleIndex() (*Stats, error) {
-	v.logger.Separator()
-	v.logger.Info("                    VERIFICATION PHASE (SINGLE INDEX)")
-	v.logger.Separator()
-	v.logger.Info("")
+	v.log.Separator()
+	v.log.Info("                    VERIFICATION PHASE (SINGLE INDEX)")
+	v.log.Separator()
+	v.log.Info("")
 
-	v.logger.Info("Opening combined index: txhash.idx")
-	v.logger.Info("Verifying all 16 column families in parallel with shared reader...")
-	v.logger.Info("")
+	v.log.Info("Opening combined index: txhash.idx")
+	v.log.Info("Verifying all 16 column families in parallel with shared reader...")
+	v.log.Info("")
 
 	// Open combined index once
 	indexPath := filepath.Join(v.indexPath, "txhash.idx")
@@ -231,12 +289,12 @@ func (v *Verifier) runSingleIndex() (*Stats, error) {
 			stats, err := v.verifyCFWithReader(name, reader)
 			if err != nil {
 				errors[idx] = err
-				v.logger.Error("Verification error for CF %s: %v", name, err)
+				v.log.Error("Verification error for CF %s: %v", name, err)
 				return
 			}
 
 			results[idx] = stats
-			v.logger.Info("  CF [%s] verified: %s keys in %s (%.0f keys/sec), failures: %s",
+			v.log.Info("  CF [%s] verified: %s keys in %s (%.0f keys/sec), failures: %s",
 				name,
 				helpers.FormatNumber(int64(stats.KeysVerified)),
 				helpers.FormatDuration(stats.VerifyTime),
@@ -270,7 +328,7 @@ func (v *Verifier) verifyCFWithReader(cfName string, reader *recsplit.IndexReade
 		offset, found := reader.Lookup(key)
 		if !found {
 			stats.Failures++
-			v.logger.Error("CF %s: Key %s not found in RecSplit",
+			v.log.Error("CF %s: Key %s not found in RecSplit",
 				cfName, types.BytesToHex(key))
 			continue
 		}
@@ -280,7 +338,7 @@ func (v *Verifier) verifyCFWithReader(cfName string, reader *recsplit.IndexReade
 
 		if actualLedgerSeq != expectedLedgerSeq {
 			stats.Failures++
-			v.logger.Error("CF %s: Key %s value mismatch: expected %d, got %d",
+			v.log.Error("CF %s: Key %s value mismatch: expected %d, got %d",
 				cfName, types.BytesToHex(key), expectedLedgerSeq, actualLedgerSeq)
 			continue
 		}
@@ -307,13 +365,13 @@ func (v *Verifier) verifyCFWithReader(cfName string, reader *recsplit.IndexReade
 // runMultiIndex verifies using 16 separate cf-X.idx files.
 // Each goroutine opens its own index file.
 func (v *Verifier) runMultiIndex() (*Stats, error) {
-	v.logger.Separator()
-	v.logger.Info("                    VERIFICATION PHASE (MULTI INDEX)")
-	v.logger.Separator()
-	v.logger.Info("")
+	v.log.Separator()
+	v.log.Info("                    VERIFICATION PHASE (MULTI INDEX)")
+	v.log.Separator()
+	v.log.Info("")
 
-	v.logger.Info("Verifying all 16 column families in parallel (each with own cf-X.idx)...")
-	v.logger.Info("")
+	v.log.Info("Verifying all 16 column families in parallel (each with own cf-X.idx)...")
+	v.log.Info("")
 
 	// Pre-allocate results slice to maintain CF order
 	results := make([]*CFStats, len(cf.Names))
@@ -329,12 +387,12 @@ func (v *Verifier) runMultiIndex() (*Stats, error) {
 			stats, err := v.verifyCF(name)
 			if err != nil {
 				errors[idx] = err
-				v.logger.Error("Verification error for CF %s: %v", name, err)
+				v.log.Error("Verification error for CF %s: %v", name, err)
 				return
 			}
 
 			results[idx] = stats
-			v.logger.Info("  CF [%s] verified: %s keys in %s (%.0f keys/sec), failures: %s",
+			v.log.Info("  CF [%s] verified: %s keys in %s (%.0f keys/sec), failures: %s",
 				name,
 				helpers.FormatNumber(int64(stats.KeysVerified)),
 				helpers.FormatDuration(stats.VerifyTime),
@@ -378,7 +436,7 @@ func (v *Verifier) verifyCF(cfName string) (*CFStats, error) {
 		offset, found := reader.Lookup(key)
 		if !found {
 			stats.Failures++
-			v.logger.Error("CF %s: Key %s not found in RecSplit",
+			v.log.Error("CF %s: Key %s not found in RecSplit",
 				cfName, types.BytesToHex(key))
 			continue
 		}
@@ -388,7 +446,7 @@ func (v *Verifier) verifyCF(cfName string) (*CFStats, error) {
 
 		if actualLedgerSeq != expectedLedgerSeq {
 			stats.Failures++
-			v.logger.Error("CF %s: Key %s value mismatch: expected %d, got %d",
+			v.log.Error("CF %s: Key %s value mismatch: expected %d, got %d",
 				cfName, types.BytesToHex(key), expectedLedgerSeq, actualLedgerSeq)
 			continue
 		}
@@ -439,10 +497,10 @@ func (v *Verifier) collectResults(results []*CFStats, errors []error) (*Stats, e
 	v.memory.Check()
 
 	// Log summary
-	v.stats.LogSummary(v.logger)
-	v.memory.LogSummary(v.logger)
+	v.stats.LogSummary(v.log)
+	v.memory.LogSummary(v.log)
 
-	v.logger.Sync()
+	v.log.Sync()
 
 	return v.stats, nil
 }

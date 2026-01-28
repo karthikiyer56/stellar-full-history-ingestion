@@ -170,6 +170,13 @@ type MetaStore interface {
 
 // Logger defines the interface for logging operations.
 // Implementations write to log file and error file separately.
+//
+// SCOPING:
+// Use WithScope() to create a child logger that prefixes messages with a scope name.
+// This is useful for phase-specific logging:
+//
+//	ingestLog := logger.WithScope("INGEST")
+//	ingestLog.Info("Processing...") // → [timestamp] [INGEST] Processing...
 type Logger interface {
 	// Info logs an informational message to the log file.
 	Info(format string, args ...interface{})
@@ -185,6 +192,10 @@ type Logger interface {
 
 	// Close closes all log files.
 	Close()
+
+	// WithScope creates a child logger that prefixes messages with the given scope.
+	// Scopes can be nested: logger.WithScope("A").WithScope("B") → [A:B]
+	WithScope(scope string) Logger
 }
 
 // =============================================================================

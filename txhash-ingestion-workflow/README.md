@@ -1135,25 +1135,144 @@ The index maps txHash → offset, and verification confirms the offset retrieves
 go test ./...
 ```
 
-### Code Structure
+### Code Architecture
 
-| File | Purpose |
-|------|---------|
-| `main.go` | Entry point, flag parsing, signal handling |
-| `workflow.go` | Phase orchestration and resume logic |
-| `config.go` | Configuration validation |
-| `interfaces.go` | Core interfaces and types |
-| `store.go` | RocksDB operations |
-| `meta_store.go` | Checkpoint persistence |
-| `ingest.go` | LFS reading and txHash extraction |
-| `parallel_ingest.go` | Parallel ingestion with readers/workers/collector |
-| `compact.go` | RocksDB compaction |
-| `recsplit.go` | RecSplit index building |
-| `verify.go` | Index verification |
-| `query_handler.go` | SIGHUP query handling |
-| `logger.go` | Logging infrastructure |
-| `stats.go` | Statistics collection |
-| `memory.go` | Memory monitoring |
+This codebase follows strict architectural principles to maintain clarity, eliminate duplication, and ensure composability.
+
+#### Core Tenets
+
+**1. No Wrappers, No Indirection**
+- Delete duplicate code rather than creating wrapper/re-export files
+- Consumers import directly from the canonical source package
+- If code exists in `pkg/`, delete local copies and update imports
+- Prefer simplicity over backward compatibility shims
+
+**2. Single Source of Truth**
+- Each type, interface, or utility exists in exactly ONE place
+- When refactoring: delete the old location, update all consumers
+- Never maintain two copies of the same code
+
+**3. Config-Based Constructors**
+- All major components use the `New(Config{...})` constructor pattern
+- Config structs embed all dependencies (store, logger, memory monitor)
+- No passing loggers as function arguments - components own their scoped logger
+
+**4. Scoped Logging**
+- Each component creates a scoped logger with a prefix (e.g., `[INGEST]`, `[COMPACT]`, `[VERIFY]`)
+- Scoped loggers are created via `logger.WithScope("SCOPE")` in constructors
+- Log output clearly identifies which component generated each message
+
+#### Package Structure
+
+```
+txhash-ingestion-workflow/
+├── main.go                 # Entry point, flag parsing, signal handling
+├── workflow.go             # Phase orchestration with [WORKFLOW] scoped logger
+├── config.go               # Configuration validation
+├── meta_store.go           # Checkpoint persistence (RocksDB-based)
+├── ingest.go               # Sequential ingestion with [INGEST] scoped logger
+├── parallel_ingest.go      # Parallel ingestion with [PARALLEL-INGEST] scoped logger
+├── query_handler.go        # SIGHUP query handling
+│
+├── pkg/                    # Reusable packages
+│   ├── interfaces/         # Core interfaces (TxHashStore, Iterator, Logger, etc.)
+│   │   └── interfaces.go
+│   │
+│   ├── types/              # Pure data types (no external dependencies)
+│   │   └── types.go        # Entry, CFStats, RocksDBSettings, Phase, encoding utils
+│   │
+│   ├── store/              # RocksDB TxHash store implementation
+│   │   └── store.go        # OpenRocksDBTxHashStore, read-only mode support
+│   │
+│   ├── cf/                 # Column family utilities
+│   │   └── cf.go           # CF names, GetName(txHash), partitioning logic
+│   │
+│   ├── logging/            # Logging infrastructure
+│   │   └── logger.go       # DualLogger (log + error files), WithScope()
+│   │
+│   ├── memory/             # Memory monitoring
+│   │   └── memory.go       # RSS tracking, warnings, summaries
+│   │
+│   ├── compact/            # Compaction with [COMPACT] scoped logger
+│   │   └── compact.go      # New(Config), CompactAllCFs
+│   │
+│   ├── recsplit/           # RecSplit index building with [RECSPLIT] scoped logger
+│   │   └── recsplit.go     # New(Config), Run(), single/multi-index modes
+│   │
+│   └── verify/             # RecSplit verification with [VERIFY] scoped logger
+│       └── verify.go       # New(Config), Run()
+│
+├── build-recsplit/         # Standalone RecSplit builder tool
+│   └── main.go             # Uses pkg/store directly (no duplication)
+│
+└── query-benchmark/        # Standalone query benchmark tool
+    └── main.go
+```
+
+#### Component Pattern
+
+All major components follow this pattern:
+
+```go
+// Config embeds all dependencies
+type Config struct {
+    Store      interfaces.TxHashStore
+    Logger     interfaces.Logger      // Parent logger (scoped logger created internally)
+    Memory     interfaces.MemoryMonitor
+    // ... component-specific settings
+}
+
+// Component struct with scoped logger
+type Compactor struct {
+    store  interfaces.TxHashStore
+    log    interfaces.Logger  // Scoped with [COMPACT] prefix
+    memory interfaces.MemoryMonitor
+}
+
+// Constructor creates scoped logger
+func New(cfg Config) *Compactor {
+    return &Compactor{
+        store:  cfg.Store,
+        log:    cfg.Logger.WithScope("COMPACT"),  // All logs prefixed with [COMPACT]
+        memory: cfg.Memory,
+    }
+}
+
+// Run executes the component's work
+func (c *Compactor) Run() (Stats, error) {
+    c.log.Info("Starting compaction...")  // Outputs: [COMPACT] Starting compaction...
+    // ...
+}
+```
+
+#### Key Interfaces
+
+| Interface | Location | Purpose |
+|-----------|----------|---------|
+| `TxHashStore` | `pkg/interfaces/` | RocksDB operations (read, write, iterate, compact) |
+| `Iterator` | `pkg/interfaces/` | Key-value iteration over column families |
+| `Logger` | `pkg/interfaces/` | Logging with Info/Error/Debug/Warn + WithScope |
+| `MemoryMonitor` | `pkg/interfaces/` | RSS tracking and memory warnings |
+| `MetaStore` | `pkg/interfaces/` | Checkpoint persistence |
+
+#### Read-Only Store Mode
+
+The `RocksDBTxHashStore` supports read-only mode for tools that don't need writes:
+
+```go
+settings := types.DefaultRocksDBSettings()
+settings.ReadOnly = true  // Open in read-only mode
+settings.BlockCacheSizeMB = 8192
+
+store, err := store.OpenRocksDBTxHashStore(path, &settings, logger)
+// store.WriteBatch() would panic - read-only mode
+// store.Get(), store.NewIteratorCF() work normally
+```
+
+Benefits of read-only mode:
+- Multiple processes can open the same database simultaneously
+- No WAL recovery overhead on open
+- Write operations panic immediately (fail-fast)
 
 ## Standalone Utilities
 

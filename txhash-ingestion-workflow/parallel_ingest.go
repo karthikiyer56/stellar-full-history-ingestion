@@ -5,6 +5,22 @@
 // This file implements parallel ingestion that uses multiple goroutines to
 // read, decompress, unmarshal, and extract transaction hashes concurrently.
 //
+// USAGE:
+//
+//	ingester := NewParallelIngester(ParallelIngestionConfig{
+//	    LFSStorePath:    "/path/to/lfs",
+//	    StartLedger:     1,
+//	    EndLedger:       1000000,
+//	    BatchSize:       5000,
+//	    ParallelWorkers: 16,
+//	    ParallelReaders: 4,
+//	    Store:           txHashStore,
+//	    Meta:            metaStore,
+//	    Logger:          logger,
+//	    Memory:          memoryMonitor,
+//	})
+//	err := ingester.Run()
+//
 // ARCHITECTURE:
 //
 //   ┌─────────────────┐    ┌─────────────────────┐    ┌──────────────┐
@@ -56,6 +72,8 @@
 //   - Resume from last_committed_ledger + 1
 //   - Up to batch_size-1 ledgers may be re-ingested
 //   - Duplicates handled by RocksDB compaction
+//
+// The ParallelIngester uses a scoped logger with [PARALLEL-INGEST] prefix.
 //
 // =============================================================================
 
@@ -185,16 +203,53 @@ func (bt *BatchTiming) AvgLedgerLatency() time.Duration {
 }
 
 // =============================================================================
-// ParallelIngester
+// ParallelIngester - Main Parallel Ingestion Component
 // =============================================================================
 
-// ParallelIngester handles parallel ingestion from LFS to RocksDB
+// ParallelIngestionConfig holds configuration for creating a ParallelIngester.
+type ParallelIngestionConfig struct {
+	// LFSStorePath is the path to the LFS ledger store (required)
+	LFSStorePath string
+
+	// StartLedger is the first ledger to ingest (required)
+	StartLedger uint32
+
+	// EndLedger is the last ledger to ingest (required)
+	EndLedger uint32
+
+	// BatchSize is the number of ledgers per batch (default: 5000)
+	BatchSize int
+
+	// ParallelWorkers is the number of decompress/unmarshal/extract workers (default: 16)
+	ParallelWorkers int
+
+	// ParallelReaders is the number of LFS reader goroutines (default: 4)
+	ParallelReaders int
+
+	// Store is the TxHash store to write to (required)
+	Store interfaces.TxHashStore
+
+	// Meta is the meta store for checkpointing (required)
+	Meta interfaces.MetaStore
+
+	// Logger is the parent logger (required)
+	// A scoped logger with [PARALLEL-INGEST] prefix will be created internally
+	Logger interfaces.Logger
+
+	// Memory is the memory monitor for tracking RAM usage (optional)
+	Memory interfaces.MemoryMonitor
+}
+
+// ParallelIngester handles parallel ingestion from LFS to RocksDB.
+//
+// The ParallelIngester is designed to be composable - it takes its dependencies
+// via ParallelIngestionConfig and uses a scoped logger for all output.
 type ParallelIngester struct {
 	config ParallelIngestionConfig
 	store  interfaces.TxHashStore
 	meta   interfaces.MetaStore
-	logger interfaces.Logger
-	memory *memory.MemoryMonitor
+	log    interfaces.Logger // Scoped logger with [PARALLEL-INGEST] prefix
+	memory interfaces.MemoryMonitor
 
 	// Channels
 	workChan  chan LedgerWork
@@ -210,26 +265,26 @@ type ParallelIngester struct {
 	closeOnce sync.Once
 }
 
-// ParallelIngestionConfig holds configuration for parallel ingestion
-type ParallelIngestionConfig struct {
-	LFSStorePath    string
-	StartLedger     uint32
-	EndLedger       uint32
-	BatchSize       int
-	ParallelWorkers int
-	ParallelReaders int
-}
+// NewParallelIngester creates a new ParallelIngester with the given configuration.
+//
+// The ParallelIngester creates a scoped logger with [PARALLEL-INGEST] prefix internally,
+// so all log messages are automatically prefixed.
+func NewParallelIngester(config ParallelIngestionConfig) *ParallelIngester {
+	if config.LFSStorePath == "" {
+		panic("NewParallelIngester: LFSStorePath is required")
+	}
+	if config.Store == nil {
+		panic("NewParallelIngester: Store is required")
+	}
+	if config.Meta == nil {
+		panic("NewParallelIngester: Meta is required")
+	}
+	if config.Logger == nil {
+		panic("NewParallelIngester: Logger is required")
+	}
 
-// NewParallelIngester creates a new parallel ingester
-func NewParallelIngester(
-	config ParallelIngestionConfig,
-	store interfaces.TxHashStore,
-	meta interfaces.MetaStore,
-	logger interfaces.Logger,
-	memory *memory.MemoryMonitor,
-) *ParallelIngester {
 	// Initialize CF counts from meta store
-	cfCounts, err := meta.GetCFCounts()
+	cfCounts, err := config.Meta.GetCFCounts()
 	if err != nil || cfCounts == nil {
 		cfCounts = make(map[string]uint64)
 		for _, cfName := range cf.Names {
@@ -239,10 +294,10 @@ func NewParallelIngester(
 
 	return &ParallelIngester{
 		config:    config,
-		store:     store,
-		meta:      meta,
-		logger:    logger,
-		memory:    memory,
+		store:     config.Store,
+		meta:      config.Meta,
+		log:       config.Logger.WithScope("PARALLEL-INGEST"),
+		memory:    config.Memory,
 		workChan:  make(chan LedgerWork, WorkChanBuffer),
 		entryChan: make(chan LedgerEntries, EntryChanBuffer),
 		aggStats:  NewParallelAggregatedStats(config.ParallelWorkers, config.ParallelReaders),
@@ -252,23 +307,23 @@ func NewParallelIngester(
 
 // Run executes the parallel ingestion
 func (pi *ParallelIngester) Run() error {
-	pi.logger.Separator()
-	pi.logger.Info("                    PARALLEL INGESTION PHASE")
-	pi.logger.Separator()
-	pi.logger.Info("")
-	pi.logger.Info("LFS Store:        %s", pi.config.LFSStorePath)
-	pi.logger.Info("Ledger Range:     %d - %d", pi.config.StartLedger, pi.config.EndLedger)
-	pi.logger.Info("Total Ledgers:    %s", helpers.FormatNumber(int64(pi.config.EndLedger-pi.config.StartLedger+1)))
-	pi.logger.Info("Batch Size:       %d ledgers", pi.config.BatchSize)
-	pi.logger.Info("Parallel Workers: %d (decompress + unmarshal + extract)", pi.config.ParallelWorkers)
-	pi.logger.Info("Parallel Readers: %d (LFS read)", pi.config.ParallelReaders)
-	pi.logger.Info("")
+	pi.log.Separator()
+	pi.log.Info("                    PARALLEL INGESTION PHASE")
+	pi.log.Separator()
+	pi.log.Info("")
+	pi.log.Info("LFS Store:        %s", pi.config.LFSStorePath)
+	pi.log.Info("Ledger Range:     %d - %d", pi.config.StartLedger, pi.config.EndLedger)
+	pi.log.Info("Total Ledgers:    %s", helpers.FormatNumber(int64(pi.config.EndLedger-pi.config.StartLedger+1)))
+	pi.log.Info("Batch Size:       %d ledgers", pi.config.BatchSize)
+	pi.log.Info("Parallel Workers: %d (decompress + unmarshal + extract)", pi.config.ParallelWorkers)
+	pi.log.Info("Parallel Readers: %d (LFS read)", pi.config.ParallelReaders)
+	pi.log.Info("")
 
 	totalLedgers := int(pi.config.EndLedger - pi.config.StartLedger + 1)
 	totalBatches := (totalLedgers + pi.config.BatchSize - 1) / pi.config.BatchSize
 
-	pi.logger.Info("Total Batches:    %d", totalBatches)
-	pi.logger.Info("")
+	pi.log.Info("Total Batches:    %d", totalBatches)
+	pi.log.Info("")
 
 	// Process ledgers in batches
 	currentLedger := pi.config.StartLedger
@@ -307,20 +362,20 @@ func (pi *ParallelIngester) Run() error {
 	}
 
 	// Flush all MemTables to disk
-	pi.logger.Info("")
-	pi.logger.Info("Flushing all MemTables to disk...")
+	pi.log.Info("")
+	pi.log.Info("Flushing all MemTables to disk...")
 	flushStart := time.Now()
 	if err := pi.store.FlushAll(); err != nil {
 		return fmt.Errorf("failed to flush MemTables: %w", err)
 	}
-	pi.logger.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
+	pi.log.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
 
 	// Log final summary
-	pi.aggStats.LogSummary(pi.logger)
+	pi.aggStats.LogSummary(pi.log)
 	pi.logCFSummary()
-	pi.memory.LogSummary(pi.logger)
+	pi.memory.LogSummary(pi.log)
 
-	pi.logger.Sync()
+	pi.log.Sync()
 
 	return nil
 }
@@ -590,29 +645,29 @@ func (pi *ParallelIngester) logBatchSummary(batchNum int, startLedger, endLedger
 	// This gives a sense of "if we had 1 worker, how long would each phase take"
 	effectiveWorkers := float64(pi.config.ParallelWorkers)
 
-	pi.logger.Info("Batch %d: ledgers %d-%d | %s txs | wall=%s | %.0f ledgers/sec | %.0f tx/sec",
+	pi.log.Info("Batch %d: ledgers %d-%d | %s txs | wall=%s | %.0f ledgers/sec | %.0f tx/sec",
 		batchNum, startLedger, endLedger, helpers.FormatNumber(int64(timing.TxCount)),
 		helpers.FormatDuration(timing.WallClockDuration().Truncate(time.Millisecond)),
 		timing.LedgersPerSecond(), timing.TxPerSecond())
 
 	// Only log detailed timing breakdown occasionally (every ProgressLogInterval batches)
 	if batchNum%ProgressLogInterval == 0 {
-		pi.logger.Info("  Timing breakdown (cumulative across %d workers, effective=cumulative/%d):",
+		pi.log.Info("  Timing breakdown (cumulative across %d workers, effective=cumulative/%d):",
 			pi.config.ParallelWorkers, pi.config.ParallelWorkers)
-		pi.logger.Info("    Decompress: %s (eff: %s/ledger)",
+		pi.log.Info("    Decompress: %s (eff: %s/ledger)",
 			helpers.FormatDuration(timing.TotalDecompressTime),
 			helpers.FormatDuration(time.Duration(float64(timing.TotalDecompressTime)/float64(timing.LedgerCount))))
-		pi.logger.Info("    Unmarshal:  %s (eff: %s/ledger)",
+		pi.log.Info("    Unmarshal:  %s (eff: %s/ledger)",
 			helpers.FormatDuration(timing.TotalUnmarshalTime),
 			helpers.FormatDuration(time.Duration(float64(timing.TotalUnmarshalTime)/float64(timing.LedgerCount))))
-		pi.logger.Info("    Extract:    %s (eff: %s/ledger)",
+		pi.log.Info("    Extract:    %s (eff: %s/ledger)",
 			helpers.FormatDuration(timing.TotalExtractTime),
 			helpers.FormatDuration(time.Duration(float64(timing.TotalExtractTime)/float64(timing.LedgerCount))))
-		pi.logger.Info("    Write:      %s (eff: %s/ledger)",
+		pi.log.Info("    Write:      %s (eff: %s/ledger)",
 			helpers.FormatDuration(timing.TotalWriteTime),
 			helpers.FormatDuration(time.Duration(float64(timing.TotalWriteTime)/float64(timing.LedgerCount))))
-		pi.logger.Info("    Checkpoint: %s", helpers.FormatDuration(timing.TotalCheckpointTime))
-		pi.logger.Info("  Parallelism efficiency: %.1f%% (wall=%s vs serial_work=%s)",
+		pi.log.Info("    Checkpoint: %s", helpers.FormatDuration(timing.TotalCheckpointTime))
+		pi.log.Info("  Parallelism efficiency: %.1f%% (wall=%s vs serial_work=%s)",
 			100.0*float64(timing.TotalDecompressTime+timing.TotalUnmarshalTime+timing.TotalExtractTime)/
 				(effectiveWorkers*float64(timing.WallClockDuration()-timing.TotalWriteTime-timing.TotalCheckpointTime)),
 			helpers.FormatDuration(timing.WallClockDuration()-timing.TotalWriteTime-timing.TotalCheckpointTime),
@@ -635,21 +690,21 @@ func (pi *ParallelIngester) logProgress(batchNum, totalBatches int, currentLedge
 		eta = avgBatchTime * time.Duration(remainingBatches)
 	}
 
-	pi.logger.Info("")
-	pi.logger.Separator()
-	pi.logger.Info("PROGRESS: %d/%d batches (%.1f%%) | elapsed=%s | ETA=%s",
+	pi.log.Info("")
+	pi.log.Separator()
+	pi.log.Info("PROGRESS: %d/%d batches (%.1f%%) | elapsed=%s | ETA=%s",
 		batchNum, totalBatches, pct,
 		helpers.FormatDuration(elapsed.Truncate(time.Second)),
 		helpers.FormatDuration(eta.Truncate(time.Second)))
-	pi.logger.Info("  Ledgers: %s | Transactions: %s",
+	pi.log.Info("  Ledgers: %s | Transactions: %s",
 		helpers.FormatNumber(int64(stats.TotalLedgers)),
 		helpers.FormatNumber(int64(stats.TotalTx)))
-	pi.logger.Info("  Throughput: %.0f ledgers/sec | %.0f tx/sec",
+	pi.log.Info("  Throughput: %.0f ledgers/sec | %.0f tx/sec",
 		stats.OverallLedgersPerSecond(), stats.OverallTxPerSecond())
-	pi.logger.Info("  Avg latency: %s/ledger (wall-clock)",
+	pi.log.Info("  Avg latency: %s/ledger (wall-clock)",
 		helpers.FormatDuration(stats.AvgWallClockPerLedger()))
-	pi.logger.Separator()
-	pi.logger.Info("")
+	pi.log.Separator()
+	pi.log.Info("")
 }
 
 // logCFSummary logs transaction counts per column family
@@ -659,13 +714,13 @@ func (pi *ParallelIngester) logCFSummary() {
 		total += count
 	}
 
-	pi.logger.Info("TRANSACTIONS BY COLUMN FAMILY:")
+	pi.log.Info("TRANSACTIONS BY COLUMN FAMILY:")
 	for _, cfName := range cf.Names {
 		count := pi.cfCounts[cfName]
 		pct := float64(count) / float64(total) * 100
-		pi.logger.Info("  CF %s: %12s (%.2f%%)", cfName, helpers.FormatNumber(int64(count)), pct)
+		pi.log.Info("  CF %s: %12s (%.2f%%)", cfName, helpers.FormatNumber(int64(count)), pct)
 	}
-	pi.logger.Info("")
+	pi.log.Info("")
 }
 
 // GetCFCounts returns the current CF counts
@@ -845,7 +900,10 @@ func (pas *ParallelAggregatedStats) LogSummary(logger interfaces.Logger) {
 // Convenience Function
 // =============================================================================
 
-// RunParallelIngestion is a convenience function to run parallel ingestion
+// RunParallelIngestion is a convenience function to run parallel ingestion.
+//
+// Deprecated: Use NewParallelIngester(ParallelIngestionConfig{...}).Run() instead.
+// This function is kept for backward compatibility.
 //
 // PARAMETERS:
 //   - config: Main configuration
@@ -862,18 +920,20 @@ func RunParallelIngestion(
 	store interfaces.TxHashStore,
 	meta interfaces.MetaStore,
 	logger interfaces.Logger,
-	memory *memory.MemoryMonitor,
+	mem *memory.MemoryMonitor,
 	startFromLedger uint32,
 ) error {
-	ingesterConfig := ParallelIngestionConfig{
+	ingester := NewParallelIngester(ParallelIngestionConfig{
 		LFSStorePath:    config.LFSStorePath,
 		StartLedger:     startFromLedger,
 		EndLedger:       config.EndLedger,
 		BatchSize:       config.ParallelBatchSize,
 		ParallelWorkers: config.ParallelWorkers,
 		ParallelReaders: config.ParallelReaders,
-	}
-
-	ingester := NewParallelIngester(ingesterConfig, store, meta, logger, memory)
+		Store:           store,
+		Meta:            meta,
+		Logger:          logger,
+		Memory:          mem,
+	})
 	return ingester.Run()
 }

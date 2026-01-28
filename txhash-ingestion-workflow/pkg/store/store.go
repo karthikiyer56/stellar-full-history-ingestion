@@ -59,14 +59,26 @@ type RocksDBTxHashStore struct {
 
 	// logger for logging operations
 	logger interfaces.Logger
+
+	// readOnly indicates if the store was opened in read-only mode
+	readOnly bool
 }
 
 // OpenRocksDBTxHashStore opens or creates a RocksDB store at the specified path.
 //
 // If the store exists, it is opened with the existing column families.
-// If it doesn't exist, it is created with 16 column families.
+// If it doesn't exist, it is created with 16 column families (unless ReadOnly is true).
 //
-// RECOVERY BEHAVIOR:
+// READ-ONLY MODE:
+// When settings.ReadOnly is true, the store is opened in read-only mode using
+// OpenDbForReadOnlyColumnFamilies. In this mode:
+//   - The database must already exist (CreateIfMissing is ignored)
+//   - Write operations (WriteBatch, FlushAll, CompactAll, CompactCF) will panic
+//   - Multiple processes can open the same database simultaneously
+//   - No write-ahead log (WAL) recovery is performed
+//   - Ideal for tools that only read data (RecSplit building, verification, queries)
+//
+// RECOVERY BEHAVIOR (read-write mode only):
 // When opening an existing store, RocksDB automatically replays the WAL (Write-Ahead Log)
 // to recover any data that was written but not yet flushed to SST files. This can take
 // significant time (observed ~300 MB/s WAL replay speed). The function logs detailed
@@ -80,8 +92,12 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 
 	// Create Database Options
 	opts := grocksdb.NewDefaultOptions()
-	opts.SetCreateIfMissing(true)
-	opts.SetCreateIfMissingColumnFamilies(true)
+	if !settings.ReadOnly {
+		opts.SetCreateIfMissing(true)
+		opts.SetCreateIfMissingColumnFamilies(true)
+	} else {
+		opts.SetCreateIfMissing(false)
+	}
 	opts.SetErrorIfExists(false)
 
 	// Global settings
@@ -110,12 +126,26 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 	}
 
 	// Open Database with Column Families
-	// This includes WAL replay if there's pending data from a previous crash
-	logger.Info("Opening RocksDB store at: %s", path)
-	logger.Info("  (WAL recovery will occur if there's uncommitted data)")
+	// This includes WAL replay if there's pending data from a previous crash (read-write mode only)
+	if settings.ReadOnly {
+		logger.Info("Opening RocksDB store at: %s (READ-ONLY)", path)
+	} else {
+		logger.Info("Opening RocksDB store at: %s", path)
+		logger.Info("  (WAL recovery will occur if there's uncommitted data)")
+	}
 
 	openStart := time.Now()
-	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(opts, path, cfNames, cfOptsList)
+	var db *grocksdb.DB
+	var cfHandles []*grocksdb.ColumnFamilyHandle
+	var err error
+
+	if settings.ReadOnly {
+		// Open in read-only mode - no WAL recovery, multiple processes can read simultaneously
+		db, cfHandles, err = grocksdb.OpenDbForReadOnlyColumnFamilies(opts, path, cfNames, cfOptsList, false)
+	} else {
+		// Open in read-write mode - includes WAL recovery
+		db, cfHandles, err = grocksdb.OpenDbColumnFamilies(opts, path, cfNames, cfOptsList)
+	}
 	openDuration := time.Since(openStart)
 
 	if err != nil {
@@ -133,8 +163,11 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 	}
 
 	// Create Write and Read Options
-	writeOpts := grocksdb.NewDefaultWriteOptions()
-	writeOpts.SetSync(false) // Async writes for performance (WAL handles durability)
+	var writeOpts *grocksdb.WriteOptions
+	if !settings.ReadOnly {
+		writeOpts = grocksdb.NewDefaultWriteOptions()
+		writeOpts.SetSync(false) // Async writes for performance (WAL handles durability)
+	}
 
 	readOpts := grocksdb.NewDefaultReadOptions()
 
@@ -156,17 +189,23 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 		path:       path,
 		cfIndexMap: cfIndexMap,
 		logger:     logger,
+		readOnly:   settings.ReadOnly,
 	}
 
 	// Log Configuration
-	memtables := settings.WriteBufferSizeMB * settings.MaxWriteBufferNumber * len(cf.Names)
 	logger.Info("RocksDB store opened successfully in %s:", helpers.FormatDuration(openDuration))
+	logger.Info("  Mode:            %s", map[bool]string{true: "READ-ONLY", false: "READ-WRITE"}[settings.ReadOnly])
 	logger.Info("  Column Families: %d", len(cfHandles)-1) // -1 for default
-	logger.Info("  MemTable RAM:    %d MB", memtables)
+	if !settings.ReadOnly {
+		memtables := settings.WriteBufferSizeMB * settings.MaxWriteBufferNumber * len(cf.Names)
+		logger.Info("  MemTable RAM:    %d MB", memtables)
+	}
 	logger.Info("  Block Cache:     %d MB", settings.BlockCacheSizeMB)
 	logger.Info("  Bloom Filter:    %d bits/key", settings.BloomFilterBitsPerKey)
-	logger.Info("  WAL:             ENABLED (always)")
-	logger.Info("  Auto-Compaction: DISABLED (manual phase)")
+	if !settings.ReadOnly {
+		logger.Info("  WAL:             ENABLED (always)")
+		logger.Info("  Auto-Compaction: DISABLED (manual phase)")
+	}
 
 	// Log detailed store stats (SST files, WAL size, etc.)
 	store.logStoreStats(openDuration)
@@ -219,7 +258,11 @@ func createCFOptions(settings *types.RocksDBSettings, blockCache *grocksdb.Cache
 // =============================================================================
 
 // WriteBatch writes a batch of entries to the appropriate column families.
+// Panics if the store was opened in read-only mode.
 func (s *RocksDBTxHashStore) WriteBatch(entriesByCF map[string][]types.Entry) error {
+	if s.readOnly {
+		panic("WriteBatch called on read-only store")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -299,7 +342,11 @@ func (s *RocksDBTxHashStore) NewScanIteratorCF(cfName string) interfaces.Iterato
 }
 
 // FlushAll flushes all column family MemTables to SST files on disk.
+// Panics if the store was opened in read-only mode.
 func (s *RocksDBTxHashStore) FlushAll() error {
+	if s.readOnly {
+		panic("FlushAll called on read-only store")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -326,7 +373,12 @@ func (s *RocksDBTxHashStore) FlushAll() error {
 // and handles concurrent reads/writes during compaction internally. All 16 CFs are
 // compacted in parallel using goroutines, with SetExclusiveManualCompaction(false)
 // to allow concurrent manual compactions. Queries continue to work during compaction.
+//
+// Panics if the store was opened in read-only mode.
 func (s *RocksDBTxHashStore) CompactAll() time.Duration {
+	if s.readOnly {
+		panic("CompactAll called on read-only store")
+	}
 	// Get all CF handles under read lock (quick operation)
 	s.mu.RLock()
 	cfHandles := make([]*grocksdb.ColumnFamilyHandle, len(cf.Names))
@@ -374,7 +426,12 @@ func (s *RocksDBTxHashStore) CompactAll() time.Duration {
 // NOTE: This method does NOT hold a lock during compaction. RocksDB is thread-safe
 // and handles concurrent reads/writes during compaction internally. Uses
 // SetExclusiveManualCompaction(false) to allow concurrent compactions with other CFs.
+//
+// Panics if the store was opened in read-only mode.
 func (s *RocksDBTxHashStore) CompactCF(cfName string) time.Duration {
+	if s.readOnly {
+		panic("CompactCF called on read-only store")
+	}
 	// Get CF handle under read lock (quick operation)
 	s.mu.RLock()
 	cfHandle := s.getCFHandleByName(cfName)
@@ -520,7 +577,12 @@ func (s *RocksDBTxHashStore) Path() string {
 	return s.path
 }
 
-// =============================================================================
+// IsReadOnly returns true if the store was opened in read-only mode.
+func (s *RocksDBTxHashStore) IsReadOnly() bool {
+	return s.readOnly
+}
+
+// ============================================================================
 // Store Statistics and Recovery Logging
 // =============================================================================
 

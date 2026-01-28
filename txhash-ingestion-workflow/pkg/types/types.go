@@ -157,6 +157,11 @@ type RocksDBSettings struct {
 	BloomFilterBitsPerKey       int
 	BlockCacheSizeMB            int
 	MaxOpenFiles                int
+
+	// ReadOnly opens the database in read-only mode.
+	// In read-only mode, write operations (WriteBatch, FlushAll, CompactAll, CompactCF) will panic.
+	// Use this mode for tools that only need to read data (e.g., RecSplit building, verification).
+	ReadOnly bool
 }
 
 // DefaultRocksDBSettings returns the default RocksDB settings.

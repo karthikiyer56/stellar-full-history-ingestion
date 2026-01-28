@@ -6,6 +6,17 @@
 //   - Informational messages to a log file
 //   - Error messages to a separate error file
 //
+// SCOPED LOGGING:
+//   Loggers can be scoped with a prefix using WithScope(). This creates a child
+//   logger that prefixes all messages with the scope name, e.g.:
+//
+//     logger := NewDualLogger("app.log", "error.log")
+//     ingestionLog := logger.WithScope("INGEST")
+//     ingestionLog.Info("Processing ledger 1000") // → [2006-01-02 15:04:05.000] [INGEST] Processing ledger 1000
+//
+//   The parent logger continues to work without the prefix:
+//     logger.Info("Starting workflow") // → [2006-01-02 15:04:05.000] Starting workflow
+//
 // =============================================================================
 
 package logging
@@ -15,6 +26,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/interfaces"
 )
 
 // =============================================================================
@@ -62,6 +75,20 @@ func NewDualLogger(logPath, errorPath string) (*DualLogger, error) {
 		logPath:   logPath,
 		errorPath: errorPath,
 	}, nil
+}
+
+// WithScope creates a scoped logger that prefixes all messages with the scope name.
+// The returned ScopedLogger shares the same underlying files as the parent.
+//
+// Example:
+//
+//	ingestLog := logger.WithScope("INGEST")
+//	ingestLog.Info("Starting") // → [timestamp] [INGEST] Starting
+func (l *DualLogger) WithScope(scope string) interfaces.Logger {
+	return &ScopedLogger{
+		parent: l,
+		scope:  scope,
+	}
 }
 
 // Info logs an informational message to the log file.
@@ -119,6 +146,69 @@ func (l *DualLogger) Close() {
 		l.errorFile.Close()
 		l.errorFile = nil
 	}
+}
+
+// =============================================================================
+// ScopedLogger - Logger with a Prefix
+// =============================================================================
+
+// ScopedLogger wraps a DualLogger and prefixes all messages with a scope name.
+// This is useful for phase-specific logging where you want to identify the source.
+//
+// ScopedLogger shares the underlying files with its parent DualLogger.
+// Closing the parent will close the files; do not close ScopedLogger directly.
+type ScopedLogger struct {
+	parent *DualLogger
+	scope  string
+}
+
+// WithScope creates a nested scoped logger.
+// The scopes are combined: parent.WithScope("A").WithScope("B") → [A:B]
+func (l *ScopedLogger) WithScope(scope string) interfaces.Logger {
+	return &ScopedLogger{
+		parent: l.parent,
+		scope:  l.scope + ":" + scope,
+	}
+}
+
+// Info logs an informational message with the scope prefix.
+func (l *ScopedLogger) Info(format string, args ...interface{}) {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+
+	timestamp := time.Now().Format(TimeFormat)
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(l.parent.logFile, "[%s] [%s] %s\n", timestamp, l.scope, msg)
+}
+
+// Error logs an error message with the scope prefix.
+func (l *ScopedLogger) Error(format string, args ...interface{}) {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+
+	timestamp := time.Now().Format(TimeFormat)
+	msg := fmt.Sprintf(format, args...)
+
+	fmt.Fprintf(l.parent.errorFile, "[%s] [%s] ERROR: %s\n", timestamp, l.scope, msg)
+	fmt.Fprintf(l.parent.logFile, "[%s] [%s] ERROR: %s\n", timestamp, l.scope, msg)
+}
+
+// Separator logs a visual separator line (no scope prefix for separators).
+func (l *ScopedLogger) Separator() {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+
+	fmt.Fprintln(l.parent.logFile, SeparatorLine)
+}
+
+// Sync forces a flush of all log data to disk.
+func (l *ScopedLogger) Sync() {
+	l.parent.Sync()
+}
+
+// Close is a no-op for ScopedLogger. Close the parent DualLogger instead.
+func (l *ScopedLogger) Close() {
+	// No-op: ScopedLogger does not own the files
 }
 
 // =============================================================================

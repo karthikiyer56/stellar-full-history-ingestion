@@ -11,6 +11,22 @@
 //   Phase 4: VERIFYING_RECSPLIT  - Verify RecSplit against RocksDB
 //   Phase 5: COMPLETE            - Done
 //
+// USAGE:
+//
+//	workflow, err := NewWorkflow(config, logger)
+//	if err != nil {
+//	    // handle error
+//	}
+//	defer workflow.Close()
+//
+//	// Set query handler for SIGHUP support
+//	workflow.SetQueryHandler(queryHandler)
+//
+//	// Run the workflow
+//	if err := workflow.Run(); err != nil {
+//	    // handle error
+//	}
+//
 // WORKFLOW DESIGN:
 //
 //   The workflow is designed to be crash-recoverable at any point.
@@ -42,6 +58,9 @@
 //
 //   Graceful shutdown (SIGINT/SIGTERM) is handled in main.go.
 //
+// The Workflow uses a scoped logger with [WORKFLOW] prefix and each phase
+// creates its own scoped logger (e.g., [INGEST], [COMPACT], [RECSPLIT], [VERIFY]).
+//
 // =============================================================================
 
 package main
@@ -66,27 +85,22 @@ import (
 
 // Workflow orchestrates the entire txHash ingestion pipeline.
 //
-// LIFECYCLE:
+// The Workflow coordinates all phases and manages:
+//   - Store lifecycle (RocksDB data store, meta store)
+//   - Phase transitions and crash recovery
+//   - Query handling for SIGHUP signals
+//   - Overall statistics and logging
 //
-//	workflow, err := NewWorkflow(config, logger)
-//	if err != nil {
-//	    // handle error
-//	}
-//	defer workflow.Close()
-//
-//	// Set query handler for SIGHUP support
-//	workflow.SetQueryHandler(queryHandler)
-//
-//	// Run the workflow
-//	if err := workflow.Run(); err != nil {
-//	    // handle error
-//	}
+// Each phase uses its own scoped logger for clear output.
 type Workflow struct {
 	// config is the main configuration
 	config *Config
 
-	// logger is the main workflow logger
-	logger interfaces.Logger
+	// log is the workflow-scoped logger with [WORKFLOW] prefix
+	log interfaces.Logger
+
+	// parentLogger is the original logger (for creating phase-scoped loggers)
+	parentLogger interfaces.Logger
 
 	// store is the RocksDB data store
 	store interfaces.TxHashStore
@@ -152,24 +166,28 @@ type WorkflowStats struct {
 // NewWorkflow creates a new Workflow orchestrator.
 //
 // This opens the RocksDB stores and initializes all components.
+// The Workflow creates a scoped logger with [WORKFLOW] prefix internally.
 //
 // PARAMETERS:
 //   - config: Validated configuration
-//   - logger: Logger instance
+//   - logger: Logger instance (parent logger)
 //
 // RETURNS:
 //   - A new Workflow instance
 //   - An error if initialization fails
 func NewWorkflow(config *Config, logger interfaces.Logger) (*Workflow, error) {
+	// Create workflow-scoped logger
+	log := logger.WithScope("WORKFLOW")
+
 	// Open RocksDB data store
-	logger.Info("Opening RocksDB data store...")
+	log.Info("Opening RocksDB data store...")
 	txStore, err := store.OpenRocksDBTxHashStore(config.RocksDBPath, &config.RocksDB, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open data store: %w", err)
 	}
 
 	// Open meta store
-	logger.Info("Opening meta store...")
+	log.Info("Opening meta store...")
 	meta, err := OpenRocksDBMetaStore(config.MetaStorePath)
 	if err != nil {
 		txStore.Close()
@@ -180,13 +198,14 @@ func NewWorkflow(config *Config, logger interfaces.Logger) (*Workflow, error) {
 	memMon := memory.NewMemoryMonitor(logger, RAMWarningThresholdGB)
 
 	return &Workflow{
-		config:    config,
-		logger:    logger,
-		store:     txStore,
-		meta:      meta,
-		memory:    memMon,
-		stats:     &WorkflowStats{},
-		startTime: time.Now(),
+		config:       config,
+		log:          log,
+		parentLogger: logger,
+		store:        txStore,
+		meta:         meta,
+		memory:       memMon,
+		stats:        &WorkflowStats{},
+		startTime:    time.Now(),
 	}, nil
 }
 
@@ -205,12 +224,12 @@ func (w *Workflow) SetQueryHandler(qh *QueryHandler) {
 func (w *Workflow) Run() error {
 	w.stats.StartTime = time.Now()
 
-	w.logger.Separator()
-	w.logger.Info("                    TXHASH INGESTION WORKFLOW")
-	w.logger.Separator()
-	w.logger.Info("")
-	w.logger.Info("Start Time: %s", w.stats.StartTime.Format("2006-01-02 15:04:05"))
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    TXHASH INGESTION WORKFLOW")
+	w.log.Separator()
+	w.log.Info("")
+	w.log.Info("Start Time: %s", w.stats.StartTime.Format("2006-01-02 15:04:05"))
+	w.log.Info("")
 
 	// Check resumability and determine starting point
 	canResume, startFrom, phase, err := CheckResumability(w.meta, w.config.StartLedger, w.config.EndLedger)
@@ -223,17 +242,17 @@ func (w *Workflow) Run() error {
 
 	// Handle resume or fresh start
 	if canResume {
-		LogResumeState(w.meta, w.logger, startFrom, phase)
+		LogResumeState(w.meta, w.log, startFrom, phase)
 
 		// Check if already complete
 		if phase == types.PhaseComplete {
-			w.logger.Info("Workflow already complete. Nothing to do.")
-			w.logger.Info("")
+			w.log.Info("Workflow already complete. Nothing to do.")
+			w.log.Info("")
 			return nil
 		}
 	} else {
 		// Fresh start - set config in meta store
-		w.logger.Info("Starting fresh workflow...")
+		w.log.Info("Starting fresh workflow...")
 		if err := w.meta.SetConfig(w.config.StartLedger, w.config.EndLedger); err != nil {
 			return fmt.Errorf("failed to set config: %w", err)
 		}
@@ -243,7 +262,7 @@ func (w *Workflow) Run() error {
 
 	// Take initial memory snapshot
 	snapshot := memory.TakeMemorySnapshot()
-	snapshot.Log(w.logger, "Initial")
+	snapshot.Log(w.log, "Initial")
 
 	// Start query handler if available
 	if w.queryHandler != nil {
@@ -307,10 +326,10 @@ func (w *Workflow) runFromPhase(startPhase types.Phase, startFromLedger uint32) 
 
 // runIngestion executes the ingestion phase.
 func (w *Workflow) runIngestion(startFromLedger uint32) error {
-	w.logger.Separator()
-	w.logger.Info("                    PHASE 1: INGESTION")
-	w.logger.Separator()
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    PHASE 1: INGESTION")
+	w.log.Separator()
+	w.log.Info("")
 
 	// Update query handler phase
 	if w.queryHandler != nil {
@@ -319,20 +338,20 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 
 	// Log start state
 	isResume := startFromLedger > w.config.StartLedger
-	LogIngestionStart(w.logger, w.config, isResume, startFromLedger)
+	LogIngestionStart(w.log, w.config, isResume, startFromLedger)
 
 	phaseStart := time.Now()
 
 	// Choose between parallel and sequential ingestion
 	var err error
 	if w.config.SequentialIngestion {
-		w.logger.Info("Using SEQUENTIAL ingestion mode")
-		w.logger.Info("")
-		err = RunIngestion(w.config, w.store, w.meta, w.logger, w.memory, startFromLedger)
+		w.log.Info("Using SEQUENTIAL ingestion mode")
+		w.log.Info("")
+		err = RunIngestion(w.config, w.store, w.meta, w.log, w.memory, startFromLedger)
 	} else {
-		w.logger.Info("Using PARALLEL ingestion mode")
-		w.logger.Info("")
-		err = RunParallelIngestion(w.config, w.store, w.meta, w.logger, w.memory, startFromLedger)
+		w.log.Info("Using PARALLEL ingestion mode")
+		w.log.Info("")
+		err = RunParallelIngestion(w.config, w.store, w.meta, w.log, w.memory, startFromLedger)
 	}
 	if err != nil {
 		return fmt.Errorf("ingestion failed: %w", err)
@@ -353,30 +372,35 @@ func (w *Workflow) runIngestion(startFromLedger uint32) error {
 		return fmt.Errorf("failed to set phase to COMPACTING: %w", err)
 	}
 
-	w.logger.Info("")
-	w.logger.Info("Ingestion phase completed in %s", helpers.FormatDuration(w.stats.IngestionTime))
-	w.logger.Info("Total keys ingested: %s", helpers.FormatNumber(int64(totalKeys)))
-	w.logger.Info("")
-	w.logger.Sync()
+	w.log.Info("")
+	w.log.Info("Ingestion phase completed in %s", helpers.FormatDuration(w.stats.IngestionTime))
+	w.log.Info("Total keys ingested: %s", helpers.FormatNumber(int64(totalKeys)))
+	w.log.Info("")
+	w.log.Sync()
 
 	return nil
 }
 
 // runCompaction executes the compaction phase.
 func (w *Workflow) runCompaction() error {
-	w.logger.Separator()
-	w.logger.Info("                    PHASE 2: COMPACTION")
-	w.logger.Separator()
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    PHASE 2: COMPACTION")
+	w.log.Separator()
+	w.log.Info("")
 
 	// Update query handler phase
 	if w.queryHandler != nil {
 		w.queryHandler.SetPhase(types.PhaseCompacting)
 	}
 
-	// Run compaction (track time separately)
+	// Run compaction using the new Config pattern (track time separately)
 	compactionStart := time.Now()
-	_, err := compact.RunCompaction(w.store, w.logger, w.memory)
+	compactor := compact.New(compact.Config{
+		Store:  w.store,
+		Logger: w.parentLogger,
+		Memory: w.memory,
+	})
+	_, err := compactor.Run()
 	if err != nil {
 		return fmt.Errorf("compaction failed: %w", err)
 	}
@@ -384,7 +408,12 @@ func (w *Workflow) runCompaction() error {
 
 	// Verify counts match after compaction (track time separately)
 	// This catches count mismatches early before RecSplit build
-	verifyStats, err := compact.VerifyCountsAfterCompaction(w.store, w.meta, w.logger)
+	countVerifier := compact.NewCountVerifier(compact.CountVerifierConfig{
+		Store:  w.store,
+		Meta:   w.meta,
+		Logger: w.parentLogger,
+	})
+	verifyStats, err := countVerifier.Run()
 	if err != nil {
 		return fmt.Errorf("post-compaction count verification failed: %w", err)
 	}
@@ -392,10 +421,10 @@ func (w *Workflow) runCompaction() error {
 
 	// Log warning if mismatches found (but don't abort - RecSplit will fail definitively)
 	if !verifyStats.AllMatched {
-		w.logger.Error("")
-		w.logger.Error("WARNING: Count verification found %d mismatches!", verifyStats.Mismatches)
-		w.logger.Error("Continuing to RecSplit build, which will fail if counts don't match.")
-		w.logger.Error("")
+		w.log.Error("")
+		w.log.Error("WARNING: Count verification found %d mismatches!", verifyStats.Mismatches)
+		w.log.Error("Continuing to RecSplit build, which will fail if counts don't match.")
+		w.log.Error("")
 	}
 
 	// Transition to next phase
@@ -403,22 +432,22 @@ func (w *Workflow) runCompaction() error {
 		return fmt.Errorf("failed to set phase to BUILDING_RECSPLIT: %w", err)
 	}
 
-	w.logger.Info("")
-	w.logger.Info("Compaction phase completed:")
-	w.logger.Info("  RocksDB compaction: %s", helpers.FormatDuration(w.stats.CompactionTime))
-	w.logger.Info("  Count verification: %s", helpers.FormatDuration(w.stats.CountVerifyTime))
-	w.logger.Info("")
-	w.logger.Sync()
+	w.log.Info("")
+	w.log.Info("Compaction phase completed:")
+	w.log.Info("  RocksDB compaction: %s", helpers.FormatDuration(w.stats.CompactionTime))
+	w.log.Info("  Count verification: %s", helpers.FormatDuration(w.stats.CountVerifyTime))
+	w.log.Info("")
+	w.log.Sync()
 
 	return nil
 }
 
 // runRecSplitBuild executes the RecSplit building phase.
 func (w *Workflow) runRecSplitBuild() error {
-	w.logger.Separator()
-	w.logger.Info("                    PHASE 3: RECSPLIT BUILDING")
-	w.logger.Separator()
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    PHASE 3: RECSPLIT BUILDING")
+	w.log.Separator()
+	w.log.Info("")
 
 	// Update query handler phase (SIGHUP ignored during this phase)
 	if w.queryHandler != nil {
@@ -433,16 +462,16 @@ func (w *Workflow) runRecSplitBuild() error {
 		return fmt.Errorf("failed to get CF counts: %w", err)
 	}
 
-	// Build RecSplit indexes
-	builder := recsplit.NewBuilder(
-		w.store,
-		cfCounts,
-		w.config.RecsplitIndexPath,
-		w.config.RecsplitTmpPath,
-		w.config.MultiIndexEnabled,
-		w.logger,
-		w.memory,
-	)
+	// Build RecSplit indexes using the new Config pattern
+	builder := recsplit.New(recsplit.Config{
+		Store:      w.store,
+		CFCounts:   cfCounts,
+		IndexPath:  w.config.RecsplitIndexPath,
+		TmpPath:    w.config.RecsplitTmpPath,
+		MultiIndex: w.config.MultiIndexEnabled,
+		Logger:     w.parentLogger,
+		Memory:     w.memory,
+	})
 	stats, err := builder.Run()
 	if err != nil {
 		return fmt.Errorf("RecSplit build failed: %w", err)
@@ -455,42 +484,37 @@ func (w *Workflow) runRecSplitBuild() error {
 		return fmt.Errorf("failed to set phase to VERIFYING_RECSPLIT: %w", err)
 	}
 
-	w.logger.Info("")
-	w.logger.Info("RecSplit build completed in %s", helpers.FormatDuration(stats.TotalTime))
-	w.logger.Info("Total keys indexed: %s", helpers.FormatNumber(int64(stats.TotalKeys)))
-	w.logger.Info("")
-	w.logger.Sync()
+	w.log.Info("")
+	w.log.Info("RecSplit build completed in %s", helpers.FormatDuration(stats.TotalTime))
+	w.log.Info("Total keys indexed: %s", helpers.FormatNumber(int64(stats.TotalKeys)))
+	w.log.Info("")
+	w.log.Sync()
 
 	return nil
 }
 
 // runVerification executes the verification phase.
 func (w *Workflow) runVerification() error {
-	w.logger.Separator()
-	w.logger.Info("                    PHASE 4: VERIFICATION")
-	w.logger.Separator()
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    PHASE 4: VERIFICATION")
+	w.log.Separator()
+	w.log.Info("")
 
 	// Update query handler phase (SIGHUP ignored during this phase)
 	if w.queryHandler != nil {
 		w.queryHandler.SetPhase(types.PhaseVerifyingRecsplit)
 	}
 
-	// Check if resuming from a specific CF
-	resumeFromCF, _ := w.meta.GetVerifyCF()
-
 	phaseStart := time.Now()
 
-	// Create verifier and run verification
-	verifier := verify.NewVerifier(
-		w.store,
-		w.meta,
-		w.config.RecsplitIndexPath,
-		resumeFromCF,
-		w.config.MultiIndexEnabled,
-		w.logger,
-		w.memory,
-	)
+	// Create verifier using the new Config pattern and run verification
+	verifier := verify.New(verify.Config{
+		Store:      w.store,
+		IndexPath:  w.config.RecsplitIndexPath,
+		MultiIndex: w.config.MultiIndexEnabled,
+		Logger:     w.parentLogger,
+		Memory:     w.memory,
+	})
 	stats, err := verifier.Run()
 	if err != nil {
 		return fmt.Errorf("verification failed: %w", err)
@@ -510,16 +534,16 @@ func (w *Workflow) runVerification() error {
 		w.queryHandler.SetPhase(types.PhaseComplete)
 	}
 
-	w.logger.Info("")
-	w.logger.Info("Verification completed in %s", helpers.FormatDuration(stats.TotalTime))
-	w.logger.Info("Keys verified: %s", helpers.FormatNumber(int64(stats.TotalKeysVerified)))
+	w.log.Info("")
+	w.log.Info("Verification completed in %s", helpers.FormatDuration(stats.TotalTime))
+	w.log.Info("Keys verified: %s", helpers.FormatNumber(int64(stats.TotalKeysVerified)))
 	if stats.TotalFailures > 0 {
-		w.logger.Error("Verification failures: %d", stats.TotalFailures)
+		w.log.Error("Verification failures: %d", stats.TotalFailures)
 	} else {
-		w.logger.Info("Verification failures: 0")
+		w.log.Info("Verification failures: 0")
 	}
-	w.logger.Info("")
-	w.logger.Sync()
+	w.log.Info("")
+	w.log.Sync()
 
 	return nil
 }
@@ -530,75 +554,75 @@ func (w *Workflow) runVerification() error {
 
 // logFinalSummary logs the final workflow summary.
 func (w *Workflow) logFinalSummary() {
-	w.logger.Separator()
-	w.logger.Info("                    WORKFLOW COMPLETE")
-	w.logger.Separator()
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    WORKFLOW COMPLETE")
+	w.log.Separator()
+	w.log.Info("")
 
-	w.logger.Info("OVERALL STATISTICS:")
-	w.logger.Info("  Start Time:        %s", w.stats.StartTime.Format("2006-01-02 15:04:05"))
-	w.logger.Info("  End Time:          %s", w.stats.EndTime.Format("2006-01-02 15:04:05"))
-	w.logger.Info("  Total Duration:    %s", helpers.FormatDuration(w.stats.TotalTime))
-	w.logger.Info("")
+	w.log.Info("OVERALL STATISTICS:")
+	w.log.Info("  Start Time:        %s", w.stats.StartTime.Format("2006-01-02 15:04:05"))
+	w.log.Info("  End Time:          %s", w.stats.EndTime.Format("2006-01-02 15:04:05"))
+	w.log.Info("  Total Duration:    %s", helpers.FormatDuration(w.stats.TotalTime))
+	w.log.Info("")
 
 	if w.stats.IsResume {
-		w.logger.Info("  Resumed From:      %s", w.stats.ResumedFromPhase)
+		w.log.Info("  Resumed From:      %s", w.stats.ResumedFromPhase)
 	}
 
-	w.logger.Info("")
-	w.logger.Info("PHASE DURATIONS:")
-	w.logger.Info("  Ingestion:         %s", helpers.FormatDuration(w.stats.IngestionTime))
-	w.logger.Info("  Compaction:        %s", helpers.FormatDuration(w.stats.CompactionTime))
-	w.logger.Info("  Count Verify:      %s", helpers.FormatDuration(w.stats.CountVerifyTime))
-	w.logger.Info("  RecSplit Build:    %s", helpers.FormatDuration(w.stats.RecSplitTime))
-	w.logger.Info("  Verification:      %s", helpers.FormatDuration(w.stats.VerificationTime))
-	w.logger.Info("")
+	w.log.Info("")
+	w.log.Info("PHASE DURATIONS:")
+	w.log.Info("  Ingestion:         %s", helpers.FormatDuration(w.stats.IngestionTime))
+	w.log.Info("  Compaction:        %s", helpers.FormatDuration(w.stats.CompactionTime))
+	w.log.Info("  Count Verify:      %s", helpers.FormatDuration(w.stats.CountVerifyTime))
+	w.log.Info("  RecSplit Build:    %s", helpers.FormatDuration(w.stats.RecSplitTime))
+	w.log.Info("  Verification:      %s", helpers.FormatDuration(w.stats.VerificationTime))
+	w.log.Info("")
 
-	w.logger.Info("DATA STATISTICS:")
-	w.logger.Info("  Keys Ingested:     %s", helpers.FormatNumber(int64(w.stats.TotalKeysIngested)))
-	w.logger.Info("  Keys Verified:     %s", helpers.FormatNumber(int64(w.stats.TotalKeysVerified)))
+	w.log.Info("DATA STATISTICS:")
+	w.log.Info("  Keys Ingested:     %s", helpers.FormatNumber(int64(w.stats.TotalKeysIngested)))
+	w.log.Info("  Keys Verified:     %s", helpers.FormatNumber(int64(w.stats.TotalKeysVerified)))
 	if w.stats.VerificationFailures > 0 {
-		w.logger.Error("  Verify Failures:   %d", w.stats.VerificationFailures)
+		w.log.Error("  Verify Failures:   %d", w.stats.VerificationFailures)
 	} else {
-		w.logger.Info("  Verify Failures:   0")
+		w.log.Info("  Verify Failures:   0")
 	}
-	w.logger.Info("")
+	w.log.Info("")
 
 	// Final memory snapshot
-	w.memory.LogSummary(w.logger)
+	w.memory.LogSummary(w.log)
 
 	// Query handler stats
 	if w.queryHandler != nil {
 		batches, total, found, notFound := w.queryHandler.GetStats()
 		if batches > 0 {
-			w.logger.Info("SIGHUP QUERIES:")
-			w.logger.Info("  Query Batches:     %d", batches)
-			w.logger.Info("  Total Queries:     %d", total)
-			w.logger.Info("  Found:             %d", found)
-			w.logger.Info("  Not Found:         %d", notFound)
-			w.logger.Info("")
+			w.log.Info("SIGHUP QUERIES:")
+			w.log.Info("  Query Batches:     %d", batches)
+			w.log.Info("  Total Queries:     %d", total)
+			w.log.Info("  Found:             %d", found)
+			w.log.Info("  Not Found:         %d", notFound)
+			w.log.Info("")
 		}
 	}
 
-	w.logger.Info("OUTPUT LOCATIONS:")
-	w.logger.Info("  RocksDB:           %s", w.config.RocksDBPath)
-	w.logger.Info("  RecSplit Indexes:  %s", w.config.RecsplitIndexPath)
-	w.logger.Info("  Meta Store:        %s", w.config.MetaStorePath)
-	w.logger.Info("")
+	w.log.Info("OUTPUT LOCATIONS:")
+	w.log.Info("  RocksDB:           %s", w.config.RocksDBPath)
+	w.log.Info("  RecSplit Indexes:  %s", w.config.RecsplitIndexPath)
+	w.log.Info("  Meta Store:        %s", w.config.MetaStorePath)
+	w.log.Info("")
 
-	w.logger.Separator()
-	w.logger.Info("                    SUCCESS")
-	w.logger.Separator()
-	w.logger.Info("")
+	w.log.Separator()
+	w.log.Info("                    SUCCESS")
+	w.log.Separator()
+	w.log.Info("")
 
-	w.logger.Sync()
+	w.log.Sync()
 }
 
 // Close releases all resources held by the workflow.
 //
 // This must be called when done with the workflow (use defer).
 func (w *Workflow) Close() {
-	w.logger.Info("Shutting down workflow...")
+	w.log.Info("Shutting down workflow...")
 
 	// Stop query handler
 	if w.queryHandler != nil {
@@ -618,8 +642,8 @@ func (w *Workflow) Close() {
 		w.meta.Close()
 	}
 
-	w.logger.Info("Workflow shutdown complete")
-	w.logger.Sync()
+	w.log.Info("Workflow shutdown complete")
+	w.log.Sync()
 }
 
 // =============================================================================
@@ -643,7 +667,7 @@ func (w *Workflow) GetConfig() *Config {
 
 // GetLogger returns the logger.
 func (w *Workflow) GetLogger() interfaces.Logger {
-	return w.logger
+	return w.log
 }
 
 // GetStats returns the workflow statistics.
