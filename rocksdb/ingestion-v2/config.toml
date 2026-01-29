@@ -3,23 +3,17 @@
 # =============================================================================
 #
 # This configuration file controls the behavior of the Stellar RocksDB ingestion
-# tool. It defines settings for three data stores and global options.
+# tool. It defines settings for two data stores and global options.
 #
-# THREE DATA STORES:
-# ==================
+# TWO DATA STORES:
+# =================
 # 1. ledger_seq_to_lcm:     Ledger sequence → Compressed LedgerCloseMeta
 #    - Key: 4 bytes (uint32)
 #    - Value: ~200 KB (compressed LCM)
 #    - Access pattern: Sequential writes, random reads
 #    - Expected size: ~900 GB/year
 #
-# 2. tx_hash_to_tx_data:    Transaction hash → Compressed TxData protobuf
-#    - Key: 32 bytes (hash)
-#    - Value: ~1.5 KB (compressed TxData)
-#    - Access pattern: Random writes, random reads
-#    - Expected size: ~1.5 TB/year
-#
-# 3. tx_hash_to_ledger_seq: Transaction hash → Ledger sequence
+# 2. tx_hash_to_ledger_seq: Transaction hash → Ledger sequence
 #    - Key: 32 bytes (hash)
 #    - Value: 4 bytes (uint32)
 #    - Access pattern: Random writes, random reads
@@ -191,101 +185,6 @@ disable_wal = true
 
 
 # =============================================================================
-# TX_HASH_TO_TX_DATA STORE CONFIGURATION
-# =============================================================================
-# Maps: 32-byte transaction hash → zstd-compressed TxData protobuf
-#
-# Data characteristics:
-# - Key size: 32 bytes (transaction hash)
-# - Value size: ~1.5 KB compressed (varies by transaction)
-# - Keys are RANDOM (hash distribution)
-# - ~1.5 billion transactions/year
-# - ~1.5 TB/year after compression
-#
-# Random keys are challenging for RocksDB because:
-# - Every L0 file overlaps with every other file
-# - Compaction during ingestion causes massive write amplification
-# - Solution: Disable compaction, do one big sort at the end
-# =============================================================================
-[tx_hash_to_tx_data]
-
-# enabled: Whether this store is active.
-# Can be overridden by --enable-tx-hash-to-tx-data on command line.
-enabled = false
-
-# output_path: Directory where the RocksDB database will be stored.
-output_path = "/data/stellar/tx_hash_to_tx_data/2022"
-
-# RocksDB settings for this store
-[tx_hash_to_tx_data.rocksdb]
-
-# -------------------------------------------------------------------------
-# WRITE BUFFER (MEMTABLE) SETTINGS
-# -------------------------------------------------------------------------
-# Total memtable RAM = 512 MB × 4 = 2 GB
-#
-# With batch size of 2,000 ledgers × 250 tx/ledger × 1.5 KB = ~750 MB,
-# 512 MB buffers provide good balance.
-#
-# Note: We could go larger, but memory is shared across 3 stores
-# and we want to run multiple ingestion processes in parallel.
-# -------------------------------------------------------------------------
-write_buffer_size_mb = 512
-max_write_buffer_number = 4
-
-# -------------------------------------------------------------------------
-# L0 FILE MANAGEMENT
-# -------------------------------------------------------------------------
-# CRITICAL for random keys: Disable compaction triggers entirely
-# Let all data accumulate in L0, then do one final compaction
-l0_compaction_trigger = 999
-l0_slowdown_writes_trigger = 999
-l0_stop_writes_trigger = 999
-
-# -------------------------------------------------------------------------
-# SST FILE SIZE SETTINGS
-# -------------------------------------------------------------------------
-# target_file_size_mb: Target size for SST files
-#
-# For ~1.5 TB/year of data:
-# - 2048 MB (2 GB) files → ~750 files/year
-# - 10 years → ~7,500 files
-#
-# 2 GB files balance:
-# - Not too many files (file handle limits)
-# - Not too large (memory during compaction)
-# -------------------------------------------------------------------------
-target_file_size_mb = 2048
-
-# -------------------------------------------------------------------------
-# max_bytes_for_level_base_mb: Maximum total size for L1
-#
-# L1 = 20 GB, L2 = 200 GB, L3 = 2 TB, L4 = 20 TB
-#
-# With 1.5 TB/year:
-# - Year 1: Fits in L2/L3
-# - 10 years (15 TB): Fits in L4
-# -------------------------------------------------------------------------
-max_bytes_for_level_base_mb = 20480
-
-# -------------------------------------------------------------------------
-# RESOURCE LIMITS
-# -------------------------------------------------------------------------
-max_background_jobs = 8
-max_open_files = 10000
-
-# Bloom filters are ESSENTIAL for random key lookups
-# 10 bits/key = ~1% false positive rate
-# Memory: 1.5B keys × 10 bits = ~1.9 GB of bloom filters per year
-bloom_filter_bits_per_key = 10
-
-# -------------------------------------------------------------------------
-# WAL (WRITE-AHEAD LOG)
-# -------------------------------------------------------------------------
-disable_wal = true
-
-
-# =============================================================================
 # TX_HASH_TO_LEDGER_SEQ STORE CONFIGURATION
 # =============================================================================
 # Maps: 32-byte transaction hash → uint32 ledger sequence
@@ -298,7 +197,6 @@ disable_wal = true
 # - ~54 GB/year raw data (1.5B × 36 bytes)
 #
 # This is a compact index - just hash → sequence mapping.
-# Much smaller than tx_hash_to_tx_data.
 # =============================================================================
 [tx_hash_to_ledger_seq]
 
@@ -349,7 +247,7 @@ max_write_buffer_number = 4
 # -------------------------------------------------------------------------
 # L0 FILE MANAGEMENT
 # -------------------------------------------------------------------------
-# Same strategy as tx_hash_to_tx_data: disable during ingestion
+# Same strategy as ledger_seq_to_lcm: disable during ingestion
 l0_compaction_trigger = 999
 l0_slowdown_writes_trigger = 999
 l0_stop_writes_trigger = 999
@@ -398,7 +296,7 @@ disable_wal = true
 # CONFIGURATION EXAMPLES
 # =============================================================================
 #
-# EXAMPLE 1: Full yearly ingestion (all 3 stores)
+# EXAMPLE 1: Full yearly ingestion (both stores)
 # -----------------------------------------------
 # Command:
 #   ./run_ingestion.sh \
@@ -406,15 +304,13 @@ disable_wal = true
 #     --year 2022 \
 #     --ledger-batch-size 2000 \
 #     --enable-ledger-seq-to-lcm \
-#     --enable-tx-hash-to-tx-data \
 #     --enable-tx-hash-to-ledger-seq
 #
 # Memory usage (per process):
 #   - ledger_seq_to_lcm:    4 GB memtables + data buffers
-#   - tx_hash_to_tx_data:   2 GB memtables + data buffers
 #   - tx_hash_to_ledger_seq: 1 GB memtables + data buffers
 #   - Processing buffers:   ~1.5 GB (batch size 2000)
-#   - Total: ~10-12 GB per process
+#   - Total: ~8-10 GB per process
 #
 #
 # EXAMPLE 2: Transaction index only (reading from existing LCM store)
@@ -449,14 +345,13 @@ disable_wal = true
 #
 # Recommended settings per process:
 # - ledger_seq_to_lcm:     write_buffer_size_mb = 1024, max_write_buffer_number = 4
-# - tx_hash_to_tx_data:    write_buffer_size_mb = 512,  max_write_buffer_number = 4
 # - tx_hash_to_ledger_seq: write_buffer_size_mb = 256,  max_write_buffer_number = 4
 # - max_background_jobs = 5 (shared across stores in practice)
 #
-# Total memtable RAM per process: 4 + 2 + 1 = 7 GB
+# Total memtable RAM per process: 4 + 1 = 5 GB
 # Processing buffers (batch 2000): ~1.5 GB
 # Bloom filters (accumulated): ~2 GB per year
 # Overhead: ~2 GB
-# Total: ~12-15 GB per process
+# Total: ~10-12 GB per process
 #
 # =============================================================================

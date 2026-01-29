@@ -27,15 +27,12 @@ import (
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/tx_data"
 	"github.com/klauspost/compress/zstd"
 	"github.com/linxGnu/grocksdb"
 	"github.com/pkg/errors"
 	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // =============================================================================
@@ -367,12 +364,6 @@ func CompressLCMsInParallel(lcms []LcmWithSeq, numWorkers int) (*LcmCompressionR
 
 // TxCompressionResult holds the aggregated results of compressing transactions.
 type TxCompressionResult struct {
-	// For tx_hash_to_tx_data store
-	TxHashToTxData   map[string][]byte // txHash (hex) -> compressed TxData
-	UncompressedSize int64
-	CompressedSize   int64
-	TxCount          int64
-
 	// For tx_hash_to_ledger_seq store
 	TxHashToLedgerSeq map[string]uint32 // txHash (hex) -> ledgerSeq
 
@@ -381,30 +372,25 @@ type TxCompressionResult struct {
 }
 
 // CompressTransactionsInParallel compresses transactions and builds mappings in parallel.
-// It handles both tx_hash_to_tx_data and tx_hash_to_ledger_seq stores.
+// It handles tx_hash_to_ledger_seq store.
 func CompressTransactionsInParallel(
 	transactions []RawTxData,
 	numWorkers int,
-	enableTxData bool, // Compress for tx_hash_to_tx_data
 	enableHashSeq bool, // Build tx_hash_to_ledger_seq mapping
 	enableRawFile bool, // Build raw file data
 ) (*TxCompressionResult, error) {
 	if len(transactions) == 0 {
 		return &TxCompressionResult{
-			TxHashToTxData:    make(map[string][]byte),
 			TxHashToLedgerSeq: make(map[string]uint32),
 		}, nil
 	}
 
 	// Results slice for parallel processing
 	type workerResult struct {
-		Hash             string
-		CompressedData   []byte // Only if enableTxData
-		UncompressedSize int64
-		CompressedSize   int64
-		LedgerSeq        uint32
-		TxHashBytes      []byte // 32-byte hash
-		Err              error
+		Hash        string
+		LedgerSeq   uint32
+		TxHashBytes []byte // 32-byte hash
+		Err         error
 	}
 
 	results := make([]workerResult, len(transactions))
@@ -416,22 +402,6 @@ func CompressTransactionsInParallel(
 		go func() {
 			defer wg.Done()
 
-			// Each worker gets its own zstd encoder (only if needed)
-			var encoder *zstd.Encoder
-			if enableTxData {
-				var err error
-				encoder, err = zstd.NewWriter(nil)
-				if err != nil {
-					for idx := range jobs {
-						results[idx] = workerResult{
-							Err: errors.Wrap(err, "failed to create zstd encoder"),
-						}
-					}
-					return
-				}
-				defer encoder.Close()
-			}
-
 			for idx := range jobs {
 				tx := transactions[idx]
 				result := workerResult{
@@ -442,54 +412,6 @@ func CompressTransactionsInParallel(
 				// Get hash bytes for raw file
 				if enableRawFile || enableHashSeq {
 					result.TxHashBytes = tx.Tx.Hash[:]
-				}
-
-				// Process for tx_hash_to_tx_data if enabled
-				if enableTxData {
-					// Marshal transaction components
-					txEnvelopeBytes, err := tx.Tx.Envelope.MarshalBinary()
-					if err != nil {
-						result.Err = errors.Wrap(err, "failed to marshal tx envelope")
-						results[idx] = result
-						continue
-					}
-
-					txResultBytes, err := tx.Tx.Result.MarshalBinary()
-					if err != nil {
-						result.Err = errors.Wrap(err, "failed to marshal tx result")
-						results[idx] = result
-						continue
-					}
-
-					txMetaBytes, err := tx.Tx.UnsafeMeta.MarshalBinary()
-					if err != nil {
-						result.Err = errors.Wrap(err, "failed to marshal tx meta")
-						results[idx] = result
-						continue
-					}
-
-					// Build protobuf
-					txDataProto := tx_data.TxData{
-						LedgerSequence: tx.LedgerSeq,
-						ClosedAt:       timestamppb.New(tx.ClosedAt),
-						Index:          tx.Tx.Index,
-						TxEnvelope:     txEnvelopeBytes,
-						TxResult:       txResultBytes,
-						TxMeta:         txMetaBytes,
-					}
-
-					txDataBytes, err := proto.Marshal(&txDataProto)
-					if err != nil {
-						result.Err = errors.Wrap(err, "failed to marshal TxData proto")
-						results[idx] = result
-						continue
-					}
-
-					result.UncompressedSize = int64(len(txDataBytes))
-
-					// Compress
-					result.CompressedData = encoder.EncodeAll(txDataBytes, make([]byte, 0, len(txDataBytes)))
-					result.CompressedSize = int64(len(result.CompressedData))
 				}
 
 				results[idx] = result
@@ -507,7 +429,6 @@ func CompressTransactionsInParallel(
 
 	// Aggregate results
 	aggregated := &TxCompressionResult{
-		TxHashToTxData:    make(map[string][]byte, len(transactions)),
 		TxHashToLedgerSeq: make(map[string]uint32, len(transactions)),
 	}
 
@@ -521,12 +442,6 @@ func CompressTransactionsInParallel(
 			return nil, result.Err
 		}
 
-		if enableTxData {
-			aggregated.TxHashToTxData[result.Hash] = result.CompressedData
-			aggregated.UncompressedSize += result.UncompressedSize
-			aggregated.CompressedSize += result.CompressedSize
-		}
-
 		if enableHashSeq {
 			aggregated.TxHashToLedgerSeq[result.Hash] = result.LedgerSeq
 		}
@@ -536,8 +451,6 @@ func CompressTransactionsInParallel(
 			aggregated.RawFileData = append(aggregated.RawFileData, result.TxHashBytes...)
 			aggregated.RawFileData = append(aggregated.RawFileData, helpers.Uint32ToBytes(result.LedgerSeq)...)
 		}
-
-		aggregated.TxCount++
 	}
 
 	return aggregated, nil
@@ -555,12 +468,6 @@ type BatchProcessingResult struct {
 	LcmCompressed   int64
 	LcmCount        int64
 
-	// For tx_hash_to_tx_data
-	TxDataMap          map[string][]byte
-	TxDataUncompressed int64
-	TxDataCompressed   int64
-	TxDataCount        int64
-
 	// For tx_hash_to_ledger_seq
 	HashSeqMap   map[string]uint32
 	HashSeqCount int64
@@ -569,8 +476,7 @@ type BatchProcessingResult struct {
 	RawFileData []byte
 
 	// Timing
-	LcmCompressionTime    time.Duration
-	TxDataCompressionTime time.Duration
+	LcmCompressionTime time.Duration
 }
 
 // ProcessBatch processes all ledgers in a batch and prepares data for writing.
@@ -582,7 +488,6 @@ func ProcessBatch(
 ) (*BatchProcessingResult, error) {
 	result := &BatchProcessingResult{
 		LcmData:    make(map[uint32][]byte),
-		TxDataMap:  make(map[string][]byte),
 		HashSeqMap: make(map[string]uint32),
 	}
 
@@ -603,26 +508,17 @@ func ProcessBatch(
 
 	// Process transactions if any tx store is enabled
 	if config.ProcessTransactions && len(transactions) > 0 {
-		start := time.Now()
-
 		enableRawFile := config.TxHashToLedgerSeq.RawDataFilePath != ""
 
 		txResult, err := CompressTransactionsInParallel(
 			transactions,
 			numWorkers,
-			config.EnableTxHashToTxData,
 			config.EnableTxHashToLedgerSeq,
 			enableRawFile,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to compress transactions")
 		}
-		result.TxDataCompressionTime = time.Since(start)
-
-		result.TxDataMap = txResult.TxHashToTxData
-		result.TxDataUncompressed = txResult.UncompressedSize
-		result.TxDataCompressed = txResult.CompressedSize
-		result.TxDataCount = txResult.TxCount
 
 		result.HashSeqMap = txResult.TxHashToLedgerSeq
 		result.HashSeqCount = int64(len(txResult.TxHashToLedgerSeq))

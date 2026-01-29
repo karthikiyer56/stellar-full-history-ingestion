@@ -157,69 +157,67 @@ go build -o txhash-ingestion-workflow .
 
 The workflow progresses through 5 logical phases (4 operational + completion):
 
+```mermaid
+flowchart TB
+    subgraph Phase1["PHASE 1: INGESTING (PARALLEL)"]
+        direction LR
+        LFS["LFS Readers<br/>(4 threads)"] --> Workers["Workers<br/>(16 threads)"]
+        Workers --> Collector["Collector<br/>(1 thread)"]
+        Collector --> RocksDB["Write to<br/>RocksDB CFs"]
+    end
+    
+    subgraph Phase2A["PHASE 2A: COMPACTING (PARALLEL)"]
+        Compact["All 16 CFs compact in parallel<br/>Queries NOT blocked (thread-safe)"]
+    end
+    
+    subgraph Phase2B["PHASE 2B: COUNT VERIFICATION"]
+        CountVerify["All 16 CFs counted in parallel<br/>Compare actual vs expected counts"]
+    end
+    
+    subgraph Phase3["PHASE 3: BUILDING RECSPLIT"]
+        RecSplit["Default: Single txhash.idx (sequential)<br/>Multi-Index: 16 cf-X.idx files (parallel)"]
+    end
+    
+    subgraph Phase4["PHASE 4: VERIFYING RECSPLIT"]
+        Verify["All 16 CFs verified in parallel<br/>Lookup each key, verify ledgerSeq matches"]
+    end
+    
+    subgraph Phase5["PHASE 5: COMPLETE"]
+        Done["All phases finished<br/>Indexes ready for use"]
+    end
+    
+    Phase1 -->|"Checkpoint: Every 5000 ledgers<br/>SIGHUP: Enabled"| Phase2A
+    Phase2A -->|"SIGHUP: Enabled"| Phase2B
+    Phase2B --> Phase3
+    Phase3 -->|"SIGHUP: Ignored"| Phase4
+    Phase4 -->|"SIGHUP: Ignored"| Phase5
+```
+
+<details>
+<summary>ASCII Diagram (for terminals)</summary>
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                           WORKFLOW PIPELINE DIAGRAM                              │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 1: INGESTING (PARALLEL)                                               │ │
-│  │ ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐       │ │
-│  │ │ LFS Readers │ → │ Workers     │ → │ Collector   │ → │ Write to    │       │ │
-│  │ │ (4 threads) │   │ (16 threads)│   │ (1 thread)  │   │ RocksDB CFs │       │ │
-│  │ └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘       │ │
-│  │                                                                              │ │
-│  │ Checkpoint: Every 5000 ledgers (last_committed_ledger, cfCounts)            │ │
-│  │ SIGHUP: Enabled (queries run against partial data)                          │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 2A: COMPACTING (PARALLEL - 16 CFs simultaneously)                     │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ All 16 CFs compact in parallel using goroutines                        │ │ │
-│  │ │ Queries NOT blocked: RocksDB is thread-safe, no locks held             │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ SIGHUP: Enabled (queries run concurrently with compaction)                  │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 2B: COUNT VERIFICATION (PARALLEL - 16 CFs simultaneously)            │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ All 16 CFs counted in parallel using scan-optimized iterators          │ │ │
-│  │ │ Compare actual counts with expected counts from meta store              │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 3: BUILDING RECSPLIT (Single Index OR Multi-Index)                   │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ Default:       Single txhash.idx built from all 16 CFs sequentially   │ │ │
-│  │ │ Multi-Index:   16 cf-X.idx files built in parallel (~144 GB RAM)      │ │ │
-│  │ │                Use --multi-index-enabled flag                          │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ SIGHUP: Ignored (RecSplit library not interruptible)                        │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 4: VERIFYING_RECSPLIT (PARALLEL - 16 CFs simultaneously)                       │ │
-│  │ ┌─────────────────────────────────────────────────────────────────────────┐ │ │
-│  │ │ All 16 CFs verified in parallel using scan-optimized iterators         │ │ │
-│  │ │ For each key: lookup in RecSplit, verify ledgerSeq matches RocksDB     │ │ │
-│  │ └─────────────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                              │ │
-│  │ SIGHUP: Ignored (verification is read-only, but runs independently)         │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                      ↓                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐ │
-│  │ PHASE 5: COMPLETE                                                           │ │
-│  │                                                                              │ │
-│  │ All phases finished successfully. Indexes are ready for use.                │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
+│  PHASE 1: INGESTING (PARALLEL)                                                  │
+│  LFS Readers (4) → Workers (16) → Collector (1) → RocksDB CFs                   │
+│  Checkpoint: Every 5000 ledgers | SIGHUP: Enabled                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  PHASE 2A: COMPACTING (16 CFs in parallel) | SIGHUP: Enabled                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  PHASE 2B: COUNT VERIFICATION (16 CFs in parallel)                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  PHASE 3: BUILDING RECSPLIT | SIGHUP: Ignored                                   │
+│  Default: Single txhash.idx | Multi-Index: 16 cf-X.idx files                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  PHASE 4: VERIFYING RECSPLIT (16 CFs in parallel) | SIGHUP: Ignored             │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  PHASE 5: COMPLETE - Indexes ready for use                                      │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+</details>
 
 ### Phase Summary Table
 
@@ -245,11 +243,10 @@ The workflow progresses through 5 logical phases (4 operational + completion):
 
 Ingestion uses a 3-stage parallel pipeline:
 
-```
-┌─────────────────┐    ┌─────────────────────┐    ┌──────────────┐
-│   LFS READERS   │───>│    WORKER POOL      │───>│   COLLECTOR  │
-│  (4 goroutines) │    │   (16 goroutines)   │    │ (1 goroutine)│
-└─────────────────┘    └─────────────────────┘    └──────────────┘
+```mermaid
+flowchart LR
+    LFS["LFS READERS<br/>(4 goroutines)"] --> Workers["WORKER POOL<br/>(16 goroutines)"]
+    Workers --> Collector["COLLECTOR<br/>(1 goroutine)"]
 ```
 
 | Stage | Goroutines | Responsibility |
