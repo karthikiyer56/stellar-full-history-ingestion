@@ -304,6 +304,5 @@ ledger_path = "/nvme/stellar-rpc/active/ledger/rocksdb"  # Used exactly as speci
 
 ## References
 
-- Canonical TOML schema: `.sisyphus/plans/create-design-docs.md` (lines 186-219)
 - BufferedStorage backend: `rocksdb/ingestion-v2/main.go`
 - CaptiveStellarCore usage: `rocksdb/ingestion-v2/` examples

@@ -188,9 +188,3 @@ These invariants are fundamental to the system's correctness and MUST be maintai
 - **Network**: High bandwidth for GCS access (backfill mode)
 
 ---
-
-## Related Documentation
-
-- **Requirements**: `random-readmes/requitements-for-full-history-rpc-service.md`
-- **Interview Notes**: `.sisyphus/drafts/full-history-rpc-design.md`
-- **Previous Design**: `.sisyphus/plans/stellar-full-history-rpc-design.md`
