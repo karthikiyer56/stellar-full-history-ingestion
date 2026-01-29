@@ -364,3 +364,4 @@ func TestCrashRecovery(t *testing.T) {
 - [Meta Store Design](./02-meta-store-design.md#scenario-6-crash-during-transition) - Scenario 6: Transition Crash
 - [Backfill Workflow](./03-backfill-workflow.md#checkpoint-mechanism) - Backfill checkpointing
 - [Streaming Workflow](./04-streaming-workflow.md#graceful-shutdown) - Streaming shutdown and recovery
+- [Checkpointing and Transitions](./10-checkpointing-and-transitions.md) - Canonical reference for checkpoint math and range boundaries

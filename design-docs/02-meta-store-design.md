@@ -463,3 +463,4 @@ This enables:
 - [Backfill Workflow](./03-backfill-workflow.md) - How backfill mode uses meta store
 - [Streaming Workflow](./04-streaming-workflow.md) - How streaming mode uses meta store
 - [Crash Recovery](./06-crash-recovery.md) - Recovery scenarios using checkpoint data
+- [Checkpointing and Transitions](./10-checkpointing-and-transitions.md) - Canonical reference for checkpoint math and range boundaries
