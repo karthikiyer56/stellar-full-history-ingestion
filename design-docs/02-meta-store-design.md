@@ -202,20 +202,20 @@ range:2:end_ledger                   = 30000001
 ```
 range:0:state                        = "INGESTING"
 range:0:ledger:phase                 = "INGESTING"
-range:0:ledger:last_committed_ledger = 5000      # After first 5000 ledgers
+range:0:ledger:last_committed_ledger = 5001      # After first 5000 ledgers
 range:0:ledger:count                 = 5000
 
 range:0:txhash:phase                 = "INGESTING"
-range:0:txhash:last_committed_ledger = 5000
+range:0:txhash:last_committed_ledger = 5001
 range:0:txhash:cf_counts             = {"0": 312, "1": 298, ..., "f": 305}
 ```
 
 **Checkpoint Update (every 1000 ledgers in backfill)**:
 ```
-# After processing ledger 6000:
-range:0:ledger:last_committed_ledger = 6000
+# After processing ledger 6001:
+range:0:ledger:last_committed_ledger = 6001
 range:0:ledger:count                 = 6000
-range:0:txhash:last_committed_ledger = 6000
+range:0:txhash:last_committed_ledger = 6001
 range:0:txhash:cf_counts             = {"0": 375, "1": 362, ..., "f": 368}
 ```
 
@@ -245,15 +245,15 @@ range:0:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/range
 **State at Crash**:
 ```
 range:0:state                        = "INGESTING"
-range:0:ledger:last_committed_ledger = 7499000   # Last checkpoint
-range:0:txhash:last_committed_ledger = 7499000
+range:0:ledger:last_committed_ledger = 7499001   # Last checkpoint
+range:0:txhash:last_committed_ledger = 7499001
 ```
 
 **Recovery Process**:
 1. Operator runs: `./stellar-rpc --backfill --start-ledger 2 --end-ledger 30000001`
 2. Code reads meta store, finds `range:0:state = "INGESTING"`
-3. Code reads `range:0:ledger:last_committed_ledger = 7499000`
-4. **Resume from ledger 7499001**
+3. Code reads `range:0:ledger:last_committed_ledger = 7499001`
+4. **Resume from ledger 7499002**
 5. Continue until range completes
 
 **Post-Recovery, Range 0 Complete**:
@@ -263,7 +263,7 @@ range:0:ledger:phase                 = "IMMUTABLE"
 range:0:txhash:phase                 = "COMPLETE"
 ```
 
-**Key Insight**: Ledgers 7499001-7500000 may already be in RocksDB from before the crash. Re-ingestion creates duplicates (same key→value), which are harmless and removed during compaction.
+**Key Insight**: Ledgers 7499002-7500000 may already be in RocksDB from before the crash. Re-ingestion creates duplicates (same key→value), which are harmless and removed during compaction.
 
 ---
 

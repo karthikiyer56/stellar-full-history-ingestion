@@ -74,9 +74,9 @@ func checkpoint(metaStore *RocksDB, rangeID uint32, ledgerSeq uint32,
 **State at Crash**:
 ```
 range:0:state = "INGESTING"
-range:0:ledger:last_committed_ledger = 7499000  # Last checkpoint
+range:0:ledger:last_committed_ledger = 7499001  # Last checkpoint
 range:0:ledger:count = 7499000
-range:0:txhash:last_committed_ledger = 7499000
+range:0:txhash:last_committed_ledger = 7499001
 range:0:txhash:cf_counts = {"0": 468000, "1": 469500, ..., "f": 467800}
 ```
 
@@ -84,12 +84,12 @@ range:0:txhash:cf_counts = {"0": 468000, "1": 469500, ..., "f": 467800}
 1. Operator runs same command: `./stellar-rpc --backfill --start-ledger 2 --end-ledger 30000001`
 2. Code loads meta store
 3. Finds `range:0:state = "INGESTING"` (incomplete)
-4. Reads `range:0:ledger:last_committed_ledger = 7499000`
-5. **Resumes from ledger 7499001**
+4. Reads `range:0:ledger:last_committed_ledger = 7499001`
+5. **Resumes from ledger 7499002**
 6. Continues until range completes
 
 **Duplicate Handling**:
-- Ledgers 7499001-7500000 may already be in RocksDB
+- Ledgers 7499002-7500000 may already be in RocksDB
 - Re-ingestion writes same key→value pairs (idempotent)
 - Compaction removes duplicates
 - Counts remain accurate (restored from checkpoint, not recomputed)
@@ -110,17 +110,17 @@ range:0:txhash:phase = "COMPLETE"
 **State at Crash**:
 ```
 # Meta store (not updated):
-range:0:ledger:last_committed_ledger = 5000
+range:0:ledger:last_committed_ledger = 5001
 
 # RocksDB (updated):
-# Ledgers 5001-6000 are in RocksDB
+# Ledgers 5002-6001 are in RocksDB
 ```
 
 **Recovery**:
-1. Load meta store: `last_committed_ledger = 5000`
-2. Resume from ledger 5001
-3. Re-ingest ledgers 5001-6000 (duplicates)
-4. Continue from 6001
+1. Load meta store: `last_committed_ledger = 5001`
+2. Resume from ledger 5002
+3. Re-ingest ledgers 5002-6001 (duplicates)
+4. Continue from 6002
 
 **Why This Works**:
 - RocksDB writes are idempotent (same key→value)
