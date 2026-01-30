@@ -97,6 +97,25 @@ range:2:end_ledger = 30000001
 
 ---
 
+## Mode Transition
+
+When streaming mode starts successfully (after gap validation passes):
+
+```
+# Mode is set to streaming (whether fresh transition or restart)
+global:mode = "streaming"
+
+# Last processed ledger from backfill is recorded
+global:last_processed_ledger = <highest end_ledger from COMPLETE ranges>
+```
+
+**Key Points**:
+- If `--backfill` flag was NOT present AND all prior ranges are COMPLETE, mode is set to `"streaming"`
+- If `global:mode = "streaming"` already exists (restart scenario), gap validation still runs to ensure all prior ranges are COMPLETE
+- For complete mode lifecycle rules, see [Backfill Workflow - Initial Meta Store State](./03-backfill-workflow.md#initial-meta-store-state)
+
+---
+
 ## Ingestion Loop
 
 ```mermaid
@@ -229,6 +248,34 @@ flowchart TD
 - Clean exit (code 0)
 
 **Resume**: On restart, streaming mode resumes from `global:last_processed_ledger + 1`.
+
+### Meta Store State After Graceful Shutdown
+
+After graceful shutdown completes:
+
+```
+global:mode = "streaming"
+global:last_processed_ledger = 65000500  # Last checkpointed ledger
+
+range:6:state = "INGESTING"
+range:6:ledger:last_committed_ledger = 65000500
+range:6:txhash:last_committed_ledger = 65000500
+```
+
+**Key Insight**: The meta store reflects the exact point where processing stopped. No data is lost because each ledger is checkpointed immediately after processing.
+
+### Restart After Graceful Shutdown
+
+When the service restarts (e.g., after upgrade):
+
+1. Load meta store
+2. Find `global:mode = "streaming"` (already in streaming mode)
+3. **Gap detection runs**: Validate all prior ranges are COMPLETE ✓
+4. Find `global:last_processed_ledger = 65000500`
+5. Resume CaptiveStellarCore from ledger 65000501
+6. Continue ingestion seamlessly
+
+**Gap detection still runs**: Even on restart, the service validates prior ranges are COMPLETE. This catches any data corruption or missing ranges that may have occurred. The check is fast (O(number of ranges)) and provides safety.
 
 ---
 
