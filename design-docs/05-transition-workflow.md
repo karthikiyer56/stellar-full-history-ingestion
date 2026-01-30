@@ -322,6 +322,46 @@ Transitioning Stores (Range N):
 
 ---
 
+## Crash Recovery During Transition
+
+If the **service crashes** (kill -9, power failure, OOM) during transition, the workflow resumes automatically on restart.
+
+### Why This Works: Meta Store vs QueryRouter
+
+| Component | Type | Survives Crash? | Purpose |
+|-----------|------|-----------------|---------|
+| **Meta Store** (RocksDB) | Persistent | ✅ Yes | Source of truth for range states and phases |
+| **QueryRouter** (struct) | In-memory | ❌ No | Runtime routing cache—pointers to open stores |
+
+**On crash:**
+1. QueryRouter is lost (in-memory pointers gone)
+2. Meta store survives with durable state (`range:6:state = "TRANSITIONING"`, `range:6:ledger:phase = "WRITING_LFS"`, etc.)
+
+**On restart:**
+1. System reads meta store to discover all range states
+2. Rebuilds QueryRouter by opening appropriate stores based on meta store state
+3. Resumes transition from the last checkpointed phase
+
+### Restart Behavior by Crash Point
+
+| Crash During | Meta Store State | Restart Action |
+|--------------|------------------|----------------|
+| Step 3 (mark TRANSITIONING) | `range:N:state = "TRANSITIONING"` | Resume transition sub-workflows from beginning |
+| Step 4 (building LFS/RecSplit) | Phase shows `WRITING_LFS` or `BUILDING_RECSPLIT` | Resume from checkpointed progress within phase |
+| Step 5 (adding immutable stores) | Immutable files exist, phase incomplete | Verify files, complete phase, continue to step 6 |
+| Step 6 (delete RocksDB) | Immutable files verified | Delete RocksDB (may already be deleted), continue to step 7 |
+| After step 6, before step 7 | RocksDB deleted, state still `TRANSITIONING` | Just mark `COMPLETE` (safe: immutable files exist) |
+
+### Key Invariant
+
+The COMPLETE state is written **last** (step 7), after RocksDB deletion (step 6). This ensures:
+- If crash happens after step 6 but before step 7, restart sees `TRANSITIONING` and checks for immutable files—they exist, so it marks COMPLETE
+- A range marked COMPLETE **always** has valid immutable files and **never** has orphaned RocksDB files
+
+See [Crash Recovery - Scenario 5: Crash During Transition](./06-crash-recovery.md#scenario-5-crash-during-transition) for detailed walkthrough.
+
+---
+
 ## Example: Transition at Ledger 70,000,001
 
 **Before (ledger 70,000,000)**:
