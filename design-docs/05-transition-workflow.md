@@ -317,6 +317,8 @@ range:6:txhash:recsplit_path = "/data/stellar-rpc/immutable/txhash/range-6"
 - Immutable Stores: Minimal (memory-mapped files)
 - **Total**: ~16GB
 
+**Disk Storage**: For detailed disk storage calculations per 10M range (Ledger LFS: ~1.5 TB, TxHash RecSplit: ~15 GB), see [Storage Size Reference](./01-architecture-overview.md#storage-size-reference-per-10m-ledger-range).
+
 ---
 
 ## Related Documentation

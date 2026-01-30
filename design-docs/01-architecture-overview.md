@@ -226,21 +226,63 @@ immutable/
 | **Total (Streaming)** | ~36 GB | |
 | **Total (Backfill, 2 parallel)** | ~52 GB | |
 
-### Disk Space Estimates
+### Storage Size Reference (Per 10M Ledger Range)
 
-**Per 10M Ledger Range**:
-- Active Ledger Store: ~1.5 TB (compressed)
-- Active TxHash Store: ~500 GB
-- Immutable LFS: ~1.2 TB (compressed)
-- Immutable RecSplit: ~50 GB
-- **Total per range**: ~3.2 TB (active + immutable during transition)
+> Based on real-world data from ledger ranges 30,000,002 - 60,000,001.
+> Earlier ranges (2 - 30,000,001) may have smaller LCM sizes due to lower network activity.
 
-**Current Stellar Network** (as of 2026-01-29):
-- Current ledger: ~62,000,000
-- Ranges: 0-5 (6 ranges)
-- Immutable storage: ~7.2 TB (6 ranges × 1.25 TB)
-- Active storage: ~2 TB (range 6)
-- **Total**: ~9.2 TB
+**Unit Convention**: All sizes use decimal (SI) units:
+- **TB** = 10^12 bytes (terabyte, not tebibyte)
+- **GB** = 10^9 bytes (gigabyte, not gibibyte)
+- This matches common disk manufacturer conventions and `df -H` output.
+
+#### Ledger Store (LedgerSeq → LCM)
+
+| Stage | Calculation | Size |
+|-------|-------------|------|
+| **RocksDB (Active)** | 10M ledgers × 150KB avg compressed LCM + 5% overhead | **~1.58 TB** |
+| **LFS (Immutable)** | 10M ledgers × 150KB (zstd compressed chunks) | **~1.5 TB** |
+| **Compression Ratio** | RocksDB → LFS | ~5% reduction (overhead removed) |
+
+**Notes**:
+- LCM sizes vary significantly by ledger activity (recent ranges: ~150KB, early ranges: ~10-50KB)
+- LFS chunks are 10K ledgers each, independently compressed with zstd
+
+#### TxHash Store (TxHash → LedgerSeq)
+
+| Stage | Calculation | Size |
+|-------|-------------|------|
+| **Entry Size** | 32-byte txhash key + 4-byte uint32 value | 36 bytes/entry |
+| **Entry Count** | 10M ledgers × 325 tx/ledger avg | **~3.25 billion entries** |
+| **RocksDB (Active)** | 3.25B entries × 36 bytes + 25% overhead (bloom filters, index blocks) | **~140 GB** |
+| **RecSplit (Immutable)** | 16 minimal perfect hash indexes | **~15 GB** |
+| **Compression Ratio** | RocksDB → RecSplit | **~89% reduction** |
+
+**Notes**:
+- RocksDB overhead includes bloom filters for each of 16 column families
+- RecSplit is a minimal perfect hash function - O(1) lookup, very space-efficient
+- 16 column families partition entries by first hex char of txhash
+
+#### Total Per-Range Storage
+
+| Store Type | RocksDB (Active) | Immutable | Savings |
+|------------|------------------|-----------|---------|
+| Ledger | ~1.58 TB | ~1.5 TB | ~5% |
+| TxHash | ~140 GB | ~15 GB | ~89% |
+| **Total** | **~1.72 TB** | **~1.52 TB** | **~12%** |
+
+#### Memory During Transition
+
+During transition, the system temporarily holds both active and transitioning stores:
+
+| Component | Memory |
+|-----------|--------|
+| Current Active Stores (Range N+1) | ~Variable (RocksDB MemTables) |
+| Transitioning Stores (Range N) | ~Variable (RocksDB read-only) |
+| Transition goroutine buffers | ~2 GB |
+| **Recommended Total RAM** | **128 GB** |
+
+See [Hardware Requirements](#hardware-requirements) for full system recommendations.
 
 ---
 
