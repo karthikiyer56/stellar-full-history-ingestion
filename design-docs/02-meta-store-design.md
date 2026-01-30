@@ -481,6 +481,44 @@ range:4:ledger:last_committed_ledger = 40500000
 
 ---
 
+### Scenario 7: Graceful Shutdown and Restart (Service Upgrade)
+
+> **What**: Service receives SIGTERM, completes graceful shutdown, then restarts and resumes.
+> **When**: Operator performs a service upgrade, rolling restart, or planned maintenance.
+> **Why it matters**: Shows how the meta store enables seamless resume after intentional shutdown.
+
+**Pre-condition**: Streaming mode active, processing ledger 65,000,500
+
+**State Before Shutdown**:
+```
+global:mode = "streaming"
+global:last_processed_ledger = 65000499
+
+range:6:state = "INGESTING"
+range:6:ledger:last_committed_ledger = 65000499
+range:6:txhash:last_committed_ledger = 65000499
+```
+
+**State After Graceful Shutdown** (see [Streaming Workflow - Graceful Shutdown](./04-streaming-workflow.md#graceful-shutdown) for full step-by-step process):
+```
+global:mode = "streaming"
+global:last_processed_ledger = 65000500  # Checkpointed before exit
+
+range:6:state = "INGESTING"
+range:6:ledger:last_committed_ledger = 65000500
+range:6:txhash:last_committed_ledger = 65000500
+```
+
+**State After Restart** (resumes from checkpoint):
+```
+# No state change - meta store is loaded as-is
+# Service resumes ingestion from ledger 65000501
+```
+
+**Key Insight**: The meta store reflects the exact checkpoint. On restart, the service reads `last_processed_ledger` and resumes from the next ledger. No data is lost.
+
+---
+
 ## Key Usage Summary
 
 | Key Pattern | Purpose | When Updated |
