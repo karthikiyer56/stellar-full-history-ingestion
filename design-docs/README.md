@@ -1,8 +1,8 @@
 # Stellar Full History RPC Service - Design Documentation
 
 > **Purpose**: Comprehensive design documentation for the Stellar Full History RPC Service  
-> **Status**: Ready for Implementation  
-> **Last Updated**: 2026-01-29
+> **Status**: Ready for Review
+
 
 ---
 
@@ -13,31 +13,36 @@ The Stellar Full History RPC Service provides query access to the complete Stell
 - **`getTransactionByHash(txHash)`**: Returns the ledger sequence containing a specific transaction
 - **`getLedgerBySequence(ledgerSeq)`**: Returns the full LedgerCloseMeta for a given ledger
 
-The service operates in two mutually exclusive modes:
+The service operates in **_two mutually exclusive_** modes:
 
-1. **Backfill Mode**: Ingests historical ledger ranges (e.g., ledgers 2 to 60,000,000) from GCS or CaptiveStellarCore, creates immutable stores, then exits. No query capability while running.
+1. **Backfill Mode**:
+   - Ingests historical ledger ranges (e.g., ledgers 2 to 60,000,000) from GCS or CaptiveStellarCore, creates immutable stores, then exits. 
+   - _**No query capability while running in backfill mode**_.
 
-2. **Streaming Mode**: Ingests real-time ledgers via CaptiveStellarCore, serves queries, and periodically transitions data from active (RocksDB) to immutable (LFS + RecSplit) stores at 10M ledger boundaries.
+2. **Streaming Mode**:
+   - Ingests real-time ledgers via CaptiveStellarCore.
+   - Serves queries.
+   - Periodically transitions data from active (RocksDB) to immutable (LFS + RecSplit) stores at 10M ledger boundaries.
 
-The architecture supports efficient storage and retrieval across billions of ledgers by partitioning data into 10-million ledger ranges, with separate handling for active (mutable) and immutable (read-only) data.
+The architecture supports efficient storage and retrieval across millions of ledgers and billions of transactions, by partitioning data into 10-million ledger ranges, with separate handling for active (mutable) and immutable (read-only) data.
 
 ---
 
 ## Document Index
 
-| Document | Description |
-|----------|-------------|
-| [01-architecture-overview.md](./01-architecture-overview.md) | High-level system architecture, components, data flow, hardware requirements |
-| [02-meta-store-design.md](./02-meta-store-design.md) | Meta store key hierarchy, enums, range ID calculation, scenario walkthroughs |
-| [03-backfill-workflow.md](./03-backfill-workflow.md) | Backfill mode detailed workflow, parallel orchestrators, checkpoint mechanism |
-| [04-streaming-workflow.md](./04-streaming-workflow.md) | Streaming mode workflow, startup validation, ingestion loop, boundary detection |
-| [05-transition-workflow.md](./05-transition-workflow.md) | Active→Immutable transition process, parallel sub-workflows, dual store management |
-| [06-crash-recovery.md](./06-crash-recovery.md) | Crash recovery scenarios, checkpoint mechanism, count accuracy guarantees |
-| [07-query-routing.md](./07-query-routing.md) | Query routing logic for getLedgerBySequence and getTransactionByHash |
-| [08-directory-structure.md](./08-directory-structure.md) | File system layout, LFS chunk paths, RecSplit paths, multi-disk configuration |
-| [09-configuration.md](./09-configuration.md) | TOML configuration reference, validation rules, example configurations |
-| [10-checkpointing-and-transitions.md](./10-checkpointing-and-transitions.md) | Checkpoint math, range boundaries, transition triggers, immutable store ranges, FAQ |
-| [FAQ.md](./FAQ.md) | Consolidated FAQ index with quick answers and links to detailed explanations |
+| Document | Description                                                                                                                     |
+|----------|---------------------------------------------------------------------------------------------------------------------------------|
+| [01-architecture-overview.md](./01-architecture-overview.md) | High-level system architecture, components, hardware requirements, recommendation on the order in which to read the design docs |
+| [02-meta-store-design.md](./02-meta-store-design.md) | Meta store key hierarchy, enums, range ID calculation, scenario walkthroughs                                                    |
+| [03-backfill-workflow.md](./03-backfill-workflow.md) | Backfill mode detailed workflow, parallel orchestrators, checkpoint mechanism                                                   |
+| [04-streaming-workflow.md](./04-streaming-workflow.md) | Streaming mode workflow, startup validation, ingestion loop, boundary detection                                                 |
+| [05-transition-workflow.md](./05-transition-workflow.md) | Active→Immutable transition process, parallel sub-workflows, dual store management                                              |
+| [06-crash-recovery.md](./06-crash-recovery.md) | Crash recovery scenarios, checkpoint mechanism, count accuracy guarantees                                                       |
+| [07-query-routing.md](./07-query-routing.md) | Query routing logic for getLedgerBySequence and getTransactionByHash                                                            |
+| [08-directory-structure.md](./08-directory-structure.md) | File system layout, LFS chunk paths, RecSplit paths, multi-disk configuration                                                   |
+| [09-configuration.md](./09-configuration.md) | TOML configuration reference, validation rules, example configurations                                                          |
+| [10-checkpointing-and-transitions.md](./10-checkpointing-and-transitions.md) | Checkpoint math, range boundaries, transition triggers, immutable store ranges, FAQ                                             |
+| [FAQ.md](./FAQ.md) | Consolidated FAQ index with quick answers and links to detailed explanations                                                    |
 
 ---
 
@@ -83,14 +88,14 @@ The architecture supports efficient storage and retrieval across billions of led
 │                                                                                  │
 │  ┌──────────────────────────────────────────────────────────────────────────┐   │
 │  │                           HTTP SERVER                                     │   │
-│  │  Backfill Mode: getHealth, getStatus only                                │   │
+│  │  Backfill Mode: getHealth, getStatus                                      │   │
 │  │  Streaming Mode: + getTransactionByHash, getLedgerBySequence             │   │
 │  └──────────────────────────────────────────────────────────────────────────┘   │
 │                                      │                                           │
 │                                      ▼                                           │
 │  ┌──────────────────────────────────────────────────────────────────────────┐   │
-│  │                          QUERY ROUTER                                     │   │
-│  │  Routes requests to correct store based on ledger sequence/range         │   │
+│  │                          QUERY ROUTER                                    │   │
+   │  │               Routes requests to correct store                        │   │
 │  └──────────────────────────────────────────────────────────────────────────┘   │
 │                                      │                                           │
 │          ┌───────────────────────────┼───────────────────────────┐              │
@@ -119,24 +124,94 @@ The architecture supports efficient storage and retrieval across billions of led
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+```mermaid
+flowchart TB
+%% ---------- Styles ----------
+   classDef service fill:#f9f9f9,stroke:#333,stroke-width:2px
+   classDef main fill:#ffffff,stroke:#333,stroke-width:1.5px
+   classDef store fill:#eef5ff,stroke:#3366cc,stroke-width:1.5px
+   classDef meta fill:#fff7e6,stroke:#cc8800,stroke-width:1.5px
+   classDef ingest fill:#f0fff4,stroke:#228b22,stroke-width:1.5px
+
+%% ---------- Service ----------
+subgraph SERVICE["STELLAR FULL HISTORY RPC SERVICE"]
+direction TB
+class SERVICE service
+
+HTTP["HTTP SERVER<br/>
+<b>Backfill</b>: getHealth, getStatus<br/>
+<b>Streaming</b>: getHealth, getStatus,<br/>getTransactionByHash,getLedgerBySequence"]
+class HTTP main
+
+ROUTER["QUERY ROUTER<br/>Routes requests to correct store"]
+class ROUTER main
+
+HTTP --> ROUTER
+
+%% ---------- Stores ----------
+subgraph STORES["STORES"]
+direction LR
+
+ACTIVE["ACTIVE STORES<br/>(RocksDB)<br/><br/>Current range<br/>being ingested"]
+TRANSITION["TRANSITIONING STORES<br/>(RocksDB)<br/><br/>Previous range<br/>being converted"]
+IMMUTABLE["IMMUTABLE STORES<br/>(LFS + RecSplit)<br/><br/>Completed ranges"]
+
+class ACTIVE,TRANSITION,IMMUTABLE store
+end
+
+ROUTER --> ACTIVE
+ROUTER --> TRANSITION
+ROUTER --> IMMUTABLE
+
+META["META STORE (RocksDB)<br/>
+- Global state<br/>
+- Per-range state<br/>
+- Crash recovery data"]
+class META meta
+
+INGEST["INGESTION ENGINE<br/>
+<b>Backfill</b>: Parallel 10M ranges (~2)<br/>
+<b>Streaming</b>: CaptiveStellarCore<br/>Batch size = 1"]
+class INGEST ingest
+
+INGEST --> ACTIVE
+INGEST --> TRANSITION
+
+ACTIVE -.-> META
+TRANSITION -.-> META
+IMMUTABLE -.-> META
+
+end
+```
+
 ---
 
 ## Recommended Reading Order
 
-For first-time readers, we recommend this sequence:
+For first-time readers, we recommend the following sequence.  
 
-1. **Start here**: [01-architecture-overview.md](./01-architecture-overview.md) - Get the big picture of system components and data flow
-2. **Understand state**: [02-meta-store-design.md](./02-meta-store-design.md) - Learn how the system tracks progress and state
-3. **Workflows**:
-   - [03-backfill-workflow.md](./03-backfill-workflow.md) - Historical data ingestion
-   - [04-streaming-workflow.md](./04-streaming-workflow.md) - Real-time data ingestion
-   - [05-transition-workflow.md](./05-transition-workflow.md) - Active→Immutable conversion
-4. **Supporting systems**:
-   - [06-crash-recovery.md](./06-crash-recovery.md) - How the system recovers from failures
-   - [07-query-routing.md](./07-query-routing.md) - How queries find the right data
-5. **Implementation details**:
-   - [08-directory-structure.md](./08-directory-structure.md) - File system organization
-   - [09-configuration.md](./09-configuration.md) - TOML configuration reference
+1. **Start here**: [01-architecture-overview.md](./01-architecture-overview.md)  
+   Get the big picture of system components and data flow.
+
+2. **Choose your path**:
+   - **Workflow-first (recommended for most readers)**  
+     Jump straight into how the system behaves:
+      - [03-backfill-workflow.md](./03-backfill-workflow.md) — Historical data ingestion
+      - [04-streaming-workflow.md](./04-streaming-workflow.md) — Real-time data ingestion
+      - [05-transition-workflow.md](./05-transition-workflow.md) — Active → Immutable conversion
+      - [06-crash-recovery.md](./06-crash-recovery.md) — How the system recovers from failures
+
+     These documents **cross-reference the [02-meta-store-design.md](./02-meta-store-design.md) wherever it’s relevant**, so you’ll pick up the important concepts naturally as you go.
+
+   - **State-first (for readers who want the internals upfront)**
+      - [02-meta-store-design.md](./02-meta-store-design.md) — How the system tracks progress and state
+
+3. **Supporting systems**:
+   - [07-query-routing.md](./07-query-routing.md) — How queries find the right data
+
+4. **Implementation details**:
+   - [08-directory-structure.md](./08-directory-structure.md) — File system organization
+   - [09-configuration.md](./09-configuration.md) — TOML configuration reference
 
 ---
 
@@ -185,8 +260,8 @@ These invariants are fundamental to the system's correctness and MUST be maintai
 
 - **CPU**: 32 cores
 - **RAM**: 128 GB
-- **CaptiveStellarCore**: ~8GB RAM per instance
-- **Disk**: SSD recommended for active stores, HDD acceptable for immutable stores
+- **CaptiveStellarCore**: ~8GB RAM per instance. Prefer to run backfill with GCS source to avoid multiple stellar-core instances on the same machine.
+- **Disk**: SSD recommended for active stores and immutable stores, HDD acceptable for immutable stores
 - **Network**: High bandwidth for GCS access (backfill mode)
 
 ---
