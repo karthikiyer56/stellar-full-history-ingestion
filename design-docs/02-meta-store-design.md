@@ -5,6 +5,17 @@
 
 ---
 
+## Prerequisites
+
+Before reading this document, ensure you understand these concepts:
+
+- **Operating Modes**: The service runs in either Backfill or Streaming mode. See [Architecture Overview](./01-architecture-overview.md#http-endpoints-by-mode).
+- **Range Boundaries**: Data is partitioned into 10-million ledger ranges. See [Checkpointing and Transitions](./10-checkpointing-and-transitions.md#immutable-store-range-table).
+- **Store Types**: Active stores (RocksDB) vs Immutable stores (LFS + RecSplit). See [Architecture Overview](./01-architecture-overview.md#store-types).
+- **Crash Recovery**: How the system recovers from failures using checkpoints. See [Crash Recovery](./06-crash-recovery.md).
+
+---
+
 ## Overview
 
 The meta store is a single RocksDB instance that serves as the source of truth for:
