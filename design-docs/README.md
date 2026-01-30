@@ -37,6 +37,7 @@ The architecture supports efficient storage and retrieval across billions of led
 | [08-directory-structure.md](./08-directory-structure.md) | File system layout, LFS chunk paths, RecSplit paths, multi-disk configuration |
 | [09-configuration.md](./09-configuration.md) | TOML configuration reference, validation rules, example configurations |
 | [10-checkpointing-and-transitions.md](./10-checkpointing-and-transitions.md) | Checkpoint math, range boundaries, transition triggers, immutable store ranges, FAQ |
+| [FAQ.md](./FAQ.md) | Consolidated FAQ index with quick answers and links to detailed explanations |
 
 ---
 
