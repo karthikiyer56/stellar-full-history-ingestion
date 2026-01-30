@@ -115,6 +115,101 @@ flowchart TB
 
 ---
 
+## QueryRouter Integration
+
+The transition workflow must update the QueryRouter registry to reflect store changes. The QueryRouter is dependency-injected into the transition orchestrator.
+
+### Dependency Injection
+
+```go
+type TransitionOrchestrator struct {
+    rangeID     uint32
+    metaStore   *MetaStore
+    queryRouter *QueryRouter  // Injected - used to update registry
+    // ... other fields
+}
+
+func NewTransitionOrchestrator(rangeID uint32, meta *MetaStore, qr *QueryRouter) *TransitionOrchestrator {
+    return &TransitionOrchestrator{
+        rangeID:     rangeID,
+        metaStore:   meta,
+        queryRouter: qr,
+    }
+}
+```
+
+### Transition Sequence with QueryRouter Updates
+
+> **ORDERING NOTE**: This sequence matches the existing flowchart in `design-docs/05-transition-workflow.md` lines 57-59: Delete RocksDB → Update Meta COMPLETE. The rationale: Meta COMPLETE should mark the FINAL state after cleanup is done.
+
+```
+1. Range N reaches last ledger (e.g., 60,000,001)
+
+2. [STREAMING MODE ONLY] Create new Active Stores for Range N+1
+   → queryRouter.AddActiveStore(N+1, newLedgerDB, newTxHashDB)
+
+3. Mark Range N as TRANSITIONING in meta store
+   → queryRouter.PromoteToTransitioning(N)
+   → Note: Range N stores are now "transitioning" in registry
+
+4. Spawn transition goroutine for Range N
+   → Ledger sub-flow: RocksDB → LFS chunks
+   → TxHash sub-flow: RocksDB → RecSplit indexes
+
+5. Both sub-flows complete, immutable files verified
+   → queryRouter.AddImmutableStores(N, lfsStore, recsplitStore)
+
+6. Delete transitioning RocksDB stores
+   → queryRouter.RemoveTransitioningStores(N)
+   → RocksDB files physically deleted from disk
+
+7. Update meta store: range:N:state = "COMPLETE"
+   → This is the FINAL step, marking transition fully done
+```
+
+### Locking Implications
+
+| Step | QueryRouter Method | Lock Type | Queries Blocked? |
+|------|-------------------|-----------|------------------|
+| 2 | AddActiveStore | Write | Yes (brief) |
+| 3 | PromoteToTransitioning | Write | Yes (brief) |
+| 5 | AddImmutableStores | Write | Yes (brief) |
+| 6 | RemoveTransitioningStores | Write | Yes (brief) |
+
+**Key Insight**: Write locks are held only for pointer swaps and map updates (microseconds). Queries experience negligible blocking. Meta store update (step 7) does not require QueryRouter lock.
+
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Ingestion
+    participant Transition
+    participant QueryRouter
+    participant MetaStore
+
+    Note over Ingestion: Ledger 60,000,001 processed
+    
+    Ingestion->>QueryRouter: AddActiveStore(7, newLedgerDB, newTxHashDB)
+    Ingestion->>QueryRouter: PromoteToTransitioning(6)
+    Ingestion->>MetaStore: range:6:state = "TRANSITIONING"
+    Ingestion->>Transition: Spawn goroutine for Range 6
+    
+    Note over Ingestion: Continues ingesting to Range 7
+    
+    Transition->>Transition: Build LFS chunks
+    Transition->>Transition: Build RecSplit indexes
+    Transition->>Transition: Verify immutable files
+    
+    Transition->>QueryRouter: AddImmutableStores(6, lfs, recsplit)
+    Transition->>QueryRouter: RemoveTransitioningStores(6)
+    Note over Transition: RocksDB stores deleted
+    Transition->>MetaStore: range:6:state = "COMPLETE"
+```
+
+See [Query Routing - QueryRouter Architecture](./07-query-routing.md#queryrouter-architecture) for the full struct and method definitions.
+
+---
+
 ## Transition Process
 
 ```mermaid
