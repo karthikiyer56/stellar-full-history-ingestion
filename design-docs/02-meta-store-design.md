@@ -179,6 +179,70 @@ const (
 
 ---
 
+## State Transition Diagrams
+
+The following diagrams visualize how each enum progresses through its lifecycle.
+
+### RangeState Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Range created
+    PENDING --> INGESTING: Ingestion starts
+    INGESTING --> TRANSITIONING: Range boundary reached
+    TRANSITIONING --> COMPLETE: Both sub-workflows done
+    INGESTING --> FAILED: Unrecoverable error
+    TRANSITIONING --> FAILED: Unrecoverable error
+    FAILED --> [*]
+    COMPLETE --> [*]
+```
+
+**Transition Triggers**:
+- **PENDING → INGESTING**: Backfill starts this range, or streaming reaches this range's first ledger
+- **INGESTING → TRANSITIONING**: Last ledger of range is processed (e.g., ledger 10,000,001 for Range 0)
+- **TRANSITIONING → COMPLETE**: Both `ledger:phase = "IMMUTABLE"` AND `txhash:phase = "COMPLETE"`
+- **Any → FAILED**: Unrecoverable error (crash recovery may resume from checkpoint if error is transient)
+
+### LedgerPhase Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> INGESTING: Range ingestion starts
+    INGESTING --> WRITING_LFS: Transition begins
+    WRITING_LFS --> IMMUTABLE: LFS chunks written
+    IMMUTABLE --> [*]
+```
+
+**Transition Triggers**:
+- **[*] → INGESTING**: When range state changes to `INGESTING` (both ledger and txhash phases start together)
+- **INGESTING → WRITING_LFS**: When range state changes to `TRANSITIONING` (last ledger of range processed)
+- **WRITING_LFS → IMMUTABLE**: When all LFS chunks are written and verified. RocksDB is deleted at this point.
+
+**Key Insight**: The ledger sub-workflow is simpler than txhash because LFS writing is a single-step operation (read RocksDB, write chunks, verify).
+
+### TxHashPhase Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> INGESTING: Range ingestion starts
+    INGESTING --> COMPACTING: Transition begins
+    COMPACTING --> BUILDING_RECSPLIT: Compaction complete
+    BUILDING_RECSPLIT --> VERIFYING_RECSPLIT: RecSplit indexes built
+    VERIFYING_RECSPLIT --> COMPLETE: All keys verified
+    COMPLETE --> [*]
+```
+
+**Transition Triggers**:
+- **[*] → INGESTING**: When range state changes to `INGESTING` (both ledger and txhash phases start together)
+- **INGESTING → COMPACTING**: When range state changes to `TRANSITIONING` (last ledger of range processed)
+- **COMPACTING → BUILDING_RECSPLIT**: When full compaction completes across all 16 column families
+- **BUILDING_RECSPLIT → VERIFYING_RECSPLIT**: When all 16 RecSplit index files are built (one per CF)
+- **VERIFYING_RECSPLIT → COMPLETE**: When verification confirms all keys from RocksDB exist in RecSplit indexes. RocksDB is deleted at this point.
+
+**Key Insight**: The txhash sub-workflow has more phases because RecSplit index creation requires: (1) compaction to reduce data size, (2) building indexes, (3) verification before deleting source data.
+
+---
+
 ## Range ID Calculation
 
 Range IDs are calculated from ledger sequences using these canonical formulas:
