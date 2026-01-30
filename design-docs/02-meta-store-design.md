@@ -633,6 +633,48 @@ This enables:
 
 ---
 
+## Frequently Asked Questions
+
+### Q: Why are there separate Ledger and TxHash phases?
+
+**A**: The two sub-workflows have different durations and operations. Ledger phase writes LFS chunks (~30-60 min), while TxHash phase compacts, builds RecSplit indexes, and verifies (~25-30 min). Separate phase tracking enables independent progress monitoring, parallel execution, and granular crash recovery. If one sub-workflow fails, the other can continue or be retried independently.
+
+### Q: What happens if the process crashes during TRANSITIONING state?
+
+**A**: The transition is crash-safe. Each sub-workflow (ledger and txhash) tracks its own phase. On recovery, the system reads the phase states and resumes from where it left off. For example, if `ledger:phase = "IMMUTABLE"` but `txhash:phase = "COMPACTING"`, only the txhash sub-workflow needs to resume. Checkpoint data is never deleted, so recovery is always possible. See [Crash Recovery - Scenario 5](./06-crash-recovery.md#scenario-5-crash-during-transition-both-modes---transition) for detailed examples.
+
+### Q: Why is cf_counts stored as JSON instead of separate keys?
+
+**A**: Storing all 16 column family counts as a single JSON value enables atomic updates and verification. During ingestion, all counts are updated together in one write operation, ensuring consistency. After transition, the entire JSON can be compared against RecSplit index sizes to verify completeness. Using separate keys would require 16 individual writes per checkpoint, increasing complexity and the risk of partial updates during crashes.
+
+### Q: Can I query data while a range is TRANSITIONING?
+
+**A**: Yes! During transition, the Active Stores (RocksDB) remain accessible for queries until the Immutable Stores (LFS + RecSplit) are fully built and verified. The query router continues serving requests from RocksDB. Only after both sub-workflows reach their terminal states (`ledger:phase = "IMMUTABLE"` AND `txhash:phase = "COMPLETE"`) are the RocksDB stores deleted. This ensures zero query downtime during transitions.
+
+### Q: Why does checkpoint data never get deleted?
+
+**A**: Checkpoint keys persist forever to provide: (1) **Audit trail** - complete history of ingestion progress, (2) **Debugging** - investigation of past issues, (3) **Verification** - validation of range completeness, (4) **Minimal cost** - checkpoint data is tiny (~few KB per range) compared to ledger/txhash data (~1.5TB per range). The benefits far outweigh the negligible storage cost.
+
+### Q: What's the difference between last_committed_ledger and count?
+
+**A**: `last_committed_ledger` is the ledger sequence number of the last successfully processed ledger (used for crash recovery - "resume from this point"). `count` is the total number of ledgers ingested so far (used for progress tracking and verification). For example, if a range starts at ledger 10,000,002 and has processed 5,000 ledgers, then `last_committed_ledger = 10,005,001` and `count = 5000`. After a crash, ingestion resumes from `last_committed_ledger + 1`.
+
+### Q: What happens during graceful shutdown?
+
+**A**: The current ledger completes processing, the meta store is checkpointed with exact progress (e.g., `global:last_processed_ledger = 65000500`), then the service exits cleanly. On restart, the service reads `last_processed_ledger` from the meta store and resumes ingestion from ledger 65000501 with no data loss. See [Scenario 7](#scenario-7-graceful-shutdown-and-restart-service-upgrade) for a complete walkthrough.
+
+### Q: How does the service know to start in streaming vs backfill mode?
+
+**A**: Mode is determined by startup flags and meta store state:
+- If `--backfill` flag is present → `global:mode = "backfill"` (always, overwrites any existing value)
+- If no `--backfill` AND all prior ranges are COMPLETE → `global:mode = "streaming"`
+- If `global:mode = "streaming"` already exists → gap validation runs to verify all prior ranges are COMPLETE, then streaming resumes
+- If fresh data directory with no ranges → ERROR (backfill required first to establish initial ranges)
+
+See [Backfill Workflow - Initial Meta Store State](./03-backfill-workflow.md#initial-meta-store-state) and [Streaming Workflow - Mode Transition](./04-streaming-workflow.md#mode-transition) for complete details.
+
+---
+
 ## Related Documentation
 
 - [Architecture Overview](./01-architecture-overview.md) - System components and data flow
