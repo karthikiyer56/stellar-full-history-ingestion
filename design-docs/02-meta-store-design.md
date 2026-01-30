@@ -16,6 +16,45 @@ Before reading this document, ensure you understand these concepts:
 
 ---
 
+## Broad Context
+
+### What Problem Does the Meta Store Solve?
+
+The Stellar Full History RPC Service must track progress across billions of ledgers, survive crashes without data loss, and know which data lives where. The meta store is the single source of truth for all of this.
+
+### Operating Modes at a Glance
+
+| Mode | Purpose | Duration | Queries Available |
+|------|---------|----------|-------------------|
+| **Backfill** | Ingest historical ledger ranges from GCS or CaptiveStellarCore | Hours to days (exits when complete) | Health/Status only |
+| **Streaming** | Ingest real-time ledgers, serve queries, transition old data to immutable | Long-running daemon | All endpoints |
+
+**Mode is tracked in meta store**: `global:mode = "backfill"` or `global:mode = "streaming"`
+
+> **Important**: For the complete ruleset on when mode is set and how transitions work, see the following sections in [Backfill Workflow](./03-backfill-workflow.md#initial-meta-store-state) and [Streaming Workflow](./04-streaming-workflow.md#mode-transition).
+
+### What is a Range?
+
+A **range** is a partition of 10 million consecutive ledgers. Each range goes through a lifecycle:
+1. **PENDING**: Waiting to be processed
+2. **INGESTING**: Actively receiving ledger data into RocksDB
+3. **TRANSITIONING**: Converting from active (RocksDB) to immutable (LFS + RecSplit) stores
+4. **COMPLETE**: Fully immutable and queryable
+
+For exact boundary math, see [Checkpointing and Transitions](./10-checkpointing-and-transitions.md#immutable-store-range-table).
+
+### Range ID Explained
+
+The **Range ID** is calculated from a ledger sequence:
+- Ledger 2 → Range 0
+- Ledger 10,000,001 → Range 0 (last ledger in range)
+- Ledger 10,000,002 → Range 1 (first ledger in range)
+- Ledger 25,000,000 → Range 2
+
+See the [Range ID Calculation](#range-id-calculation) section below for the formula.
+
+---
+
 ## Overview
 
 The meta store is a single RocksDB instance that serves as the source of truth for:
