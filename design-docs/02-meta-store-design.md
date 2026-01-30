@@ -73,53 +73,53 @@ The meta store uses a hierarchical key structure with colon-separated namespaces
 
 ### Global Keys
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `global:mode` | string | Operating mode: "backfill" or "streaming" |
-| `global:last_processed_ledger` | uint32 | Last ledger processed in streaming mode |
-| `global:backfill_start_ledger` | uint32 | Start ledger for backfill operation |
-| `global:backfill_end_ledger` | uint32 | End ledger for backfill operation |
+| Key | Type | Description | Triggers / Conditions |
+|-----|------|-------------|----------------------|
+| `global:mode` | string | Operating mode: "backfill" or "streaming" | **Set**: At process startup. Backfill mode sets `"backfill"` (see [Backfill Workflow](./03-backfill-workflow.md#initial-meta-store-state)), streaming mode sets `"streaming"` (see [Streaming Workflow](./04-streaming-workflow.md#mode-transition)). **Updated**: Never changes during process lifetime. **Example**: `"backfill"` or `"streaming"`. |
+| `global:last_processed_ledger` | uint32 | Last ledger processed in streaming mode | **Set**: When streaming mode starts after backfill completes (highest end_ledger from COMPLETE ranges). **Updated**: After each ledger is processed in streaming mode (checkpoint every 1 ledger). **Component**: Streaming ingestion loop. **Example**: `65000500`. |
+| `global:backfill_start_ledger` | uint32 | Start ledger for backfill operation | **Set**: At backfill startup from `--start-ledger` flag. **Updated**: Never. **Component**: Backfill initialization. **Example**: `2` or `10000002`. |
+| `global:backfill_end_ledger` | uint32 | End ledger for backfill operation | **Set**: At backfill startup from `--end-ledger` flag. **Updated**: Never. **Component**: Backfill initialization. **Example**: `30000001`. |
 
 ### Per-Range Keys
 
 Each 10M ledger range has its own set of keys:
 
-| Key Pattern | Type | Description |
-|-------------|------|-------------|
-| `range:{id}:state` | RangeState | Overall range lifecycle state |
-| `range:{id}:start_ledger` | uint32 | First ledger in range |
-| `range:{id}:end_ledger` | uint32 | Last ledger in range |
-| `range:{id}:created_at` | timestamp | When range ingestion started |
-| `range:{id}:completed_at` | timestamp | When range became COMPLETE |
+| Key Pattern | Type | Description | Triggers / Conditions |
+|-------------|------|-------------|----------------------|
+| `range:{id}:state` | RangeState | Overall range lifecycle state | **Set**: To `"PENDING"` when range is created during initialization. **Updated**: `PENDING` → `INGESTING` (when ingestion starts), `INGESTING` → `TRANSITIONING` (when last ledger processed), `TRANSITIONING` → `COMPLETE` (when both sub-workflows finish). **Component**: Range orchestrator. **Example**: `"INGESTING"`. |
+| `range:{id}:start_ledger` | uint32 | First ledger in range | **Set**: Once when range is created. Formula: `(rangeID × 10,000,000) + 2`. **Updated**: Never. **Component**: Range initialization. **Example**: `10000002` (range 1). |
+| `range:{id}:end_ledger` | uint32 | Last ledger in range | **Set**: Once when range is created. Formula: `((rangeID + 1) × 10,000,000) + 1`. **Updated**: Never. **Component**: Range initialization. **Example**: `20000001` (range 1). |
+| `range:{id}:created_at` | timestamp | When range ingestion started | **Set**: When range state changes from `PENDING` to `INGESTING`. **Updated**: Never. **Component**: Range orchestrator. **Example**: `"2026-01-28T10:00:00Z"`. |
+| `range:{id}:completed_at` | timestamp | When range became COMPLETE | **Set**: When range state changes to `COMPLETE` (both sub-workflows finished). **Updated**: Never. **Component**: Transition completion handler. **Example**: `"2026-01-28T12:00:00Z"`. |
 
 ### Per-Range Ledger Store Keys
 
-| Key Pattern | Type | Description |
-|-------------|------|-------------|
-| `range:{id}:ledger:phase` | LedgerPhase | Ledger sub-workflow phase |
-| `range:{id}:ledger:last_committed_ledger` | uint32 | Last checkpointed ledger |
-| `range:{id}:ledger:count` | uint64 | Total ledgers ingested |
-| `range:{id}:ledger:immutable_path` | string | Path to LFS chunks after transition |
+| Key Pattern | Type | Description | Triggers / Conditions |
+|-------------|------|-------------|----------------------|
+| `range:{id}:ledger:phase` | LedgerPhase | Ledger sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `WRITING_LFS` (when transition starts), `WRITING_LFS` → `IMMUTABLE` (when LFS writing completes). **Component**: Ledger sub-workflow. **Example**: `"WRITING_LFS"`. |
+| `range:{id}:ledger:last_committed_ledger` | uint32 | Last checkpointed ledger | **Set**: After first batch processed. **Updated**: At each checkpoint (every 1000 ledgers in backfill, every 1 ledger in streaming). **Component**: Ingestion loop. **Example**: `7499001`. |
+| `range:{id}:ledger:count` | uint64 | Total ledgers ingested | **Set**: After first batch processed. **Updated**: At each checkpoint (incremented by batch size). **Component**: Ingestion loop. **Example**: `7499000`. |
+| `range:{id}:ledger:immutable_path` | string | Path to LFS chunks after transition | **Set**: When LFS writing completes (phase becomes `IMMUTABLE`). **Updated**: Never. **Component**: LFS writer. **Example**: `"/data/stellar-rpc/immutable/ledgers/range-0"`. |
 
 ### Per-Range TxHash Store Keys
 
-| Key Pattern | Type | Description |
-|-------------|------|-------------|
-| `range:{id}:txhash:phase` | TxHashPhase | TxHash sub-workflow phase |
-| `range:{id}:txhash:last_committed_ledger` | uint32 | Last checkpointed ledger |
-| `range:{id}:txhash:cf_counts` | JSON | Per-CF counts: {"0": count, ..., "f": count} |
-| `range:{id}:txhash:rocksdb_path` | string | Path to Active Store RocksDB |
-| `range:{id}:txhash:recsplit_path` | string | Path to RecSplit indexes after transition |
+| Key Pattern | Type | Description | Triggers / Conditions |
+|-------------|------|-------------|----------------------|
+| `range:{id}:txhash:phase` | TxHashPhase | TxHash sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `COMPACTING` → `BUILDING_RECSPLIT` → `VERIFYING_RECSPLIT` → `COMPLETE` (see [Transition Workflow](./05-transition-workflow.md) for phase details). **Component**: TxHash sub-workflow. **Example**: `"BUILDING_RECSPLIT"`. |
+| `range:{id}:txhash:last_committed_ledger` | uint32 | Last checkpointed ledger | **Set**: After first batch processed. **Updated**: At each checkpoint (every 1000 ledgers in backfill, every 1 ledger in streaming). **Component**: Ingestion loop. **Example**: `7499001`. |
+| `range:{id}:txhash:cf_counts` | JSON | Per-CF counts: {"0": count, ..., "f": count} | **Set**: After first batch processed. **Updated**: At each checkpoint (counts incremented by transactions in batch). **Component**: Ingestion loop. **Example**: `{"0": 375, "1": 362, ..., "f": 368}`. |
+| `range:{id}:txhash:rocksdb_path` | string | Path to Active Store RocksDB | **Set**: When range ingestion starts (RocksDB instance created). **Updated**: Never. **Component**: Range orchestrator. **Example**: `"/data/stellar-rpc/active/txhash/range-1"`. |
+| `range:{id}:txhash:recsplit_path` | string | Path to RecSplit indexes after transition | **Set**: When RecSplit building completes (phase becomes `COMPLETE`). **Updated**: Never. **Component**: RecSplit builder. **Example**: `"/data/stellar-rpc/immutable/txhash/range-0"`. |
 
 ### Transition Keys (Temporary)
 
 Only present during active→immutable transition:
 
-| Key Pattern | Type | Description |
-|-------------|------|-------------|
-| `range:{id}:transition:started_at` | timestamp | When transition began |
-| `range:{id}:transition:ledger_status` | string | "pending", "in_progress", "complete" |
-| `range:{id}:transition:txhash_status` | string | "pending", "in_progress", "complete" |
+| Key Pattern | Type | Description | Triggers / Conditions |
+|-------------|------|-------------|----------------------|
+| `range:{id}:transition:started_at` | timestamp | When transition began | **Set**: When range state changes to `TRANSITIONING` (last ledger of range processed). **Updated**: Never. **Deleted**: After range becomes `COMPLETE`. **Component**: Transition orchestrator. **Example**: `"2026-01-28T11:30:00Z"`. |
+| `range:{id}:transition:ledger_status` | string | "pending", "in_progress", "complete" | **Set**: To `"pending"` when transition starts. **Updated**: `"pending"` → `"in_progress"` (LFS writing starts), `"in_progress"` → `"complete"` (LFS writing finishes). **Deleted**: After range becomes `COMPLETE`. **Component**: Ledger sub-workflow. **Example**: `"in_progress"`. |
+| `range:{id}:transition:txhash_status` | string | "pending", "in_progress", "complete" | **Set**: To `"pending"` when transition starts. **Updated**: `"pending"` → `"in_progress"` (compaction starts), progresses through RecSplit phases, `"in_progress"` → `"complete"` (verification finishes). **Deleted**: After range becomes `COMPLETE`. **Component**: TxHash sub-workflow. **Example**: `"in_progress"`. |
 
 ---
 
