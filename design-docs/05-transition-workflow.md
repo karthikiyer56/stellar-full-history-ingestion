@@ -140,7 +140,7 @@ func NewTransitionOrchestrator(rangeID uint32, meta *MetaStore, qr *QueryRouter)
 
 ### Transition Sequence with QueryRouter Updates
 
-> **ORDERING NOTE**: This sequence matches the existing flowchart in `design-docs/05-transition-workflow.md` lines 57-59: Delete RocksDB → Update Meta COMPLETE. The rationale: Meta COMPLETE should mark the FINAL state after cleanup is done.
+> **ORDERING NOTE**: RocksDB deletion (step 6) happens BEFORE marking the range COMPLETE (step 7). The rationale: the COMPLETE state should only be set after all cleanup is finished—this ensures crash recovery never sees a "COMPLETE" range with orphaned RocksDB files.
 
 ```
 1. Range N reaches last ledger (e.g., 60,000,001)
