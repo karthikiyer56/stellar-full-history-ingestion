@@ -227,6 +227,10 @@ These scenarios show exactly how meta store keys evolve through different operat
 
 ### Scenario 1: Fresh Backfill (Ledgers 2 to 30,000,001)
 
+> **What**: Initial backfill operation starting from genesis ledger 2.
+> **When**: First-time setup or expanding historical coverage.
+> **Why it matters**: Shows how meta store initializes ranges and tracks parallel orchestrator progress.
+
 **Command**: `./stellar-rpc --backfill --start-ledger 2 --end-ledger 30000001`
 
 **Initial State (t=0)**:
@@ -290,6 +294,10 @@ range:0:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/range
 
 ### Scenario 2: Crash During Backfill and Recovery
 
+> **What**: Backfill process crashes mid-range, then resumes from last checkpoint.
+> **When**: Hardware failure, OOM kill, or operator intervention during backfill.
+> **Why it matters**: Demonstrates crash recovery mechanism and checkpoint-based resume.
+
 **Situation**: Backfill running, crash occurs at ledger 7,500,000 (mid-range 0)
 
 **State at Crash**:
@@ -318,6 +326,10 @@ range:0:txhash:phase                 = "COMPLETE"
 ---
 
 ### Scenario 3: Backfill Complete, Start Streaming Mode
+
+> **What**: Backfill completes, operator restarts without --backfill flag to enter streaming mode.
+> **When**: After historical data ingestion finishes, transitioning to real-time operation.
+> **Why it matters**: Shows mode transition from backfill to streaming and gap validation.
 
 **Pre-condition**: All ranges complete
 ```
@@ -350,6 +362,10 @@ range:3:txhash:phase                 = "INGESTING"
 ---
 
 ### Scenario 4: Streaming Mode - 10M Boundary Transition
+
+> **What**: Streaming mode ingests the last ledger of a range, triggering automatic transition to immutable stores.
+> **When**: Every 10 million ledgers during continuous operation.
+> **Why it matters**: Shows how active stores transition to immutable while ingestion continues seamlessly.
 
 **Situation**: Streaming at ledger 40,000,000, about to hit boundary at 40,000,001
 
@@ -406,6 +422,10 @@ range:3:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/range
 
 ### Scenario 5: Gap Detection (Incomplete Backfill)
 
+> **What**: Operator attempts to start streaming mode with incomplete ranges, service detects gap and exits.
+> **When**: Misconfiguration or incomplete backfill before streaming startup.
+> **Why it matters**: Shows gap validation prevents data inconsistency.
+
 **Situation**: Backfill ran for ranges 0-2, but range 1 failed
 
 **Meta Store State**:
@@ -432,6 +452,10 @@ range:2:state = "COMPLETE"
 ---
 
 ### Scenario 6: Crash During Transition (Streaming Mode)
+
+> **What**: Service crashes while transition goroutine is converting range 3 to immutable stores.
+> **When**: Hardware failure or OOM during background transition.
+> **Why it matters**: Shows transition recovery with independent sub-flow resume.
 
 **Situation**: Streaming mode, transition in progress for range 3, crash occurs
 
