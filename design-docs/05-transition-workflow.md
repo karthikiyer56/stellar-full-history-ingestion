@@ -7,23 +7,111 @@
 
 ## Overview
 
-The transition workflow converts Active Stores (RocksDB) to Immutable Stores (LFS + RecSplit) when a 10M ledger range completes. This process runs in the background while ingestion continues to the next range.
+The transition workflow converts Active Stores (RocksDB) to Immutable Stores (LFS + RecSplit) when a 10M ledger range completes ingestion.
 
 **Key Characteristics**:
-- Triggered automatically in streaming mode only (not backfill)
+- Triggered at 10M range boundary completion in both modes
+- Same sub-workflow steps: RocksDB → LFS (ledgers), RocksDB → RecSplit (txhash)
 - Runs in parallel: Ledger sub-flow + TxHash sub-flow
-- Non-blocking: Ingestion continues to new Active Stores
-- Query-safe: Transitioning stores remain available for queries
+- **Streaming mode**: Non-blocking background goroutine, new Active Stores created, queries served during transition
+- **Backfill mode**: Sequential/blocking per range, no new Active Stores, no queries served
 
 ---
 
 ## Trigger Conditions
 
-Transition triggers when streaming mode ingests the **last ledger of a range**.
+Transition triggers when **the last ledger of a range** is ingested.
 
 **Trigger Points**: 10,000,001, 20,000,001, 30,000,001, 40,000,001, ...
 
-**NOT triggered in backfill mode** - backfill creates immutable stores directly.
+**Same trigger in both modes**: Whether in backfill or streaming, reaching the last ledger of a range initiates the transition sub-workflows.
+
+See [Transition in Backfill vs Streaming Mode](#transition-in-backfill-vs-streaming-mode) for how the context differs.
+
+---
+
+## Transition in Backfill vs Streaming Mode
+
+The transition sub-workflows (Ledger → LFS, TxHash → RecSplit) are **identical** in both modes.
+The difference is in the surrounding context:
+
+> **CRITICAL: RocksDB Deletion After Transition**
+>
+> **In BOTH modes (backfill AND streaming), once the transition sub-workflows complete and immutable files are created (LFS chunks + RecSplit indexes), the corresponding RocksDB stores for that 10-million ledger range are DELETED.**
+>
+> This is a **permanent, irreversible operation**. The immutable files become the sole source of truth for that range.
+
+| Aspect | Backfill Mode | Streaming Mode |
+|--------|---------------|----------------|
+| **Trigger** | After range ingestion completes (last ledger written) | At 10M boundary (last ledger of range) |
+| **New Active Stores** | NO - next range orchestrator creates fresh stores | YES - created immediately for continued ingestion |
+| **Execution Model** | Sequential, blocking (range completes before next starts) | Background goroutine (ingestion continues to new stores) |
+| **Query Serving** | NO - backfill mode doesn't serve queries | YES - transitioning stores remain queryable |
+| **Parallelism** | Multiple ranges can transition in parallel (if 2+ orchestrators) | One transition at a time (single ingestion thread) |
+| **After Completion** | Orchestrator picks up next PENDING range | Ingestion continues seamlessly to Range N+1 |
+| **RocksDB Fate** | **DELETED after immutable files verified** | **DELETED after immutable files verified** |
+
+### Why This Matters
+
+**In Streaming Mode**, the system must:
+1. Create new Active Stores BEFORE starting transition
+2. Route new ledgers to the new stores immediately
+3. Keep transitioning stores available for queries
+4. Run transition as a background goroutine
+5. **Delete transitioning RocksDB stores after immutable files are verified**
+
+**In Backfill Mode**, none of this is needed because:
+1. Each range orchestrator handles one range at a time
+2. No queries are served during backfill
+3. The next range doesn't start until transition completes (for that orchestrator)
+4. Multiple orchestrators can work in parallel on different ranges
+5. **Delete range RocksDB stores after immutable files are verified**
+
+### The Transition Result (Same in Both Modes)
+
+**Before Transition:**
+```
+Range N data lives in:
+├── Ledger RocksDB: /data/.../ledger/rocksdb/  (mutable)
+└── TxHash RocksDB: /data/.../txhash/rocksdb/  (mutable)
+```
+
+**After Transition:**
+```
+Range N data lives in:
+├── LFS Chunks: /data/immutable/ledgers/range-N/  (read-only)
+└── RecSplit: /data/immutable/txhash/range-N/    (read-only)
+
+RocksDB stores: **DELETED** ← This is the key outcome!
+```
+
+### Flowchart: Backfill vs Streaming Context
+
+```mermaid
+flowchart TB
+    subgraph Backfill["Backfill Mode"]
+        B1[Ingest Range N] --> B2[Last Ledger Reached]
+        B2 --> B3[Transition Sub-Workflows]
+        B3 --> B4[Verify Immutable Files]
+        B4 --> B5[DELETE RocksDB Stores]
+        B5 --> B6[Range N → COMPLETE]
+        B6 --> B7[Pick Next PENDING Range]
+    end
+    
+    subgraph Streaming["Streaming Mode"]
+        S1[Ingest Ledger] --> S2{Last Ledger of Range?}
+        S2 -->|No| S1
+        S2 -->|Yes| S3[Create NEW Active Stores for Range N+1]
+        S3 --> S4[Spawn Transition Goroutine for Range N]
+        S4 --> S5[Continue Ingesting to Range N+1]
+        S4 --> S6[Transition Sub-Workflows - Background]
+        S6 --> S7[Verify Immutable Files]
+        S7 --> S8[DELETE RocksDB Stores]
+        S8 --> S9[Range N → COMPLETE]
+    end
+```
+
+**Key Insight**: The sub-workflow steps (Ledger Sub-Flow, TxHash Sub-Flow documented below) are IDENTICAL. Only the orchestration context differs. **The end result - RocksDB deletion and immutable file creation - is the same in both modes.**
 
 ---
 

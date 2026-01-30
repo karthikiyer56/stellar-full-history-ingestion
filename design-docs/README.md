@@ -58,7 +58,7 @@ The architecture supports efficient storage and retrieval across billions of led
 | Data stores | Separate RocksDB instances per data type (ledger, txhash) |
 | Immutable ledger format | LFS chunks (10K ledgers per chunk, zstd compressed) |
 | Immutable txhash format | RecSplit minimal perfect hash indexes (16 files) |
-| Transition trigger | Automatic at 10M boundary (streaming mode only) |
+| Transition trigger | Automatic at 10M boundary (both modes, different context) |
 | Crash recovery | Per-range checkpointing, never deleted |
 | Batch size | 1000 ledgers (backfill), 1 ledger (streaming) |
 
@@ -165,9 +165,10 @@ These invariants are fundamental to the system's correctness and MUST be maintai
    - Enables crash recovery at any point
    - Provides audit trail of ingestion history
 
-3. **Transition only triggers in streaming mode, not backfill**
-   - Backfill creates immutable stores directly
-   - Streaming uses active→immutable transition at 10M boundaries
+3. **Transition sub-workflows are identical in both modes**
+   - Backfill: Transition runs sequentially after each range completes ingestion
+   - Streaming: Transition runs in background goroutine while new range ingests
+   - Both modes: RocksDB stores are deleted after immutable files verified
 
 4. **No gaps allowed**: streaming mode validates all prior ranges are COMPLETE
    - Startup validation checks all ranges before current
