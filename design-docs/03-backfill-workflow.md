@@ -90,6 +90,25 @@ flowchart TD
 
 ---
 
+## Initial Meta Store State
+
+When backfill starts, the meta store is initialized with:
+
+```
+global:mode = "backfill"
+global:backfill_start_ledger = <start-ledger>
+global:backfill_end_ledger = <end-ledger>
+
+# For each range in the backfill scope:
+range:N:state = "PENDING"
+range:N:start_ledger = <first ledger>
+range:N:end_ledger = <last ledger>
+```
+
+**Key Point**: The `global:mode = "backfill"` setting persists for the lifetime of the backfill process. It is NOT automatically changed when backfill completes - the operator must restart the service without `--backfill` to enter streaming mode. (For complete mode lifecycle rules, see [Streaming Workflow - Mode Transition](./04-streaming-workflow.md#mode-transition).)
+
+---
+
 ## Parallel Orchestrator Design
 
 Backfill mode uses parallel orchestrators to process multiple 10M ranges concurrently.
