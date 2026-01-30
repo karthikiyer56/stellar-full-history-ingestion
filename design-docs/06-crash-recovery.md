@@ -67,7 +67,7 @@ func checkpoint(metaStore *RocksDB, rangeID uint32, ledgerSeq uint32,
 
 ## Recovery Scenarios
 
-### Scenario 1: Crash During Backfill Ingestion
+### Scenario 1: Crash During Backfill Ingestion [BACKFILL MODE]
 
 **Situation**: Backfill running, crash at ledger 7,500,000 (mid-range 0)
 
@@ -103,7 +103,7 @@ range:0:txhash:phase = "COMPLETE"
 
 ---
 
-### Scenario 2: Crash After Batch Write, Before Checkpoint
+### Scenario 2: Crash After Batch Write, Before Checkpoint [BOTH MODES]
 
 **Situation**: Batch of 1000 ledgers written to RocksDB, crash before checkpoint
 
@@ -129,7 +129,24 @@ range:0:ledger:last_committed_ledger = 5001
 
 ---
 
-### Scenario 3: Crash During Compaction
+## Transition Sub-Flows Explained
+
+During transition from Active (RocksDB) to Immutable stores, **two sub-flows run in parallel**:
+
+| Sub-Flow | What It Does | Duration |
+|----------|--------------|----------|
+| **Ledger Sub-Flow** | Reads ledgers from RocksDB → Writes compressed LFS chunks | ~30-60 min |
+| **TxHash Sub-Flow** | Compacts RocksDB → Builds RecSplit indexes → Verifies | ~25-30 min |
+
+These sub-flows are **independent** - a crash in one does not affect the other's recovery.
+
+**Key Recovery Principle**: Each sub-flow tracks its own phase in meta store. On crash:
+- Ledger sub-flow resumes from last completed LFS chunk
+- TxHash sub-flow: If in COMPACTING → restart compaction; If in BUILDING_RECSPLIT → resume from current CF
+
+---
+
+### Scenario 3: Crash During Compaction [BOTH MODES - TRANSITION]
 
 **Situation**: Transition in progress, compaction running, crash occurs
 
@@ -154,7 +171,7 @@ range:3:txhash:phase = "COMPACTING"   # Interrupted
 
 ---
 
-### Scenario 4: Crash During Streaming
+### Scenario 4: Crash During Streaming [STREAMING MODE]
 
 **Situation**: Streaming mode, crash at ledger 65,000,500
 
@@ -176,32 +193,61 @@ range:6:txhash:last_committed_ledger = 65000500
 
 ---
 
-### Scenario 5: Crash During Transition (Both Sub-Flows)
+### Scenario 5: Crash During Transition (Both Sub-Flows) [BOTH MODES - TRANSITION]
 
-**Situation**: Transition in progress, both sub-flows running, crash occurs
+**Context**: During transition, both Ledger and TxHash sub-flows run in parallel. A crash affects both, but recovery is independent for each.
+
+#### Example 5A: Crash in RecSplit Builder (TxHash Sub-Flow)
+
+**Situation**: RecSplit is building CF 7 (of 16), LFS is writing chunk 450 (of 1000). Crash occurs.
 
 **State at Crash**:
 ```
 range:3:state = "TRANSITIONING"
 range:3:ledger:phase = "WRITING_LFS"
+range:3:ledger:lfs_chunks_written = 450  # Tracks progress
 range:3:txhash:phase = "BUILDING_RECSPLIT"
-
-range:4:state = "INGESTING"
-range:4:ledger:last_committed_ledger = 40500000
+range:3:txhash:recsplit_cf_completed = 6  # CFs 0-6 done, crash during CF 7
 ```
 
 **Recovery**:
-1. Restart streaming mode
-2. Find `range:3:state = "TRANSITIONING"`
-3. Find `range:4:state = "INGESTING"`
-4. **Resume both**:
-   - Spawn transition goroutine for range 3 (resume from current phases)
-   - Resume ingestion for range 4 from ledger 40500001
+1. Restart service
+2. Detect `range:3:state = "TRANSITIONING"`
+3. **Ledger Sub-Flow**: Resume LFS writing from chunk 451 (chunks 1-450 verified)
+4. **TxHash Sub-Flow**: Resume RecSplit build from CF 7 (CFs 0-6 already written to disk)
+5. Both sub-flows continue in parallel
 
-**Parallel Recovery**:
-- Transition continues in background
-- Ingestion continues in foreground
-- No blocking, no data loss
+**What Happens to Partial Work**:
+- LFS chunks 1-450: Kept (each chunk is atomic write)
+- LFS chunk 451 (if partially written): Overwritten on resume
+- RecSplit CFs 0-6: Kept (each CF index is atomic write)
+- RecSplit CF 7 (if partially built): Discarded, rebuilt from scratch
+
+#### Example 5B: Crash in LFS Writing (Ledger Sub-Flow)
+
+**Situation**: LFS is writing chunk 750, RecSplit just finished CF 12. Crash occurs.
+
+**State at Crash**:
+```
+range:3:state = "TRANSITIONING"
+range:3:ledger:phase = "WRITING_LFS"
+range:3:ledger:lfs_chunks_written = 749
+range:3:txhash:phase = "BUILDING_RECSPLIT"
+range:3:txhash:recsplit_cf_completed = 12
+```
+
+**Recovery**:
+1. Restart service
+2. Detect `range:3:state = "TRANSITIONING"`
+3. **Ledger Sub-Flow**: Resume LFS writing from chunk 750
+4. **TxHash Sub-Flow**: Resume RecSplit build from CF 13
+
+**If TxHash Finishes First**:
+- TxHash sub-flow marks `range:3:txhash:phase = "COMPLETE"`
+- Ledger sub-flow continues independently
+- Range transitions to COMPLETE only when BOTH sub-flows finish
+
+**Key Insight**: Sub-flows are independent. One can complete while the other recovers from crash.
 
 ---
 
