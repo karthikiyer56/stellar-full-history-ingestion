@@ -59,7 +59,7 @@ The architecture supports efficient storage and retrieval across millions of led
 
 | Decision | Choice |
 |----------|--------|
-| Ledger range unit | 10 million ledgers |
+| Ledger range unit | 10 million ledgers (**Note: everywhere in these docs, "Range" refers to a range of 10 million ledgers**) |
 | Backfill parallelism | ~2 concurrent 10M range orchestrators |
 | Data stores | Separate RocksDB instances per data type (ledger, txhash) |
 | Immutable ledger format | LFS chunks (10K ledgers per chunk, zstd compressed) |

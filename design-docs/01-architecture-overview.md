@@ -1,50 +1,49 @@
 # Architecture Overview
 
 > **Document**: 01-architecture-overview.md  
-> **Purpose**: High-level system architecture, components, and data flow  
-> **Last Updated**: 2026-01-29
-
+> **Purpose**: High-level system architecture, components, and data flow
 ---
 
 ## System Components
 
-The Stellar Full History RPC Service consists of six major components working together to provide efficient query access to the complete blockchain history:
+The Stellar Full History RPC Service consists of six major components working together to provide efficient query access to complete blockchain history:
 
 ```mermaid
 graph TB
-    subgraph "External"
-        LB[LedgerBackend<br/>GCS or CaptiveStellarCore]
-        Client[HTTP Clients]
+%% ---------------- External ----------------
+  subgraph "External"
+    Client[HTTP Clients]
+  end
+
+%% ------------- Stellar Full History RPC Service -------------
+  subgraph "Stellar Full History RPC Service"
+    HTTP[HTTP Server]
+    Router[Query Router<br/>Range-based routing]
+    Ingestion[Ingestion Engine<br/>Backfill or Streaming]
+    Meta[(Meta Store<br/>RocksDB)]
+
+    subgraph "Data Stores"
+      Active[(Active Stores<br/>RocksDB)]
+      Trans[(Transitioning Stores<br/>RocksDB)]
+      Immut[Immutable Stores<br/>LFS + RecSplit]
     end
-    
-    subgraph "Stellar Full History RPC Service"
-        HTTP[HTTP Server<br/>Port 8080]
-        Router[Query Router<br/>Range-based routing]
-        Ingestion[Ingestion Engine<br/>Backfill or Streaming]
-        Meta[(Meta Store<br/>RocksDB)]
-        
-        subgraph "Data Stores"
-            Active[(Active Stores<br/>RocksDB)]
-            Trans[(Transitioning Stores<br/>RocksDB)]
-            Immut[Immutable Stores<br/>LFS + RecSplit]
-        end
-    end
-    
-    Client -->|HTTP Requests| HTTP
-    HTTP --> Router
-    Router --> Active
-    Router --> Trans
-    Router --> Immut
-    
-    LB -->|Ledgers| Ingestion
-    Ingestion --> Active
-    Ingestion --> Meta
-    
-    Active -.->|Transition| Trans
-    Trans -.->|Complete| Immut
-    
-    Router --> Meta
-    Ingestion --> Meta
+  end
+
+%% ---------------- Arrows ----------------
+  Client -->|HTTP Requests| HTTP
+  HTTP --> Router
+  Router --> Active
+  Router --> Trans
+  Router --> Immut
+
+  Ingestion --> Active
+  Ingestion --> Meta
+
+  Active -.->|Transition| Trans
+  Trans -.->|Complete| Immut
+
+  Router --> Meta
+  Ingestion --> Meta
 ```
 
 ---
@@ -68,74 +67,139 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant LB as LedgerBackend<br/>(GCS/CaptiveCore)
-    participant IE as Ingestion Engine
-    participant AS as Active Stores<br/>(RocksDB)
-    participant MS as Meta Store
-    participant IS as Immutable Stores<br/>(LFS + RecSplit)
+    autonumber
     
-    Note over IE: Backfill Mode Start
-    IE->>MS: Load checkpoint (if exists)
-    IE->>LB: PrepareRange(start, end)
-    
-    loop For each batch (1000 ledgers)
-        LB->>IE: GetLedger(seq)
-        IE->>AS: Write ledger + txhash
-        IE->>MS: Checkpoint progress
+    box rgb(240, 248, 255) Data Source
+        participant LB as LedgerBackend<br/>(GCS or CaptiveCore)
     end
     
-    Note over IE: Range complete
-    IE->>IS: Write LFS chunks
-    IE->>IS: Build RecSplit indexes
-    IE->>AS: Delete Active Store
-    IE->>MS: Mark range COMPLETE
+    box rgb(240, 255, 240) Processing
+        participant IE as Ingestion Engine
+    end
     
-    Note over IE: All ranges complete → EXIT
-```
-
-### Streaming Mode Data Flow
-
-```mermaid
-sequenceDiagram
-    participant CC as CaptiveStellarCore
-    participant IE as Ingestion Engine
-    participant AS1 as Active Store<br/>Range N
-    participant AS2 as Active Store<br/>Range N+1
-    participant MS as Meta Store
-    participant TO as Transition<br/>Orchestrator
-    participant IS as Immutable Stores
-    participant QR as Query Router
-    participant Client as HTTP Client
+    box rgb(255, 248, 240) Storage
+        participant AS as Active Stores<br/>(RocksDB)
+        participant MS as Meta Store
+        participant IS as Immutable Stores<br/>(LFS + RecSplit)
+    end
     
-    Note over IE: Streaming Mode Start
-    IE->>MS: Validate no gaps
-    IE->>CC: Start from last_ledger + 1
+    rect rgb(230, 245, 255)
+        Note over IE,MS: PHASE 1: Initialization
+        IE->>MS: Load checkpoint (resume if crash)
+        IE->>LB: PrepareRange(start, end)
+    end
     
-    loop Every ledger
-        CC->>IE: GetLedger(seq)
-        IE->>AS1: Write ledger + txhash
-        IE->>MS: Checkpoint (batch=1)
-        
-        alt Boundary detected (10M)
-            IE->>AS2: Create new Active Store
-            IE->>TO: Spawn transition goroutine
-            Note over TO: Parallel: LFS + RecSplit
-            TO->>IS: Write immutable data
-            TO->>AS1: Delete when complete
+    rect rgb(230, 255, 230)
+        Note over LB,AS: PHASE 2: Ingestion (batches of 1000)
+        loop Each batch
+            LB-->>IE: Stream ledgers
+            IE->>AS: Write ledger data
+            IE->>AS: Write txhash mappings
+            IE->>MS: Checkpoint progress
         end
     end
     
-    Client->>QR: getLedgerBySequence(seq)
-    QR->>MS: Check range state
-    alt Range COMPLETE
-        QR->>IS: Query immutable store
-    else Range INGESTING
-        QR->>AS1: Query active store
-    else Range TRANSITIONING
-        QR->>AS1: Query transitioning store
+    rect rgb(255, 245, 230)
+        Note over AS,IS: PHASE 3: Transition to Immutable
+        IE->>AS: Compact RocksDB
+        IE->>IS: Write LFS chunks (10K ledgers each)
+        IE->>IS: Build RecSplit indexes (16 files)
+        IE->>IS: Verify immutable data
+        IE->>AS: Delete Active Store
+        IE->>MS: Mark range COMPLETE
     end
-    QR->>Client: Return result
+    
+    Note over IE: Repeat for next range, or EXIT when all done
 ```
+
+> **Note**: The transition phase (Phase 3) is **identical** in both backfill and streaming modes.  
+> The only difference is that in **streaming mode**, the store being transitioned is marked `TRANSITIONING` and remains queryable during conversion, whereas in **backfill mode**, queries are not served so there is no transitioning store state.
+---
+
+### Streaming Mode Data Flow
+
+The streaming mode diagram is split into two parts for clarity: **Ingestion Flow** (how data enters) and **Query Flow** (how data is served).
+
+---
+
+#### Ingestion Flow (streaming mode)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    
+    box rgb(240, 248, 255) Data Source
+        participant CC as CaptiveStellarCore
+    end
+    
+    box rgb(240, 255, 240) Processing
+        participant IE as Ingestion Engine
+        participant TO as Transition Orchestrator
+    end
+    
+    box rgb(255, 248, 240) Storage
+        participant AS as Active Store<br/>(Current Range)
+        participant MS as Meta Store
+        participant IS as Immutable Stores
+    end
+    
+    rect rgb(230, 245, 255)
+        Note over IE,MS: STARTUP: Validation
+        IE->>MS: Validate no gaps in prior ranges
+        IE->>CC: Start from last_ledger + 1
+    end
+    
+    rect rgb(230, 255, 230)
+        Note over CC,AS: STEADY STATE: Per-ledger ingestion
+        loop Every ledger (batch=1)
+            CC-->>IE: GetLedger(seq)
+            IE->>AS: Write ledger + txhash
+            IE->>MS: Checkpoint progress
+        end
+    end
+    
+    rect rgb(255, 245, 230)
+        Note over IE,IS: BOUNDARY: Transition (at 10M ledger boundary)
+        IE->>AS: Mark current store TRANSITIONING
+        IE->>AS: Create NEW Active Store for next range
+        IE->>TO: Spawn background goroutine
+        
+        par Background Transition (non-blocking)
+            TO->>AS: Compact RocksDB
+            TO->>IS: Write LFS chunks
+            TO->>IS: Build RecSplit indexes
+            TO->>IS: Verify data integrity
+            TO->>AS: Delete old Active Store
+            TO->>MS: Mark range COMPLETE
+        end
+        
+        Note over IE: Continue ingesting to new Active Store
+    end
+```
+
+> **Note**: The transition steps (compact → LFS → RecSplit → verify → delete → mark complete) are **identical** in both modes.  
+> The key difference: In streaming mode, the old store is marked `TRANSITIONING` and **remains queryable** while conversion happens in the background. In backfill mode, no queries are served, so this state doesn't exist.
+---
+
+#### Query Flow (streaming mode)
+
+```mermaid
+flowchart LR
+    C[Client] --> QR[Query Router]
+    QR --> AS[(Active Store)]
+    QR --> TS[(Transitioning Store)]
+    QR --> IS[(Immutable Stores)]
+    AS --> R[Response]
+    TS --> R
+    IS --> R
+```
+
+| Query | Routing Logic |
+|-------|---------------|
+| **getLedgerBySequence** | Range calculated from ledger sequence → query single store based on range state |
+| **getTransactionByHash** | Range unknown → search Active → Transitioning → Immutable (newest to oldest) until found |
+
+> For detailed query routing logic, search order, and false positive handling, see [Query Routing - getTransactionByHash Workflow](./07-query-routing.md#gettransactionbyhash-workflow).
 
 ---
 
@@ -147,21 +211,22 @@ Active stores hold data for the current 10M ledger range being ingested. They ar
 
 **Ledger Store**:
 - **Key**: `uint32(ledgerSeq)` (4 bytes, big-endian)
-- **Value**: `zstd(LedgerCloseMeta)` (compressed protobuf)
+- **Value**: `zstd(LedgerCloseMeta)` (compressed LedgerCloseMeta in bytes, appx 150kb for recent ledgers)
 - **Column Families**: 1 (default)
 - **Purpose**: Store compressed ledger data for quick retrieval
 
 **TxHash Store**:
-- **Key**: `[32]byte(txHash)` (SHA-256 hash)
+- **Key**: `[32]byte(txHash)`
 - **Value**: `uint32(ledgerSeq)` (4 bytes, big-endian)
-- **Column Families**: 16 (sharded by first hex character: 0-9, a-f)
+- **Column Families**: 16 (sharded by first character in the hex representation of transaction hash: 0-9, a-f)
 - **Purpose**: Map transaction hash to ledger sequence
 
 **Configuration**:
 - Write-optimized settings during ingestion
 - Auto-compaction disabled (manual compaction before transition)
-- Block cache: 8GB (configurable)
-- Write buffer: 512MB per CF
+- Tuned block cache and write buffer sizes for performance
+- Bloom filters enabled for txhash CFs
+- See [Configuration Document](./09-configuration.md) for full details
 
 ### Immutable Stores
 
@@ -179,7 +244,7 @@ Immutable stores hold data for completed 10M ledger ranges. They are read-only a
 **RecSplit TxHash Index**:
 - **Format**: Minimal perfect hash function
 - **Files**: 16 `.idx` files (one per hex prefix: 0-9, a-f)
-- **Overhead**: ~2-3 bits per key
+- **Size**: ~4.5 bytes/entry (including overhead, compared to 36 bytes/entry (plus bloom filter overhead) in Rocksdb)
 - **Lookup**: O(1) with 2-3 disk seeks
 - **Purpose**: Space-efficient txhash → ledgerSeq mapping
 
@@ -206,35 +271,31 @@ immutable/
 
 ### Minimum Specifications
 
-| Resource | Requirement | Notes |
-|----------|-------------|-------|
-| **CPU** | 32 cores | For parallel backfill orchestrators and compaction |
-| **RAM** | 128 GB | CaptiveStellarCore (~8GB) + RocksDB caches + buffers |
-| **Disk (Active)** | 2 TB NVMe SSD | Active stores, meta store (high IOPS required) |
-| **Disk (Immutable)** | 50+ TB HDD | Immutable stores (sequential access, lower IOPS acceptable) |
-| **Network** | 10 Gbps | For GCS access in backfill mode |
+| Resource | Requirement            | Notes                                                |
+|----------|------------------------|------------------------------------------------------|
+| **CPU** | 32 cores               | For parallel backfill orchestrators and compaction   |
+| **RAM** | 128 GB                 | CaptiveStellarCore (~8GB) + RocksDB caches + buffers |
+| **Disk (Active)** | 2 TB NVMe SSD          | Active stores, meta store (high IOPS required)       |
+| **Disk (Immutable)** | 32+ TB (SSD Preferred) | Immutable stores (sequential access)                 |
+| **Network** | 10 Gbps                | For GCS access in backfill mode                      |
 
 ### Memory Breakdown
 
-| Component | Memory Usage | Configurable |
-|-----------|--------------|--------------|
-| CaptiveStellarCore | ~8 GB per instance | No |
-| RocksDB Block Cache | 8 GB (default) | Yes (`block_cache_mb`) |
+| Component | Memory Usage                 | Configurable |
+|-----------|------------------------------|--------------|
+| CaptiveStellarCore | ~8 GB per instance           | No |
+| RocksDB Block Cache | 8 GB (default)               | Yes (`block_cache_mb`) |
 | RocksDB Write Buffers | 512 MB × 2 × 17 CFs = ~17 GB | Yes (`write_buffer_mb`, `max_write_buffer_number`) |
-| Ingestion Buffers | 1000 ledgers × 1 MB = ~1 GB | Yes (`checkpoint_interval`) |
-| Application Overhead | ~2 GB | No |
-| **Total (Streaming)** | ~36 GB | |
-| **Total (Backfill, 2 parallel)** | ~52 GB | |
+| Ingestion Buffers | 1000 ledgers × 1 MB = ~1 GB  | Yes (`checkpoint_interval`) |
+| Application Overhead | ~2 GB                        | No |
+| **Total (Streaming)** | ~36 GB                       | |
+| **Total (Backfill, 2 parallel)** | ~72 GB                       | |
 
 ### Storage Size Reference (Per 10M Ledger Range)
 
-> Based on real-world data from ledger ranges 30,000,002 - 60,000,001.
+>  Based on real-world data from ledger ranges 30,000,002 - 60,000,001. 
 > Earlier ranges (2 - 30,000,001) may have smaller LCM sizes due to lower network activity.
 
-**Unit Convention**: All sizes use decimal (SI) units:
-- **TB** = 10^12 bytes (terabyte, not tebibyte)
-- **GB** = 10^9 bytes (gigabyte, not gibibyte)
-- This matches common disk manufacturer conventions and `df -H` output.
 
 #### Ledger Store (LedgerSeq → LCM)
 
@@ -281,8 +342,6 @@ During transition, the system temporarily holds both active and transitioning st
 | Transitioning Stores (Range N) | ~Variable (RocksDB read-only) |
 | Transition goroutine buffers | ~2 GB |
 | **Recommended Total RAM** | **128 GB** |
-
-See [Hardware Requirements](#hardware-requirements) for full system recommendations.
 
 ---
 
