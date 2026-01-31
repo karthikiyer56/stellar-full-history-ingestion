@@ -26,31 +26,36 @@ The Stellar Full History RPC Service organizes data across multiple storage type
 │       └── rocksdb/
 │
 └── immutable/                            # Completed immutable stores (historical ranges)
-    ├── ledgers/                          # LFS ledger stores (adheres to existing LFS format)
-    │   ├── range-0/                      # Range 0: ledgers 2 - 10,000,001
-    │   │   └── chunks/                   # LFS chunks (10,000 ledgers per chunk)
-    │   │       ├── 0000/                 # Parent directory for chunks 0-999
-    │   │       │   ├── 000000.data       # Chunk 0 data (zstd compressed)
-    │   │       │   ├── 000000.index      # Chunk 0 index (ledger offsets)
-    │   │       │   ├── 000001.data       # Chunk 1 data
-    │   │       │   ├── 000001.index      # Chunk 1 index
-    │   │       │   └── ...               # Chunks 2-999
-    │   │       ├── 0001/                 # Parent directory for chunks 1000-1999
-    │   │       │   ├── 001000.data
-    │   │       │   ├── 001000.index
-    │   │       │   └── ...
-    │   │       └── ...                   # More parent directories as needed
-    │   ├── range-1/                      # Range 1: ledgers 10,000,002 - 20,000,001
-    │   │   └── chunks/
-    │   │       ├── 0001/                 # Chunks 1000-1999 (range 1 starts at chunk 1000)
-    │   │       ├── 0002/                 # Chunks 2000-2999
-    │   │       └── ...
-    │   ├── range-2/                      # Range 2: ledgers 20,000,002 - 30,000,001
-    │   │   └── chunks/
-    │   └── ...                           # Additional ranges as ingestion progresses
+    ├── ledgers/                          # Single LFS store for ALL ranges (no per-range dirs)
+    │   └── chunks/                       # LFS chunks (10,000 ledgers per chunk)
+    │       ├── 0000/                     # Range 0: chunks 0-999 (ledgers 2 - 10,000,001)
+    │       │   ├── 000000.data           # Chunk 0 data (zstd compressed)
+    │       │   ├── 000000.index          # Chunk 0 index (ledger offsets)
+    │       │   ├── 000001.data           # Chunk 1 data
+    │       │   ├── 000001.index          # Chunk 1 index
+    │       │   └── ...                   # Chunks 2-999
+    │       ├── 0001/                     # Range 1: chunks 1000-1999 (ledgers 10,000,002 - 20,000,001)
+    │       │   ├── 001000.data
+    │       │   ├── 001000.index
+    │       │   └── ...
+│       ├── 0002/                     # Range 2: chunks 2000-2999 (ledgers 20,000,002 - 30,000,001)
+│       │   ├── 002000.data
+│       │   ├── 002000.index
+│       │   └── ...
+│       ├── 0005/                     # Range 5: chunks 5000-5999 (ledgers 50,000,002 - 60,000,001)
+│       │   ├── 005000.data           # First chunk (ledgers 50,000,002 - 50,010,001)
+│       │   ├── 005000.index
+│       │   ├── 005001.data           # Second chunk (ledgers 50,010,002 - 50,020,001)
+│       │   ├── 005001.index
+│       │   ├── ...
+│       │   ├── 005998.data           # Second-to-last chunk (ledgers 59,980,002 - 59,990,001)
+│       │   ├── 005998.index
+│       │   ├── 005999.data           # Last chunk (ledgers 59,990,002 - 60,000,001)
+│       │   └── 005999.index
+│       └── ...                       # More parent directories as ranges are ingested
     │
-    └── txhash/                           # RecSplit indexes (minimal perfect hash)
-        ├── range-0/                      # Range 0 txhash index
+    └── txhash/                           # RecSplit indexes (minimal perfect hash) - per range
+        ├── 0000/                         # Range 0 txhash index
         │   └── index/
         │       ├── cf-0.idx              # RecSplit index for CF "0" (txhashes starting with 0)
         │       ├── cf-1.idx              # RecSplit index for CF "1"
@@ -68,13 +73,20 @@ The Stellar Full History RPC Service organizes data across multiple storage type
         │       ├── cf-d.idx
         │       ├── cf-e.idx
         │       └── cf-f.idx              # RecSplit index for CF "f"
-        ├── range-1/
+        ├── 0001/                         # Range 1 txhash index
         │   └── index/
         │       ├── cf-0.idx
         │       └── ...
-        ├── range-2/
-        │   └── index/
-        └── ...
+├── 0002/                         # Range 2 txhash index
+│   └── index/
+├── 0005/                         # Range 5 txhash index
+│   └── index/
+│       ├── cf-0.idx              # First file
+│       ├── cf-1.idx              # Second file
+│       ├── ...
+│       ├── cf-e.idx              # Second-to-last file
+│       └── cf-f.idx              # Last file
+└── ...
 ```
 
 ---
@@ -148,6 +160,8 @@ func chunkLastLedger(chunkID uint32) uint32 {
 | 1,000,002 | 100 | `chunks/0000/` | `chunks/0000/000100.data` | `chunks/0000/000100.index` |
 | 10,000,002 | 1000 | `chunks/0001/` | `chunks/0001/001000.data` | `chunks/0001/001000.index` |
 | 20,000,002 | 2000 | `chunks/0002/` | `chunks/0002/002000.data` | `chunks/0002/002000.index` |
+| 50,000,002 | 5000 | `chunks/0005/` | `chunks/0005/005000.data` | `chunks/0005/005000.index` |
+| 59,990,002 | 5999 | `chunks/0005/` | `chunks/0005/005999.data` | `chunks/0005/005999.index` |
 
 ---
 
@@ -155,14 +169,14 @@ func chunkLastLedger(chunkID uint32) uint32 {
 
 ### Path Convention
 
-RecSplit indexes are organized by range and column family:
+RecSplit indexes are organized by range (using 4-digit zero-padded directory names to match LFS convention) and column family:
 
 ```
-immutable/txhash/range-{N}/index/cf-{X}.idx
+immutable/txhash/XXXX/index/cf-{X}.idx
 ```
 
 Where:
-- `{N}` = Range ID (0, 1, 2, ...)
+- `XXXX` = Range ID (4-digit zero-padded: 0000, 0001, 0002, ...)
 - `{X}` = Column family name (0-9, a-f)
 
 ### Path Calculation (Go Pseudocode)
@@ -174,7 +188,7 @@ func getRecSplitPath(baseDir string, rangeID uint32, cfName string) string {
         baseDir,
         "immutable",
         "txhash",
-        fmt.Sprintf("range-%d", rangeID),
+        fmt.Sprintf("%04d", rangeID),
         "index",
         fmt.Sprintf("cf-%s.idx", cfName),
     )
@@ -185,10 +199,12 @@ func getRecSplitPath(baseDir string, rangeID uint32, cfName string) string {
 
 | Range ID | CF Name | Path |
 |----------|---------|------|
-| 0 | 0 | `immutable/txhash/range-0/index/cf-0.idx` |
-| 0 | a | `immutable/txhash/range-0/index/cf-a.idx` |
-| 1 | 5 | `immutable/txhash/range-1/index/cf-5.idx` |
-| 2 | f | `immutable/txhash/range-2/index/cf-f.idx` |
+| 0 | 0 | `immutable/txhash/0000/index/cf-0.idx` |
+| 0 | a | `immutable/txhash/0000/index/cf-a.idx` |
+| 1 | 5 | `immutable/txhash/0001/index/cf-5.idx` |
+| 2 | f | `immutable/txhash/0002/index/cf-f.idx` |
+| 5 | 0 | `immutable/txhash/0005/index/cf-0.idx` |
+| 5 | f | `immutable/txhash/0005/index/cf-f.idx` |
 
 ---
 

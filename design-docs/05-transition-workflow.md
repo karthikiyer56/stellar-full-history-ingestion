@@ -79,8 +79,8 @@ Range N data lives in:
 **After Transition:**
 ```
 Range N data lives in:
-├── LFS Chunks: /data/immutable/ledgers/range-N/  (read-only)
-└── RecSplit: /data/immutable/txhash/range-N/    (read-only)
+├── LFS Chunks: /data/immutable/ledgers/chunks/000N/  (read-only)
+└── RecSplit: /data/immutable/txhash/000N/    (read-only)
 
 RocksDB stores: **DELETED** ← This is the key outcome!
 ```
@@ -261,7 +261,7 @@ flowchart TD
 1. Read all ledgers from Active RocksDB (sequential scan)
 2. Group into 10K ledger chunks
 3. Compress each chunk with zstd
-4. Write to LFS format: `immutable/ledgers/range-N/chunks/XXXX/YYYYYY.data`
+4. Write to LFS format: `immutable/ledgers/chunks/XXXX/YYYYYY.data`
 5. Verify: Read back and decompress each chunk
 6. Mark phase as IMMUTABLE
 
@@ -279,7 +279,7 @@ flowchart TD
 1. **Compact**: Run full compaction on all 16 CFs in parallel
 2. **Build**: For each CF, build RecSplit minimal perfect hash index
 3. **Verify**: For each CF, verify all keys can be looked up in RecSplit
-4. **Write**: Save indexes to `immutable/txhash/range-N/index/cf-{0..f}.idx`
+4. **Write**: Save indexes to `immutable/txhash/000N/index/cf-{0..f}.idx`
 5. Mark phase as COMPLETE
 
 ---
@@ -412,9 +412,9 @@ range:6:txhash:phase = "BUILDING_RECSPLIT"  # Compaction done, building indexes
 range:6:state = "COMPLETE"
 range:6:completed_at = "2026-01-29T15:30:00Z"
 range:6:ledger:phase = "IMMUTABLE"
-range:6:ledger:immutable_path = "/data/stellar-rpc/immutable/ledgers/range-6"
+range:6:ledger:immutable_path = "/data/stellar-rpc/immutable/ledgers/chunks/0006"
 range:6:txhash:phase = "COMPLETE"
-range:6:txhash:recsplit_path = "/data/stellar-rpc/immutable/txhash/range-6"
+range:6:txhash:recsplit_path = "/data/stellar-rpc/immutable/txhash/0006"
 
 # Active RocksDB for range 6 deleted
 # Queries now routed to immutable stores

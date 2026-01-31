@@ -270,12 +270,12 @@ range:1:state = "COMPLETE"
 range:2:state = "COMPLETE"
 
 # Immutable stores created:
-/data/stellar-rpc/immutable/ledgers/range-0/
-/data/stellar-rpc/immutable/ledgers/range-1/
-/data/stellar-rpc/immutable/ledgers/range-2/
-/data/stellar-rpc/immutable/txhash/range-0/
-/data/stellar-rpc/immutable/txhash/range-1/
-/data/stellar-rpc/immutable/txhash/range-2/
+/data/stellar-rpc/immutable/ledgers/chunks/0000/  # Range 0 chunks (0-999)
+/data/stellar-rpc/immutable/ledgers/chunks/0001/  # Range 1 chunks (1000-1999)
+/data/stellar-rpc/immutable/ledgers/chunks/0002/  # Range 2 chunks (2000-2999)
+/data/stellar-rpc/immutable/txhash/0000/
+/data/stellar-rpc/immutable/txhash/0001/
+/data/stellar-rpc/immutable/txhash/0002/
 ```
 
 **Process Exit**: Backfill process terminates with exit code 0.

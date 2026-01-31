@@ -286,18 +286,21 @@ flowchart TD
 
 For COMPLETE ranges, ledgers are stored in LFS chunks (10,000 ledgers per chunk):
 
-> **Note on Path Formats**: The file paths shown below (e.g., `/data/immutable/ledgers/range-N/chunks/XXXX/YYYYYY.data`) are **illustrative examples** for documentation clarity. Actual path formats may differ based on implementation. These examples demonstrate the conceptual directory structure, not the canonical path specification.
+> **Note on Path Formats**: The LFS uses global chunk IDs. There are no per-range directories for ledgers - just a flat `chunks/XXXX/YYYYYY.data` structure where XXXX = chunkID/1000 and YYYYYY = chunkID.
 
 ```go
-func (s *LFSStore) GetLedger(rangeID, ledgerSeq uint32) (*xdr.LedgerCloseMeta, error) {
-    // Calculate chunk ID within range
-    offsetInRange := ledgerSeq - rangeFirstLedger(rangeID)
-    chunkID := offsetInRange / 10000
-    offsetInChunk := offsetInRange % 10000
+func (s *LFSStore) GetLedger(ledgerSeq uint32) (*xdr.LedgerCloseMeta, error) {
+    // Calculate global chunk ID (LFS uses global, not per-range)
+    const FirstLedger = 2
+    const LedgersPerChunk = 10000
     
-    // Path: /data/immutable/ledgers/range-N/chunks/XXXX/YYYYYY.data
-    chunkPath := fmt.Sprintf("%s/range-%d/chunks/%04d/%06d.data", 
-        s.basePath, rangeID, chunkID/100, chunkID)
+    chunkID := (ledgerSeq - FirstLedger) / LedgersPerChunk
+    offsetInChunk := (ledgerSeq - FirstLedger) % LedgersPerChunk
+    
+    // Path: /data/immutable/ledgers/chunks/XXXX/YYYYYY.data
+    parentDir := chunkID / 1000
+    chunkPath := fmt.Sprintf("%s/chunks/%04d/%06d.data", 
+        s.basePath, parentDir, chunkID)
     
     // Read and decompress chunk
     compressed, _ := os.ReadFile(chunkPath)
@@ -461,7 +464,7 @@ func verifyTransactionInLedger(lcmBytes []byte, targetTxHash []byte) (bool, erro
    - **Range 5**: RecSplit lookup → Not found, continue
    - **Range 4**: RecSplit lookup → Not found, continue
    - **Range 3**: RecSplit lookup → **Returns ledgerSeq = 35,123,456**
-     - Fetch LCM from LFS: `/data/immutable/ledgers/range-3/chunks/0512/005123.data`
+      - Fetch LCM from LFS: `/data/immutable/ledgers/chunks/0003/003512.data`
      - Decompress with zstd
      - Parse LedgerCloseMeta
      - Iterate transactions, compute hashes
@@ -502,7 +505,7 @@ func verifyTransactionInLedger(lcmBytes []byte, targetTxHash []byte) (bool, erro
 1. Calculate range: `(5000000 - 2) / 10000000 = 0`
 2. Check state: `range:0:state = "COMPLETE"`
 3. Route to: Immutable LFS store
-4. Path: `/data/immutable/ledgers/range-0/chunks/0500/005000.data`
+4. Path: `/data/immutable/ledgers/chunks/0000/000499.data`
 5. Return: LedgerCloseMeta
 
 **Response**: 200 OK

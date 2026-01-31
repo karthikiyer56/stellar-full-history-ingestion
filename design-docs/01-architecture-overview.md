@@ -251,18 +251,45 @@ Immutable stores hold data for completed 10M ledger ranges. They are read-only a
 **Path Structure**:
 ```
 immutable/
-├── ledgers/
-│   └── range-0/
-│       ├── chunk-0000.data
-│       ├── chunk-0000.index
-│       ├── ...
-│       └── chunk-0999.index
-└── txhash/
-    └── range-0/
-        ├── 0.idx
-        ├── 1.idx
-        ├── ...
-        └── f.idx
+├── ledgers/                              # Single LFS store for all ranges
+│   └── chunks/
+│       ├── 0000/                         # Range 0: chunks 0-999 (ledgers 2 - 10,000,001)
+│       │   ├── 000000.data               # Chunk 0 (ledgers 2-10,001)
+│       │   ├── 000000.index
+│       │   ├── 000001.data               # Chunk 1 (ledgers 10,002-20,001)
+│       │   ├── 000001.index
+│       │   └── ...
+│       ├── 0001/                         # Range 1: chunks 1000-1999 (ledgers 10,000,002 - 20,000,001)
+│       │   ├── 001000.data
+│       │   ├── 001000.index
+│       │   └── ...
+│       ├── 0005/                         # Range 5: chunks 5000-5999 (ledgers 50,000,002 - 60,000,001)
+│       │   ├── 005000.data               # First chunk (ledgers 50,000,002 - 50,010,001)
+│       │   ├── 005000.index
+│       │   ├── 005001.data               # Second chunk (ledgers 50,010,002 - 50,020,001)
+│       │   ├── 005001.index
+│       │   ├── ...
+│       │   ├── 005998.data               # Second-to-last chunk (ledgers 59,980,002 - 59,990,001)
+│       │   ├── 005998.index
+│       │   ├── 005999.data               # Last chunk (ledgers 59,990,002 - 60,000,001)
+│       │   └── 005999.index
+│       └── ...
+└── txhash/                               # RecSplit indexes per range
+    ├── 0000/                             # Range 0
+    │   └── index/
+    │       ├── cf-0.idx
+    │       └── ...
+    ├── 0001/                             # Range 1
+    │   └── index/
+    │       └── ...
+    ├── 0005/                             # Range 5
+    │   └── index/
+    │       ├── cf-0.idx
+    │       ├── cf-1.idx
+    │       ├── ...
+    │       ├── cf-e.idx
+    │       └── cf-f.idx
+    └── ...
 ```
 
 ---

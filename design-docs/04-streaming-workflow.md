@@ -212,8 +212,8 @@ During transition, the service maintains multiple RocksDB instances:
 ┌─────────────────────────────────────────────────────────┐
 │                 Immutable Stores                         │
 │  Ranges 0-2 (COMPLETE)                                  │
-│  - LFS chunks: /data/immutable/ledgers/range-{0,1,2}   │
-│  - RecSplit: /data/immutable/txhash/range-{0,1,2}      │
+│  - LFS chunks: /data/immutable/ledgers/chunks/000{0,1,2}│
+│  - RecSplit: /data/immutable/txhash/000{0,1,2}       │
 │  - Serving queries                                      │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -317,8 +317,8 @@ When the service restarts (e.g., after upgrade):
 **Transition Complete**:
 ```
 [INFO] Range 6 transition complete
-[INFO]   Ledger: IMMUTABLE (/data/immutable/ledgers/range-6)
-[INFO]   TxHash: COMPLETE (/data/immutable/txhash/range-6)
+[INFO]   Ledger: IMMUTABLE (/data/immutable/ledgers/chunks/0006)
+[INFO]   TxHash: COMPLETE (/data/immutable/txhash/0006)
 [INFO] Range 6 state: COMPLETE
 ```
 

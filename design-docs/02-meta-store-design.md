@@ -99,7 +99,7 @@ Each 10M ledger range has its own set of keys:
 | `range:{id}:ledger:phase` | LedgerPhase | Ledger sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `WRITING_LFS` (when transition starts), `WRITING_LFS` → `IMMUTABLE` (when LFS writing completes). **Component**: Ledger sub-workflow. **Example**: `"WRITING_LFS"`. |
 | `range:{id}:ledger:last_committed_ledger` | uint32 | Last checkpointed ledger | **Set**: After first batch processed. **Updated**: At each checkpoint (every 1000 ledgers in backfill, every 1 ledger in streaming). **Component**: Ingestion loop. **Example**: `7499001`. |
 | `range:{id}:ledger:count` | uint64 | Total ledgers ingested | **Set**: After first batch processed. **Updated**: At each checkpoint (incremented by batch size). **Component**: Ingestion loop. **Example**: `7499000`. |
-| `range:{id}:ledger:immutable_path` | string | Path to LFS chunks after transition | **Set**: When LFS writing completes (phase becomes `IMMUTABLE`). **Updated**: Never. **Component**: LFS writer. **Example**: `"/data/stellar-rpc/immutable/ledgers/range-0"`. |
+| `range:{id}:ledger:immutable_path` | string | Path to LFS chunks after transition | **Set**: When LFS writing completes (phase becomes `IMMUTABLE`). **Updated**: Never. **Component**: LFS writer. **Example**: `"/data/stellar-rpc/immutable/ledgers/chunks/0000"` (for range 0, containing chunks 0-999). |
 
 ### Per-Range TxHash Store Keys
 
@@ -108,8 +108,8 @@ Each 10M ledger range has its own set of keys:
 | `range:{id}:txhash:phase` | TxHashPhase | TxHash sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `COMPACTING` → `BUILDING_RECSPLIT` → `VERIFYING_RECSPLIT` → `COMPLETE` (see [Transition Workflow](./05-transition-workflow.md) for phase details). **Component**: TxHash sub-workflow. **Example**: `"BUILDING_RECSPLIT"`. |
 | `range:{id}:txhash:last_committed_ledger` | uint32 | Last checkpointed ledger | **Set**: After first batch processed. **Updated**: At each checkpoint (every 1000 ledgers in backfill, every 1 ledger in streaming). **Component**: Ingestion loop. **Example**: `7499001`. |
 | `range:{id}:txhash:cf_counts` | JSON | Per-CF counts: {"0": count, ..., "f": count} | **Set**: After first batch processed. **Updated**: At each checkpoint (counts incremented by transactions in batch). **Component**: Ingestion loop. **Example**: `{"0": 375, "1": 362, ..., "f": 368}`. |
-| `range:{id}:txhash:rocksdb_path` | string | Path to Active Store RocksDB | **Set**: When range ingestion starts (RocksDB instance created). **Updated**: Never. **Component**: Range orchestrator. **Example**: `"/data/stellar-rpc/active/txhash/range-1"`. |
-| `range:{id}:txhash:recsplit_path` | string | Path to RecSplit indexes after transition | **Set**: When RecSplit building completes (phase becomes `COMPLETE`). **Updated**: Never. **Component**: RecSplit builder. **Example**: `"/data/stellar-rpc/immutable/txhash/range-0"`. |
+| `range:{id}:txhash:rocksdb_path` | string | Path to Active Store RocksDB | **Set**: When range ingestion starts (RocksDB instance created). **Updated**: Never. **Component**: Range orchestrator. **Example**: `"/data/stellar-rpc/active/txhash/rocksdb"`. |
+| `range:{id}:txhash:recsplit_path` | string | Path to RecSplit indexes after transition | **Set**: When RecSplit building completes (phase becomes `COMPLETE`). **Updated**: Never. **Component**: RecSplit builder. **Example**: `"/data/stellar-rpc/immutable/txhash/0000"` (for range 0). |
 
 ### Transition Keys (Temporary)
 
@@ -349,9 +349,9 @@ range:0:txhash:phase                 = "COMPACTING"
 range:0:state                        = "COMPLETE"
 range:0:completed_at                 = "2026-01-28T12:00:00Z"
 range:0:ledger:phase                 = "IMMUTABLE"
-range:0:ledger:immutable_path        = "/data/stellar-rpc/immutable/ledgers/range-0"
+range:0:ledger:immutable_path        = "/data/stellar-rpc/immutable/ledgers/chunks/0000"
 range:0:txhash:phase                 = "COMPLETE"
-range:0:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/range-0"
+range:0:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/0000"
 ```
 
 ---
@@ -475,9 +475,9 @@ range:4:txhash:last_committed_ledger = 40000002
 range:3:state                        = "COMPLETE"
 range:3:completed_at                 = "2026-01-29T14:30:00Z"
 range:3:ledger:phase                 = "IMMUTABLE"
-range:3:ledger:immutable_path        = "/data/stellar-rpc/immutable/ledgers/range-3"
+range:3:ledger:immutable_path        = "/data/stellar-rpc/immutable/ledgers/chunks/0003"
 range:3:txhash:phase                 = "COMPLETE"
-range:3:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/range-3"
+range:3:txhash:recsplit_path         = "/data/stellar-rpc/immutable/txhash/0003"
 ```
 
 **Key Insight**: Transition triggers on the LAST ledger of a range (10000001, 20000001, 30000001, 40000001, etc.), not the first ledger of the next range.
