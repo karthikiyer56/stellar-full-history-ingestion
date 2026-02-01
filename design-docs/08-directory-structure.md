@@ -132,22 +132,22 @@ func getIndexPath(dataDir string, chunkID uint32) string {
 ```go
 const (
     FirstLedger       = 2
-    LedsPerChunk      = 10_000
+    LedgersPerChunk   = 10_000
 )
 
 // Convert ledger sequence to chunk ID
 func ledgerToChunkID(ledgerSeq uint32) uint32 {
-    return (ledgerSeq - FirstLedger) / LedsPerChunk
+    return (ledgerSeq - FirstLedger) / LedgersPerChunk
 }
 
 // Get first ledger in a chunk
 func chunkFirstLedger(chunkID uint32) uint32 {
-    return (chunkID * LedsPerChunk) + FirstLedger
+    return (chunkID * LedgersPerChunk) + FirstLedger
 }
 
 // Get last ledger in a chunk
 func chunkLastLedger(chunkID uint32) uint32 {
-    return ((chunkID + 1) * LedsPerChunk) + FirstLedger - 1
+    return ((chunkID + 1) * LedgersPerChunk) + FirstLedger - 1
 }
 ```
 
@@ -286,25 +286,29 @@ Any `*_path` or `*_base` configuration key can be overridden with an absolute pa
 
 ## Storage Requirements
 
+> For detailed calculations and methodology, see [Storage Size Reference](./01-architecture-overview.md#storage-size-reference-per-10m-ledger-range).
+
 ### Per-Range Estimates
+
+Based on real-world data from ledger ranges 30,000,002 - 60,000,001. Earlier ranges may have smaller sizes due to lower network activity.
 
 | Store Type | Size per 10M Ledgers | Notes |
 |------------|----------------------|-------|
-| Active Ledger (RocksDB) | ~500 GB | Before compaction |
-| Active TxHash (RocksDB) | ~50 GB | Before compaction |
-| Immutable Ledgers (LFS) | ~400 GB | After zstd compression |
-| Immutable TxHash (RecSplit) | ~10 GB | Minimal perfect hash |
+| Active Ledger (RocksDB) | ~1.58 TB | 10M × 150KB avg LCM + 5% overhead |
+| Active TxHash (RocksDB) | ~140 GB | 3.25B entries × 36 bytes + 25% overhead |
+| Immutable Ledgers (LFS) | ~1.5 TB | zstd compressed chunks |
+| Immutable TxHash (RecSplit) | ~15 GB | 16 minimal perfect hash indexes |
 
 ### Total Storage (Example: 100M Ledgers)
 
-| Component | Size |
-|-----------|------|
-| 10 Immutable Ledger Ranges | 10 × 400 GB = 4 TB |
-| 10 Immutable TxHash Ranges | 10 × 10 GB = 100 GB |
-| 1 Active Ledger Store | ~500 GB |
-| 1 Active TxHash Store | ~50 GB |
-| Meta Store | ~1 GB |
-| **Total** | **~4.65 TB** |
+| Component | Size                |
+|-----------|---------------------|
+| 10 Immutable Ledger Ranges | 10 × 1.5 TB = 15 TB |
+| 10 Immutable TxHash Ranges | 10 × 15 GB = 150 GB |
+| 1 Active Ledger Store | ~1.58 TB            |
+| 1 Active TxHash Store | ~140 GB             |
+| Meta Store | ~100 MB             |
+| **Total** | **~16.87 TB**       |
 
 ---
 
