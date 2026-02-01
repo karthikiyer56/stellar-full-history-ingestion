@@ -71,7 +71,7 @@ func checkpoint(metaStore *RocksDB, rangeID uint32, ledgerSeq uint32,
 
 ### Scenario 1: Crash During Backfill Ingestion [BACKFILL MODE]
 
-**Situation**: Backfill running, crash at ledger 7,500,000 (mid-range 0)
+**Situation**: Backfill running, crash at ledger 7,500,000 (in the midst of ingesting range-0)
 
 **State at Crash**:
 ```
@@ -107,7 +107,7 @@ range:0:txhash:phase = "COMPLETE"
 
 ### Scenario 2: Crash After Batch Write, Before Checkpoint [BOTH MODES]
 
-**Situation**: Batch of 1000 ledgers written to RocksDB, crash before checkpoint
+**Situation**: Batch of 1000 ledgers written to RocksDB successfully, crash before checkpoint could be updated
 
 **State at Crash**:
 ```
@@ -135,10 +135,10 @@ range:0:ledger:last_committed_ledger = 5001
 
 During transition from Active (RocksDB) to Immutable stores, **two sub-flows run in parallel**:
 
-| Sub-Flow | What It Does | Duration |
-|----------|--------------|----------|
-| **Ledger Sub-Flow** | Reads ledgers from RocksDB → Writes compressed LFS chunks | ~30-60 min |
-| **TxHash Sub-Flow** | Compacts RocksDB → Builds RecSplit indexes → Verifies | ~25-30 min |
+| Sub-Flow | What It Does |
+|----------|--------------|
+| **Ledger Sub-Flow** | Reads ledgers from RocksDB → Writes compressed LFS chunks |
+| **TxHash Sub-Flow** | Compacts RocksDB → Builds RecSplit indexes → Verifies counts |
 
 These sub-flows are **independent** - a crash in one does not affect the other's recovery.
 
@@ -175,7 +175,7 @@ range:3:txhash:phase = "COMPACTING"   # Interrupted
 
 ### Scenario 4: Crash During Streaming [STREAMING MODE]
 
-**Situation**: Streaming mode, crash at ledger 65,000,500
+**Situation**: Streaming mode, crash while processing ledger 65,000,501
 
 **State at Crash**:
 ```
@@ -188,8 +188,9 @@ range:6:txhash:last_committed_ledger = 65000500
 1. Restart: `./stellar-rpc`
 2. Gap detection: All prior ranges COMPLETE ✓
 3. Find `range:6:state = "INGESTING"`
-4. Resume from ledger 65000501
-5. Continue streaming
+4. Resume from ledger 65000501. 
+5. Even if ledger 65000501 was partially processed+ its data written to the active store previosuly, re-ingesting it is still safe. Compaction will remove any duplicates later.
+6. Continue streaming
 
 **Batch Size = 1**: In streaming mode, checkpoint happens after every ledger, so recovery loses at most 1 ledger of progress.
 
@@ -241,7 +242,10 @@ range:3:txhash:recsplit_cf_completed = 12
 **Recovery**:
 1. Restart service
 2. Detect `range:3:state = "TRANSITIONING"`
-3. **Ledger Sub-Flow**: Resume LFS writing from chunk 750
+3. **Ledger Sub-Flow**:
+   - Resume LFS writing from chunk 750.
+   - Delete partial chunk 750 if exists, rewrite the chunk completely.
+   - Rewrite chunk 750 from scratch.
 4. **TxHash Sub-Flow**: Resume RecSplit build from CF 13
 
 **If TxHash Finishes First**:
@@ -249,7 +253,7 @@ range:3:txhash:recsplit_cf_completed = 12
 - Ledger sub-flow continues independently
 - Range transitions to COMPLETE only when BOTH sub-flows finish
 
-**Key Insight**: Sub-flows are independent. One can complete while the other recovers from crash.
+**Key Insight**: Sub-flows are independent. One can complete/wait while the other recovers from crash.
 
 ---
 
@@ -317,7 +321,7 @@ func detectGaps(metaStore *RocksDB) error {
 
 ### Example: Gap Detected
 
-**Meta Store State**:
+**Existing Meta Store State**:
 ```
 range:0:state = "COMPLETE"
 range:1:state = "INGESTING"  # INCOMPLETE!
@@ -325,7 +329,7 @@ range:1:ledger:last_committed_ledger = 15000000
 range:2:state = "COMPLETE"
 ```
 
-**Streaming Startup**:
+**On Streaming Startup**:
 ```
 [ERROR] Cannot start streaming mode - incomplete ranges detected:
   Range 1 (ledgers 10000002-20000001): state=INGESTING, last_committed=15000000
@@ -345,7 +349,7 @@ Action required: Re-run backfill with --start-ledger 2 --end-ledger 30000001
 - Enables crash recovery at any point
 - Provides audit trail of ingestion history
 - Allows verification of range completeness
-- Minimal storage cost (KB per range)
+- Minimal storage cost (less than 1KB per range)
 
 **Cleanup**: Only delete checkpoint data when decommissioning the entire service.
 
@@ -355,11 +359,11 @@ Action required: Re-run backfill with --start-ledger 2 --end-ledger 30000001
 
 | Scenario | Recovery Time | Notes |
 |----------|---------------|-------|
-| Backfill crash (mid-range) | Instant | Resume from checkpoint |
-| Streaming crash | Instant | Resume from last ledger |
-| Transition crash (ledger) | ~30-60 min | Resume LFS writing |
-| Transition crash (txhash compaction) | ~5 min | Restart compaction |
-| Transition crash (txhash recsplit) | ~15-20 min | Resume RecSplit build |
+| Backfill crash (mid-range) | Instant       | Resume from checkpoint |
+| Streaming crash | Instant       | Resume from last ledger |
+| Transition crash (ledger) | ~30-60 min    | Resume LFS writing |
+| Transition crash (txhash compaction) | ~5 min        | Restart compaction |
+| Transition crash (txhash recsplit) | ~25-30 min    | Resume RecSplit build |
 
 **Key Insight**: Recovery is fast because checkpoint data provides exact resume point.
 

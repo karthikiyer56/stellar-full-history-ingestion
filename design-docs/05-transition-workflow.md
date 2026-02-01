@@ -259,31 +259,30 @@ flowchart TD
 **Process**:
 1. Read all ledgers from Active RocksDB (sequential scan)
 2. Group into 10K ledger chunks
-3. Compress each chunk with zstd
-4. Write to LFS format: `immutable/ledgers/chunks/XXXX/YYYYYY.data`
-5. Verify: Read back and decompress each chunk
-6. Mark phase as IMMUTABLE
+3. Write to LFS format: `immutable/ledgers/chunks/XXXX/YYYYYY.data`
+4. Verify: Read back and decompress each chunk
+5. Mark phase as IMMUTABLE
 
 ### TxHash Sub-Flow
 
-| Phase | Description | Duration | Meta Store Key |
-|-------|-------------|----------|----------------|
-| INGESTING | Writing to Active RocksDB | Ongoing | `range:N:txhash:phase = "INGESTING"` |
-| COMPACTING | Full compaction of 16 CFs (parallel) | ~5 min | `range:N:txhash:phase = "COMPACTING"` |
-| BUILDING_RECSPLIT | Build 16 RecSplit indexes | ~15-20 min | `range:N:txhash:phase = "BUILDING_RECSPLIT"` |
-| VERIFYING_RECSPLIT | Verify all keys in indexes | ~5 min | `range:N:txhash:phase = "VERIFYING_RECSPLIT"` |
-| COMPLETE | RecSplit ready, RocksDB deleted | - | `range:N:txhash:phase = "COMPLETE"` |
+| Phase | Description                           | Duration | Meta Store Key |
+|-------|---------------------------------------|----------|----------------|
+| INGESTING | Writing to Active RocksDB             | Ongoing | `range:N:txhash:phase = "INGESTING"` |
+| COMPACTING | Full compaction of 16 CFs (parallel)  | ~5 min | `range:N:txhash:phase = "COMPACTING"` |
+| BUILDING_RECSPLIT | Build 16 RecSplit indexes (parallel)  | ~15-20 min | `range:N:txhash:phase = "BUILDING_RECSPLIT"` |
+| VERIFYING_RECSPLIT | Verify all keys in indexes (parallel) | ~5 min | `range:N:txhash:phase = "VERIFYING_RECSPLIT"` |
+| COMPLETE | RecSplit ready, RocksDB deleted       | - | `range:N:txhash:phase = "COMPLETE"` |
 
 **Process**:
 1. **Compact**: Run full compaction on all 16 CFs in parallel
-2. **Build**: For each CF, build RecSplit minimal perfect hash index
-3. **Verify**: For each CF, verify all keys can be looked up in RecSplit
+2. **Build**: For each CF, read from rocksdb and build corresponding RecSplit minimal perfect hash index in parallel
+3. **Verify**: For each CF, verify all keys can be looked up in their corresponding RecSplit index in parallel
 4. **Write**: Save indexes to `immutable/txhash/000N/index/cf-{0..f}.idx`
 5. Mark phase as COMPLETE
 
 ---
 
-## Multiple Active Stores During Transition
+## Multiple Rocksdb Stores During Transition
 
 During transition, up to 4 RocksDB instances may be open:
 
@@ -308,16 +307,55 @@ Transitioning Stores (Range N):
 
 ## Transition Failure Handling
 
-**If transition fails** (e.g., disk full, corruption):
-- Transitioning stores remain ALIVE
-- Queries continue to work (served from transitioning RocksDB)
-- Transition goroutine retries with exponential backoff
-- Ingestion continues to new Active Stores (no data loss)
+Transition follows the same **fail-fast** philosophy as the rest of the service. See [Streaming Workflow - Error Handling](./04-streaming-workflow.md#error-handling-and-recovery) for the full error handling philosophy.
 
-**Recovery**:
-- Automatic retry until success
-- Operator can investigate logs during retries
-- No manual intervention required unless persistent failure
+**If transition fails** (e.g., disk full, I/O error, corruption):
+
+1. **Transition goroutine logs the error** with full context (range ID, phase, error details)
+2. **Transition goroutine returns error** to the parent context (via errgroup)
+3. **Parent context is cancelled** → ingestion goroutine sees cancellation and exits
+4. **Service exits with non-zero code**
+
+**Why No Retries?**
+
+| Error Type | Why Retry Won't Help |
+|------------|---------------------|
+| Disk full | Disk is still full after retry |
+| I/O error | Likely hardware issue - needs investigation |
+| Corruption | Data integrity issue - needs manual review |
+| OOM during RecSplit build | Memory limits unchanged after retry |
+
+**Recovery Process**:
+
+1. **Investigate logs** before restarting:
+
+   ```bash
+   # Find the transition error
+   grep -i "transition.*error\|failed" /var/log/stellar-rpc/streaming.log | tail -20
+
+   # Check which phase failed
+   grep "range:N:.*phase" /var/log/stellar-rpc/streaming.log | tail -5
+   ```
+
+2. **Fix the underlying issue**:
+   - Disk full → Free disk space
+   - I/O errors → Check disk health (`dmesg`, SMART status)
+   - OOM → Increase RAM or reduce buffer sizes
+
+3. **Restart the service**:
+
+   ```bash
+   ./stellar-rpc
+   ```
+
+4. **Automatic resume**: On restart, the service reads meta store, finds `range:N:state = "TRANSITIONING"`, and resumes transition from the last checkpointed phase.
+
+**During Failure** (before restart):
+- Transitioning RocksDB stores remain on disk (not deleted)
+- If in streaming mode: ingestion has stopped (service exited), so no new data is being written
+- Data integrity preserved: checkpoint reflects last successful state
+
+**Key Point**: Do NOT blindly restart. Investigate the failure first—the same error will recur if the root cause isn't addressed.
 
 ---
 
@@ -424,32 +462,26 @@ range:6:txhash:recsplit_path = "/data/stellar-rpc/immutable/txhash/0006"
 ## Performance Expectations
 
 **Ledger Sub-Flow**:
-- Read throughput: ~10,000 ledgers/sec from RocksDB
-- Write throughput: ~5,000 ledgers/sec to LFS (zstd compression)
-- Total time: ~30-60 minutes for 10M ledgers
+TBD - havent finalized performance testing for LFS chunk writing.
 
 **TxHash Sub-Flow**:
-- Compaction: ~5 minutes (16 CFs parallel)
-- RecSplit build: ~15-20 minutes (16 indexes)
+- Compaction: ~10 minutes (16 CFs parallel)
+- RecSplit build: ~25 minutes (16 indexes)
 - Verification: ~5 minutes
-- Total time: ~25-30 minutes
+- Total time: ~35-45 minutes
 
-**Overlap**: Both sub-flows run in parallel, so total transition time is ~30-60 minutes (dominated by ledger sub-flow).
+**Overlap**: Both sub-flows run in parallel, so total transition time will be decided by the slower of the 2 sub-flows.
 
 ---
 
 ## Memory Requirements
 
 **During Transition**:
-- Current Active Stores: ~16GB (2 RocksDB instances)
-- Transitioning Stores: ~16GB (2 RocksDB instances)
-- Transition goroutine: ~2GB (buffers)
-- **Total**: ~34GB
+TBD
+Observed: 64GB RAM usage during RecSplit vefify phase (all 16 CFs in parallel).
 
 **After Transition**:
-- Current Active Stores: ~16GB
-- Immutable Stores: Minimal (memory-mapped files)
-- **Total**: ~16GB
+TBD
 
 **Disk Storage**: For detailed disk storage calculations per 10M range (Ledger LFS: ~1.5 TB, TxHash RecSplit: ~15 GB), see [Storage Size Reference](./01-architecture-overview.md#storage-size-reference-per-10m-ledger-range).
 
