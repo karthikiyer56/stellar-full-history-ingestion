@@ -48,9 +48,9 @@ Shared RocksDB tuning parameters.
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
-| `block_cache_mb` | int | Optional | `8192` | Block cache size in MB |
-| `write_buffer_mb` | int | Optional | `512` | Write buffer size in MB per CF |
-| `max_write_buffer_number` | int | Optional | `2` | Max write buffers per CF |
+| `block_cache_mb` | int | Optional | `8192`  | Block cache size in MB |
+| `write_buffer_mb` | int | Optional | `64`    | Write buffer size in MB per CF |
+| `max_write_buffer_number` | int | Optional | `2`     | Max write buffers per CF |
 
 ### [backfill]
 
@@ -242,8 +242,7 @@ txhash_base = "/hdd/stellar-rpc/immutable/txhash"
 binary_path = "/usr/local/bin/stellar-core"
 config_path = "/etc/stellar/captive-core.cfg"
 ```
-
-**Description**: Optimizes performance by placing active stores on fast NVMe, immutable stores on cheaper HDD, and meta store on dedicated SSD.
+**Description**: Distributes data across multiple disks for performance and capacity optimization.
 
 ---
 

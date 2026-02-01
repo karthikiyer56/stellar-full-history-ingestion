@@ -191,27 +191,26 @@ end
 For first-time readers, we recommend the following sequence.  
 
 1. **Start here**: [01-architecture-overview.md](./01-architecture-overview.md)  
-   Get the big picture of system components and data flow.
+   Get the big picture of system components, data flow, and store types.
 
-2. **Choose your path**:
-   - **Workflow-first (recommended for most readers)**  
-     Jump straight into how the system behaves:
-      - [03-backfill-workflow.md](./03-backfill-workflow.md) — Historical data ingestion
-      - [04-streaming-workflow.md](./04-streaming-workflow.md) — Real-time data ingestion
-      - [05-transition-workflow.md](./05-transition-workflow.md) — Active → Immutable conversion
-      - [06-crash-recovery.md](./06-crash-recovery.md) — How the system recovers from failures
+2. **Physical layout**: Ground yourself in concrete details before diving into workflows.
+   - [08-directory-structure.md](./08-directory-structure.md) — Where data lives on disk (file tree, chunk paths, RecSplit paths)
+   - [09-configuration.md](./09-configuration.md) — TOML configuration reference (what's configurable and how)
 
-     These documents **cross-reference the [02-meta-store-design.md](./02-meta-store-design.md) wherever it’s relevant**, so you’ll pick up the important concepts naturally as you go.
+3. **Workflows**: Now that you know the physical layout and configuration, understand how the system behaves.
+   - [03-backfill-workflow.md](./03-backfill-workflow.md) — Historical data ingestion
+   - [04-streaming-workflow.md](./04-streaming-workflow.md) — Real-time data ingestion
+   - [05-transition-workflow.md](./05-transition-workflow.md) — Active → Immutable conversion
+   - [06-crash-recovery.md](./06-crash-recovery.md) — How the system recovers from failures
 
-   - **State-first (for readers who want the internals upfront)**
-      - [02-meta-store-design.md](./02-meta-store-design.md) — How the system tracks progress and state
+   These documents **cross-reference [02-meta-store-design.md](./02-meta-store-design.md) wherever relevant**, so you'll pick up state tracking concepts naturally as you go.
 
-3. **Supporting systems**:
+4. **Query handling**:
    - [07-query-routing.md](./07-query-routing.md) — How queries find the right data
 
-4. **Implementation details**:
-   - [08-directory-structure.md](./08-directory-structure.md) — File system organization
-   - [09-configuration.md](./09-configuration.md) — TOML configuration reference
+5. **Deep dives** (optional):
+   - [02-meta-store-design.md](./02-meta-store-design.md) — Complete meta store key hierarchy and state machines
+   - [10-checkpointing-and-transitions.md](./10-checkpointing-and-transitions.md) — Checkpoint math and transition triggers
 
 ---
 
