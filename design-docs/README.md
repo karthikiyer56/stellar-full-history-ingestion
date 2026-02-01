@@ -210,7 +210,7 @@ For first-time readers, we recommend the following sequence.
 
 5. **Deep dives** (optional):
    - [02-meta-store-design.md](./02-meta-store-design.md) — Complete meta store key hierarchy and state machines
-   - [10-checkpointing-and-transitions.md](./10-checkpointing-and-transitions.md) — Checkpoint math and transition triggers
+   - [10-checkpointing-and-transitions.md](./10-checkpointing-and-transitions.md) — Optional but recommended for concretizing what you've read. Covers the minutiae of checkpoint timing, range boundaries, transition triggers, and crash recovery invariants. Serves as the canonical reference for implementation details.
 
 ---
 

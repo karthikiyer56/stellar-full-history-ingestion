@@ -2,6 +2,8 @@
 
 ## Overview
 
+> **Optional Reading**: If you've read the recommended documents in order (Architecture → Directory Structure → Configuration → Workflows), you should already be familiar with transitions, workflows, and meta store updates. This document is optional but serves to **concretize** what you've learned so far about checkpointing, transition triggers, crash & recovery.
+
 This document provides the canonical reference for checkpoint timing, range boundary calculations, and transition triggers in the Stellar Full History RPC Service. It establishes the mathematical invariants that must be maintained across all scenarios and provides concrete examples to clarify corner cases.
 
 **Purpose**: Serve as the single source of truth for:
