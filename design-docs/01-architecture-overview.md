@@ -401,26 +401,7 @@ During transition, the system temporarily holds both active and transitioning st
 ---
 
 ## Scalability Considerations
-
-### Horizontal Scaling
-
-**Current Design**: Single-instance service (no horizontal scaling)
-
-**Rationale**:
-- Ingestion MUST be single-threaded per range to maintain consistency
-- Query load can be handled by single instance with proper caching
-- Immutable stores are read-only and can be replicated if needed
-
-**Future**: If query load exceeds single-instance capacity:
-- Deploy read-only replicas with immutable stores only
-- Use load balancer to distribute query traffic
-- Keep single writer instance for ingestion
-
-### Vertical Scaling
-
-**CPU**: Add more cores for faster backfill (more parallel orchestrators)
-**RAM**: Increase RocksDB caches for better query performance
-**Disk**: Add more volumes for immutable stores (multi-disk configuration)
+TBD
 
 ---
 
