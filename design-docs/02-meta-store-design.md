@@ -31,7 +31,7 @@ The Stellar Full History RPC Service must track progress across billions of ledg
 
 **Mode is tracked in meta store**: `global:mode = "backfill"` or `global:mode = "streaming"`
 
-> **Important**: For the complete ruleset on when mode is set and how transitions work, see the following sections in [Backfill Workflow](./03-backfill-workflow.md#initial-meta-store-state) and [Streaming Workflow](./04-streaming-workflow.md#mode-transition).
+> **Important**: For the complete ruleset on when mode is set and how transitions work, see the following sections in [Backfill Workflow](./03-backfill-workflow.md#initial-meta-store-state) and [Streaming Workflow](./04-streaming-workflow.md#startup-validation).
 
 ### What is a Range?
 
@@ -75,7 +75,7 @@ The meta store uses a hierarchical key structure with colon-separated namespaces
 
 | Key | Type | Description | Triggers / Conditions |
 |-----|------|-------------|----------------------|
-| `global:mode` | string | Operating mode: "backfill" or "streaming" | **Set**: At process startup. Backfill mode sets `"backfill"` (see [Backfill Workflow](./03-backfill-workflow.md#initial-meta-store-state)), streaming mode sets `"streaming"` (see [Streaming Workflow](./04-streaming-workflow.md#mode-transition)). **Updated**: Never changes during process lifetime. **Example**: `"backfill"` or `"streaming"`. |
+| `global:mode` | string | Operating mode: "backfill" or "streaming" | **Set**: At process startup. Backfill mode sets `"backfill"` (see [Backfill Workflow](./03-backfill-workflow.md#initial-meta-store-state)), streaming mode sets `"streaming"` (see [Streaming Workflow](./04-streaming-workflow.md#startup-validation)). **Updated**: Never changes during process lifetime. **Example**: `"backfill"` or `"streaming"`. |
 | `global:last_processed_ledger` | uint32 | Last ledger processed in streaming mode | **Set**: When streaming mode starts after backfill completes (highest end_ledger from COMPLETE ranges). **Updated**: After each ledger is processed in streaming mode (checkpoint every 1 ledger). **Component**: Streaming ingestion loop. **Example**: `65000500`. |
 | `global:backfill_start_ledger` | uint32 | Start ledger for backfill operation | **Set**: At backfill startup from `--start-ledger` flag. **Updated**: Never. **Component**: Backfill initialization. **Example**: `2` or `10000002`. |
 | `global:backfill_end_ledger` | uint32 | End ledger for backfill operation | **Set**: At backfill startup from `--end-ledger` flag. **Updated**: Never. **Component**: Backfill initialization. **Example**: `30000001`. |
@@ -641,7 +641,7 @@ This enables:
 
 ### Q: What happens if the process crashes during TRANSITIONING state?
 
-**A**: The transition is crash-safe. Each sub-workflow (ledger and txhash) tracks its own phase. On recovery, the system reads the phase states and resumes from where it left off. For example, if `ledger:phase = "IMMUTABLE"` but `txhash:phase = "COMPACTING"`, only the txhash sub-workflow needs to resume. Checkpoint data is never deleted, so recovery is always possible. See [Crash Recovery - Scenario 5](./06-crash-recovery.md#scenario-5-crash-during-transition-both-modes---transition) for detailed examples.
+**A**: The transition is crash-safe. Each sub-workflow (ledger and txhash) tracks its own phase. On recovery, the system reads the phase states and resumes from where it left off. For example, if `ledger:phase = "IMMUTABLE"` but `txhash:phase = "COMPACTING"`, only the txhash sub-workflow needs to resume. Checkpoint data is never deleted, so recovery is always possible. See [Crash Recovery - Scenario 5](./06-crash-recovery.md#scenario-5-crash-during-transition-both-sub-flows-both-modes---transition) for detailed examples.
 
 ### Q: Why is cf_counts stored as JSON instead of separate keys?
 
@@ -671,7 +671,7 @@ This enables:
 - If `global:mode = "streaming"` already exists → gap validation runs to verify all prior ranges are COMPLETE, then streaming resumes
 - If fresh data directory with no ranges → ERROR (backfill required first to establish initial ranges)
 
-See [Backfill Workflow - Initial Meta Store State](./03-backfill-workflow.md#initial-meta-store-state) and [Streaming Workflow - Mode Transition](./04-streaming-workflow.md#mode-transition) for complete details.
+See [Backfill Workflow - Initial Meta Store State](./03-backfill-workflow.md#initial-meta-store-state) and [Streaming Workflow - Startup Validation](./04-streaming-workflow.md#startup-validation) for complete details.
 
 ---
 

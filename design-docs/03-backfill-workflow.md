@@ -110,7 +110,7 @@ range:N:start_ledger = <first ledger>
 range:N:end_ledger = <last ledger>
 ```
 
-**Key Point**: The `global:mode = "backfill"` setting persists for the lifetime of the backfill process. It is NOT automatically changed when backfill completes - the operator must restart the service without `--backfill` to enter streaming mode. (For complete mode lifecycle rules, see [Streaming Workflow - Mode Transition](./04-streaming-workflow.md#mode-transition).)
+**Key Point**: The `global:mode = "backfill"` setting persists for the lifetime of the backfill process. It is NOT automatically changed when backfill completes - the operator must restart the service without `--backfill` to enter streaming mode. (For complete mode lifecycle rules, see [Streaming Workflow - Startup Validation](./04-streaming-workflow.md#startup-validation).)
 
 ---
 

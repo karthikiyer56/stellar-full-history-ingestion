@@ -662,7 +662,7 @@ func (c *RangeStateCache) Refresh() {
 
 ## Related Documentation
 
-- [Architecture Overview](./01-architecture-overview.md#query-router) - Router component overview
-- [Meta Store Design](./02-meta-store-design.md#range-state-enum) - Range state definitions
-- [Transition Workflow](./05-transition-workflow.md#multiple-active-stores-during-transition) - Why transitioning stores remain queryable
-- [Streaming Workflow](./04-streaming-workflow.md#multiple-active-stores-during-transition) - Store lifecycle
+- [Architecture Overview](./01-architecture-overview.md#component-responsibilities) - Router component overview
+- [Meta Store Design](./02-meta-store-design.md#rangestate) - Range state definitions
+- [Transition Workflow](./05-transition-workflow.md#multiple-rocksdb-stores-during-transition) - Why transitioning stores remain queryable
+- [Streaming Workflow](./04-streaming-workflow.md#multiple-rocksdb-stores-during-transition) - Store lifecycle
