@@ -10,8 +10,8 @@
 The transition workflow converts Active Stores (RocksDB) to Immutable Stores (LFS + RecSplit) when a 10M ledger range completes ingestion.
 
 **Key Characteristics**:
-- Triggered at 10M range boundary completion in both modes
-- Same sub-workflow steps: RocksDB → LFS (ledgers), RocksDB → RecSplit (txhash)
+- Triggered at 10M range boundary completion in both - backfill and streaming modes
+- Same sub-workflow steps for both modes: RocksDB → LFS (ledgers), RocksDB → RecSplit (txhash)
 - Runs in parallel: Ledger sub-flow + TxHash sub-flow
 - **Streaming mode**: Non-blocking background goroutine, new Active Stores created, queries served during transition
 - **Backfill mode**: Sequential/blocking per range, no new Active Stores, no queries served
@@ -25,8 +25,6 @@ Transition triggers when **the last ledger of a range** is ingested.
 **Trigger Points**: 10,000,001, 20,000,001, 30,000,001, 40,000,001, ...
 
 **Same trigger in both modes**: Whether in backfill or streaming, reaching the last ledger of a range initiates the transition sub-workflows.
-
-See [Transition in Backfill vs Streaming Mode](#transition-in-backfill-vs-streaming-mode) for how the context differs.
 
 ---
 
@@ -85,30 +83,31 @@ Range N data lives in:
 RocksDB stores: **DELETED** ← This is the key outcome!
 ```
 
-### Flowchart: Backfill vs Streaming Context
+### Flowchart: Backfill Mode Transition
 
 ```mermaid
-flowchart TB
-    subgraph Backfill["Backfill Mode"]
-        B1[Ingest Range N] --> B2[Last Ledger Reached]
-        B2 --> B3[Transition Sub-Workflows]
-        B3 --> B4[Verify Immutable Files]
-        B4 --> B5[DELETE RocksDB Stores]
-        B5 --> B6[Range N → COMPLETE]
-        B6 --> B7[Pick Next PENDING Range]
-    end
-    
-    subgraph Streaming["Streaming Mode"]
-        S1[Ingest Ledger] --> S2{Last Ledger of Range?}
-        S2 -->|No| S1
-        S2 -->|Yes| S3[Create NEW Active Stores for Range N+1]
-        S3 --> S4[Spawn Transition Goroutine for Range N]
-        S4 --> S5[Continue Ingesting to Range N+1]
-        S4 --> S6[Transition Sub-Workflows - Background]
-        S6 --> S7[Verify Immutable Files]
-        S7 --> S8[DELETE RocksDB Stores]
-        S8 --> S9[Range N → COMPLETE]
-    end
+flowchart TD
+    B1[Ingest Range N] --> B2[Last Ledger Reached]
+    B2 --> B3[Transition Sub-Workflows]
+    B3 --> B4[Verify Immutable Files]
+    B4 --> B5[DELETE RocksDB Stores]
+    B5 --> B6[Range N → COMPLETE]
+    B6 --> B7[Pick Next PENDING Range]
+```
+
+### Flowchart: Streaming Mode Transition
+
+```mermaid
+flowchart TD
+    S1[Ingest Ledger] --> S2{Last Ledger of Range?}
+    S2 -->|No| S1
+    S2 -->|Yes| S3[Create NEW Active Stores for Range N+1]
+    S3 --> S4[Spawn Transition Goroutine for Range N]
+    S4 --> S5[Continue Ingesting to Range N+1]
+    S4 -.-> S6[Transition Sub-Workflows - Background]
+    S6 --> S7[Verify Immutable Files]
+    S7 --> S8[DELETE RocksDB Stores]
+    S8 --> S9[Range N → COMPLETE]
 ```
 
 **Key Insight**: The sub-workflow steps (Ledger Sub-Flow, TxHash Sub-Flow documented below) are IDENTICAL. Only the orchestration context differs. **The end result - RocksDB deletion and immutable file creation - is the same in both modes.**

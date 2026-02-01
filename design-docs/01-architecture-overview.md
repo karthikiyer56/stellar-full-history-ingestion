@@ -424,6 +424,82 @@ During transition, the system temporarily holds both active and transitioning st
 
 ---
 
+## Future Scope and Design Considerations
+
+This section documents planned extensions and design decisions that may evolve as the system matures.
+
+### Current Scope: getLedgerBySequence and getTransactionByHash
+
+The design documents in this repository focus exclusively on two query types:
+
+| Endpoint | Data Flow | Stores Involved |
+|----------|-----------|-----------------|
+| `getLedgerBySequence` | LedgerSeq → LedgerCloseMeta | Ledger Store (RocksDB → LFS) |
+| `getTransactionByHash` | TxHash → LedgerSeq | TxHash Store (RocksDB → RecSplit) |
+
+### Planned Extension: getEvents
+
+A separate body of work will add `getEvents` support following the same architectural pattern:
+
+**Ingestion Changes:**
+- Add one additional write step: Write events data to Active Events Store (RocksDB)
+- Events extracted from LedgerCloseMeta during ledger processing
+
+**Transition Changes:**
+- Add one additional sub-workflow: Convert Active Events Store → Immutable Events Store
+- Follows same pattern: RocksDB → compaction → immutable format → verification → deletion
+
+**Query Routing:**
+- Integrate Events Store into QueryRouter
+- Same routing logic: Active → Transitioning → Immutable stores
+- Range-based routing (events belong to specific ledger ranges)
+
+The core architecture (meta store state machine, checkpoint mechanism, crash recovery, transition workflow) remains unchanged. Only the number of stores and sub-workflows increases.
+
+### RecSplit Sharding: 16 Files vs Single Index
+
+**Current Design**: 16 RecSplit index files per range (sharded by first hex character of txhash: 0-9, a-f)
+
+**Why 16 Shards?**
+
+| Approach | Build Time | Rationale |
+|----------|------------|-----------|
+| Single RecSplit index | ~7 hours | Building one index for ~3.25 billion entries is memory and CPU intensive |
+| 16 parallel RecSplit indexes | ~45 minutes | Each shard has ~200M entries, builds independently in parallel |
+
+**Ongoing Investigation**: Research is underway to reduce single-index build time significantly. If successful, the design may pivot to non-sharded RecSplit indexes, which would simplify:
+- File management (1 file instead of 16 per range)
+- Query routing (no prefix-based file selection)
+- Transition workflow (single build step instead of 16 parallel)
+
+The sharding decision is isolated to the TxHash sub-workflow and RecSplit build phase. Changes would not affect the overall architecture.
+
+### Alternative Backfill Source: Pre-Created Archives
+
+**Current Backfill Sources**:
+1. **BufferedStorageBackend (GCS)**: Download ledgers from Google Cloud Storage
+2. **CaptiveStellarCore**: Replay ledgers from Stellar network
+
+**Potential Third Source**: Pre-created immutable archives hosted on S3/GCS
+
+If an operator hosts complete LFS chunks and RecSplit indexes for multiple ranges in cloud storage, backfill could become a simple download operation:
+
+| Aspect | Current Backfill                     | Archive-Based Backfill |
+|--------|--------------------------------------|------------------------|
+| Speed | Slow (ingestion bound)               | Network-bound (potentially 10-100x faster) |
+| Processing | Full ingestion + transition pipeline | Download + verify only |
+| Meta Store | Track ingestion progress, phases     | Simplified: track download progress only |
+| Transition | Required (RocksDB → Immutable)       | Skipped (files already immutable) |
+
+**Impact on Design**:
+- Backfill workflow would have a third code path
+- Meta store state machine may be simplified for this mode (no INGESTING → TRANSITIONING flow)
+- Verification becomes critical (downloaded files must be validated before marking COMPLETE)
+
+This option is not yet designed in detail. See [Backfill Workflow](./03-backfill-workflow.md) for current implementation.
+
+---
+
 ## Related Documents
 
 - [Meta Store Design](./02-meta-store-design.md) - State tracking and checkpointing
