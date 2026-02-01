@@ -3,6 +3,11 @@
 > **Purpose**: Detailed specification of backfill mode for ingesting historical ledger ranges  
 > **Related**: [Meta Store Design](./02-meta-store-design.md), [Crash Recovery](./06-crash-recovery.md), [Configuration](./09-configuration.md)
 
+>**_Prerequisite_**: This document contains code snippets that reference meta store keys (e.g., `range:{id}:state`, `range:{id}:ledger:last_committed_ledger`). 
+> To follow along effectively, either:
+> 1. **Have [Meta Store Design](./02-meta-store-design.md) open** in a separate tab for quick reference, or
+> 2. **Read [Meta Store Design](./02-meta-store-design.md) first** to understand the key hierarchy and state machines
+
 ---
 
 ## Overview
@@ -331,21 +336,14 @@ Backfill mode does **NOT** automatically transition to streaming mode.
 
 ## Performance Expectations
 
-**Throughput** (BufferedStorageBackend with 2 parallel orchestrators):
-- Ingestion: ~10,000 ledgers/minute per orchestrator
-- Transition: ~30-60 minutes per 10M range
-- Total: ~90-120 minutes per 10M range
+TBD: Performance benchmarks for backfill mode will be documented here once available. Expected throughput depends on:
+- LedgerBackend choice (GCS vs CaptiveCore)
+- Network bandwidth
+- Disk I/O performance
+- Number of parallel orchestrators configured
+- System resources (CPU, RAM)
+- Ledger size and complexity
 
-**For 30M ledgers (3 ranges)**:
-- Parallel phase (ranges 0+1): ~120 minutes
-- Sequential phase (range 2): ~120 minutes
-- **Total**: ~4 hours
-
-**Memory Requirements**:
-- Per orchestrator: ~16GB (RocksDB buffers + LedgerBackend)
-- 2 orchestrators: ~32GB
-- Meta store: ~1GB
-- **Total**: ~35GB
 
 ---
 

@@ -9,6 +9,8 @@
 
 The system implements robust crash recovery through per-range checkpointing in the meta store. All progress is tracked atomically, enabling resume from the exact point of failure with no data loss.
 
+> **See Also**: [Streaming Workflow - Error Handling](./04-streaming-workflow.md#error-handling-and-recovery) covers the operational perspective: error categories, goroutine coordination patterns (`errgroup`), and post-failure investigation steps. This document focuses on the checkpoint mechanisms, recovery algorithms, and specific crash scenarios.
+
 **Key Principles**:
 - Checkpoint data is NEVER deleted
 - Counts are checkpointed WITH progress (not computed from store)
