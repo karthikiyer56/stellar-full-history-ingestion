@@ -312,7 +312,7 @@ immutable/
 |-----------|------------------------------|--------------|
 | CaptiveStellarCore | ~8 GB per instance           | No |
 | RocksDB Block Cache | 8 GB (default)               | Yes (`block_cache_mb`) |
-| RocksDB Write Buffers | 512 MB × 2 × 17 CFs = ~17 GB | Yes (`write_buffer_mb`, `max_write_buffer_number`) |
+| RocksDB Write Buffers | 512 MB × 2 × 16 CFs = ~16 GB | Yes (`write_buffer_mb`, `max_write_buffer_number`) |
 | Ingestion Buffers | 1000 ledgers × 1 MB = ~1 GB  | Yes (`checkpoint_interval`) |
 | Application Overhead | ~2 GB                        | No |
 | **Total (Streaming)** | ~36 GB                       | |
@@ -367,7 +367,6 @@ During transition, the system temporarily holds both active and transitioning st
 |-----------|--------|
 | Current Active Stores (Range N+1) | ~Variable (RocksDB MemTables) |
 | Transitioning Stores (Range N) | ~Variable (RocksDB read-only) |
-| Transition goroutine buffers | ~2 GB |
 | **Recommended Total RAM** | **128 GB** |
 
 ---

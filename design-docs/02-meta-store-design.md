@@ -637,7 +637,7 @@ This enables:
 
 ### Q: Why are there separate Ledger and TxHash phases?
 
-**A**: The two sub-workflows have different durations and operations. Ledger phase writes LFS chunks (~30-60 min), while TxHash phase compacts, builds RecSplit indexes, and verifies (~25-30 min). Separate phase tracking enables independent progress monitoring, parallel execution, and granular crash recovery. If one sub-workflow fails, the other can continue or be retried independently.
+**A**: The two sub-workflows have different durations and operations. Ledger phase writes LFS chunks (time taken: TBD), while TxHash phase compacts, builds RecSplit indexes, and verifies (~45 min). Separate phase tracking enables independent progress monitoring, parallel execution, and granular crash recovery. If one sub-workflow fails, the other can continue or be retried independently.
 
 ### Q: What happens if the process crashes during TRANSITIONING state?
 
