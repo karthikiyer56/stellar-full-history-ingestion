@@ -53,24 +53,27 @@ type Config struct {
 
 // TimingStats tracks timing statistics with percentile calculation support
 type TimingStats struct {
-	Durations []time.Duration
-	Min       time.Duration
-	Max       time.Duration
-	Sum       time.Duration
-	Count     int64
+	Samples    []time.Duration
+	Min        time.Duration
+	Max        time.Duration
+	Sum        time.Duration
+	Count      int64
+	SampleRate int
 }
 
-// NewTimingStats creates a new TimingStats with pre-allocated capacity
-func NewTimingStats(maxSamples int) *TimingStats {
+func NewTimingStats(maxSamples int, totalItems int) *TimingStats {
+	sampleRate := 1
+	if totalItems > maxSamples {
+		sampleRate = (totalItems + maxSamples - 1) / maxSamples
+	}
 	return &TimingStats{
-		Durations: make([]time.Duration, 0, maxSamples),
-		Min:       time.Duration(1<<63 - 1), // MaxInt64
+		Samples:    make([]time.Duration, 0, maxSamples),
+		Min:        time.Duration(1<<63 - 1),
+		SampleRate: sampleRate,
 	}
 }
 
-// Record adds a duration sample to the statistics
 func (ts *TimingStats) Record(d time.Duration) {
-	ts.Durations = append(ts.Durations, d)
 	ts.Sum += d
 	ts.Count++
 	if d < ts.Min {
@@ -78,6 +81,9 @@ func (ts *TimingStats) Record(d time.Duration) {
 	}
 	if d > ts.Max {
 		ts.Max = d
+	}
+	if ts.Count%int64(ts.SampleRate) == 0 {
+		ts.Samples = append(ts.Samples, d)
 	}
 }
 
@@ -89,18 +95,15 @@ func (ts *TimingStats) Avg() time.Duration {
 	return time.Duration(int64(ts.Sum) / ts.Count)
 }
 
-// Percentile calculates the p-th percentile (0-100)
 func (ts *TimingStats) Percentile(p float64) time.Duration {
-	if len(ts.Durations) == 0 {
+	if len(ts.Samples) == 0 {
 		return 0
 	}
 
-	// Sort durations for percentile calculation
-	sorted := make([]time.Duration, len(ts.Durations))
-	copy(sorted, ts.Durations)
+	sorted := make([]time.Duration, len(ts.Samples))
+	copy(sorted, ts.Samples)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
-	// Calculate index
 	idx := int(float64(len(sorted)-1) * p / 100.0)
 	if idx < 0 {
 		idx = 0
@@ -278,12 +281,6 @@ func validateConfig(config *Config) error {
 	}
 	config.StellarCoreToml = absToml
 
-	ledgerCount := int(config.EndLedger - config.StartLedger + 1)
-	if ledgerCount > config.MaxSamples {
-		return fmt.Errorf("ledger count (%d) exceeds max-samples (%d); increase --max-samples or reduce range",
-			ledgerCount, config.MaxSamples)
-	}
-
 	return nil
 }
 
@@ -360,7 +357,7 @@ func runBenchmark(config *Config, logger *Logger) error {
 	logger.Info("")
 
 	// Initialize timing stats
-	getLedgerStats := NewTimingStats(config.MaxSamples)
+	getLedgerStats := NewTimingStats(config.MaxSamples, int(totalLedgers))
 
 	// Track bytes
 	var totalBytes int64
