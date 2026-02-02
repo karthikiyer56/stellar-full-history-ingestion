@@ -9,6 +9,8 @@
 
 | Question | Short Answer | Full Answer |
 |----------|--------------|-------------|
+| What is a chunk? | File unit storing 10K ledgers with .data and .index files | [Doc 10](./10-checkpointing-and-transitions.md#faq-section) |
+| What is the difference between a chunk and a range? | Range = 10M ledgers (transition unit), Chunk = 10K ledgers (file unit) | [Doc 10](./10-checkpointing-and-transitions.md#faq-section) |
 | What is a Range ID? | Partition index for 10M ledgers | [Doc 10](./10-checkpointing-and-transitions.md#faq-section) |
 | Why separate Ledger and TxHash phases? | Different durations, parallel execution | [Doc 02](./02-meta-store-design.md#frequently-asked-questions) |
 | What happens during graceful shutdown? | Checkpoint and exit cleanly, resume seamlessly | [Doc 02](./02-meta-store-design.md#frequently-asked-questions) |
@@ -43,10 +45,12 @@
 
 ### Range Boundaries and Checkpoints
 
+- [What is a chunk?](./10-checkpointing-and-transitions.md#faq-section)
+- [What is the difference between a chunk and a range?](./10-checkpointing-and-transitions.md#faq-section)
 - [What is the exact last ledger in Range 0 immutable store?](./10-checkpointing-and-transitions.md#faq-section)
 - [Which store handles getLedgerBySequence(10000001)?](./10-checkpointing-and-transitions.md#faq-section)
 - [Which store handles getLedgerBySequence(10000002)?](./10-checkpointing-and-transitions.md#faq-section)
-- [What ledgers are in LFS chunk chunks/0000/000999.index?](./10-checkpointing-and-transitions.md#faq-section)
+- [What ledgers are in LFS chunk `chunks/0000/000999.index`?](./10-checkpointing-and-transitions.md#faq-section)
 - [When does the transition to immutable store happen?](./10-checkpointing-and-transitions.md#faq-section)
 - [Are range boundaries inclusive or exclusive?](./10-checkpointing-and-transitions.md#faq-section)
 - [Why is the checkpoint formula (ledgerSeq - 1) % 1000 == 0 instead of ledgerSeq % 1000 == 0?](./10-checkpointing-and-transitions.md#faq-section)
@@ -68,15 +72,17 @@
 
 ### Checkpointing and Transitions (10-checkpointing-and-transitions.md)
 
-1. [What is the exact last ledger in Range 0 immutable store?](./10-checkpointing-and-transitions.md#faq-section)
-2. [Which store handles getLedgerBySequence(10000001)?](./10-checkpointing-and-transitions.md#faq-section)
-3. [Which store handles getLedgerBySequence(10000002)?](./10-checkpointing-and-transitions.md#faq-section)
-4. [What ledgers are in LFS chunk chunks/0000/000999.index?](./10-checkpointing-and-transitions.md#faq-section)
-5. [When does the transition to immutable store happen?](./10-checkpointing-and-transitions.md#faq-section)
-6. [If I crash at ledger 7,500,000 with last_committed_ledger = 7499001, what ledgers get re-ingested?](./10-checkpointing-and-transitions.md#faq-section)
-7. [Why is the checkpoint formula (ledgerSeq - 1) % 1000 == 0 instead of ledgerSeq % 1000 == 0?](./10-checkpointing-and-transitions.md#faq-section)
-8. [Are range boundaries inclusive or exclusive?](./10-checkpointing-and-transitions.md#faq-section)
-9. [What happens if I query ledger 10,000,001 during the transition?](./10-checkpointing-and-transitions.md#faq-section)
+1. [What is a chunk?](./10-checkpointing-and-transitions.md#faq-section)
+2. [What is the difference between a chunk and a range?](./10-checkpointing-and-transitions.md#faq-section)
+3. [What is the exact last ledger in Range 0 immutable store?](./10-checkpointing-and-transitions.md#faq-section)
+4. [Which store handles getLedgerBySequence(10000001)?](./10-checkpointing-and-transitions.md#faq-section)
+5. [Which store handles getLedgerBySequence(10000002)?](./10-checkpointing-and-transitions.md#faq-section)
+6. [What ledgers are in LFS chunk `chunks/0000/000999.index`?](./10-checkpointing-and-transitions.md#faq-section)
+7. [When does the transition to immutable store happen?](./10-checkpointing-and-transitions.md#faq-section)
+8. [If I crash at ledger 7,500,000 with last_committed_ledger = 7499001, what ledgers get re-ingested?](./10-checkpointing-and-transitions.md#faq-section)
+9. [Why is the checkpoint formula (ledgerSeq - 1) % 1000 == 0 instead of ledgerSeq % 1000 == 0?](./10-checkpointing-and-transitions.md#faq-section)
+10. [Are range boundaries inclusive or exclusive?](./10-checkpointing-and-transitions.md#faq-section)
+11. [What happens if I query ledger 10,000,001 during the transition?](./10-checkpointing-and-transitions.md#faq-section)
 
 ---
 

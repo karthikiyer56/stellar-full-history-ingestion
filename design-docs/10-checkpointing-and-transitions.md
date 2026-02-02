@@ -296,6 +296,65 @@ This section walks through the complete lifecycle of Range 0 from first ledger t
 
 ## FAQ Section
 
+### Q: What is a chunk?
+
+**A**: A chunk is a file unit in the immutable Ledger File Store (LFS) that contains 10,000 ledgers.
+
+**Details**:
+- Each ledger is individually **zstd compressed** before being written to the chunk
+- On the filesystem, a chunk consists of two files:
+  - `.data` — Contains the compressed ledger data (variable-length records)
+  - `.index` — Contains the offset table for random access to individual ledgers
+- Chunk ID is calculated as: `chunkID = (ledgerSeq - FirstLedger) / 10000`
+
+**Example (Range 4)**:
+```
+immutable/ledgers/chunks/0004/
+├── 004500.data    # Chunk 4500: ledgers 45,000,002 to 45,010,001
+├── 004500.index   # Offset table for chunk 4500
+├── 004501.data    # Chunk 4501: ledgers 45,010,002 to 45,020,001
+├── 004501.index
+└── ...
+```
+
+**Why chunks?**
+- **Random access**: The `.index` file enables O(1) lookup of any ledger within the chunk
+- **Efficient I/O**: Reading one ledger doesn't require loading the entire range
+- **Compression ratio**: Individual ledger compression achieves ~70-80% reduction while maintaining random access
+
+---
+
+### Q: What is the difference between a chunk and a range?
+
+**A**: A **range** is the partitioning unit (10 million ledgers), while a **chunk** is the file storage unit (10 thousand ledgers).
+
+| Concept | Size | Purpose | Example |
+|---------|------|---------|---------|
+| **Range** | 10,000,000 ledgers | Partition boundary for active→immutable transition | Range 4: ledgers 40,000,002 to 50,000,001 |
+| **Chunk** | 10,000 ledgers | File storage unit in LFS | Chunk 4500: ledgers 45,000,002 to 45,010,001 |
+
+**Relationship**:
+- **1 range = 1,000 chunks**
+- Range N contains chunks `(N × 1000)` through `(N × 1000) + 999`
+
+**Range 4 breakdown**:
+```
+Range 4: ledgers 40,000,002 to 50,000,001
+├── Chunk 4000: ledgers 40,000,002 to 40,010,001  (first chunk)
+├── Chunk 4001: ledgers 40,010,002 to 40,020,001
+├── ...
+├── Chunk 4500: ledgers 45,000,002 to 45,010,001  (middle chunk)
+├── ...
+├── Chunk 4998: ledgers 49,980,002 to 49,990,001
+└── Chunk 4999: ledgers 49,990,002 to 50,000,001  (last chunk)
+```
+
+**Why two levels?**
+- **Range granularity**: Controls when data transitions from active (RocksDB) to immutable (LFS + RecSplit)
+- **Chunk granularity**: Optimizes file I/O and enables efficient random access within a range
+
+---
+
 ### Q: What is the exact last ledger in Range 0 immutable store?
 
 **A**: Ledger 10,000,001 (inclusive). This is the last ledger stored in Range 0.
