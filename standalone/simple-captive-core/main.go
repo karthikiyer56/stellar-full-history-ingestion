@@ -151,19 +151,17 @@ func (l *Logger) timestamp() string {
 	return time.Now().UTC().Format("2006-01-02T15:04:05Z")
 }
 
-// Info logs an info message to stdout and log file
+// Info logs an info message to log file
 func (l *Logger) Info(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] [INFO] %s\n", l.timestamp(), msg)
-	fmt.Print(line)
 	l.logFile.WriteString(line)
 }
 
-// Error logs an error message to stdout, log file, and error file
+// Error logs an error message to log file and error file
 func (l *Logger) Error(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] [ERROR] %s\n", l.timestamp(), msg)
-	fmt.Print(line)
 	l.logFile.WriteString(line)
 	l.errorFile.WriteString(line)
 }
@@ -171,7 +169,6 @@ func (l *Logger) Error(format string, args ...interface{}) {
 // Separator logs a visual separator line
 func (l *Logger) Separator() {
 	line := "================================================================================\n"
-	fmt.Print(line)
 	l.logFile.WriteString(line)
 }
 
