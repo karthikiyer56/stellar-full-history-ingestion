@@ -33,6 +33,8 @@ import (
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/rocksdb"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 	"github.com/linxGnu/grocksdb"
 )
 
@@ -52,22 +54,42 @@ var cfNames = []string{
 
 // metaStore implements the MetaStore interface using RocksDB.
 type metaStore struct {
-	db        *grocksdb.DB
-	opts      *grocksdb.Options
-	readOpts  *grocksdb.ReadOptions
-	writeOpts *grocksdb.WriteOptions
-	path      string
+	rocksdb.BaseStore
 }
 
 // NewMetaStore creates a new meta store at the given path.
 // Path: typically {data_dir}/meta
-func NewMetaStore(path string) (*metaStore, error) {
+// settings: optional per-store RocksDB tuning parameters. If nil, uses sensible defaults.
+func NewMetaStore(path string, settings *types.MetaRocksDBSettings) (*metaStore, error) {
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
+
+	// Apply per-store settings if provided
+	var blockCache *grocksdb.Cache
+	if settings != nil {
+		if settings.WriteBufferMB > 0 {
+			opts.SetWriteBufferSize(uint64(settings.WriteBufferMB * 1024 * 1024))
+		}
+		if settings.MaxWriteBufferNumber > 0 {
+			opts.SetMaxWriteBufferNumber(settings.MaxWriteBufferNumber)
+		}
+		if settings.TargetFileSizeMB > 0 {
+			opts.SetTargetFileSizeBase(uint64(settings.TargetFileSizeMB * 1024 * 1024))
+		}
+		if settings.BlockCacheMB > 0 {
+			blockCache = grocksdb.NewLRUCache(uint64(settings.BlockCacheMB * 1024 * 1024))
+			bbto := grocksdb.NewDefaultBlockBasedTableOptions()
+			bbto.SetBlockCache(blockCache)
+			opts.SetBlockBasedTableFactory(bbto)
+		}
+	}
 
 	db, err := grocksdb.OpenDb(opts, path)
 	if err != nil {
 		opts.Destroy()
+		if blockCache != nil {
+			blockCache.Destroy()
+		}
 		return nil, fmt.Errorf("failed to open meta store at %s: %w", path, err)
 	}
 
@@ -76,11 +98,14 @@ func NewMetaStore(path string) (*metaStore, error) {
 	writeOpts.SetSync(true) // Ensure durability
 
 	return &metaStore{
-		db:        db,
-		opts:      opts,
-		readOpts:  readOpts,
-		writeOpts: writeOpts,
-		path:      path,
+		BaseStore: rocksdb.BaseStore{
+			DB:         db,
+			Opts:       opts,
+			ReadOpts:   readOpts,
+			WriteOpts:  writeOpts,
+			BlockCache: blockCache,
+			Path:       path,
+		},
 	}, nil
 }
 
@@ -98,7 +123,7 @@ func (ms *metaStore) GetRangeState(rangeID uint32) (string, error) {
 // SetRangeState updates the range-level state.
 func (ms *metaStore) SetRangeState(rangeID uint32, state string) error {
 	key := fmt.Sprintf("range:%d:state", rangeID)
-	return ms.db.Put(ms.writeOpts, []byte(key), []byte(state))
+	return ms.DB.Put(ms.WriteOpts, []byte(key), []byte(state))
 }
 
 // =============================================================================
@@ -115,7 +140,7 @@ func (ms *metaStore) GetLedgerPhase(rangeID uint32) (string, error) {
 // SetLedgerPhase updates the ledger sub-phase.
 func (ms *metaStore) SetLedgerPhase(rangeID uint32, phase string) error {
 	key := fmt.Sprintf("range:%d:ledger:phase", rangeID)
-	return ms.db.Put(ms.writeOpts, []byte(key), []byte(phase))
+	return ms.DB.Put(ms.WriteOpts, []byte(key), []byte(phase))
 }
 
 // =============================================================================
@@ -132,7 +157,7 @@ func (ms *metaStore) GetTxHashPhase(rangeID uint32) (string, error) {
 // SetTxHashPhase updates the txhash sub-phase.
 func (ms *metaStore) SetTxHashPhase(rangeID uint32, phase string) error {
 	key := fmt.Sprintf("range:%d:txhash:phase", rangeID)
-	return ms.db.Put(ms.writeOpts, []byte(key), []byte(phase))
+	return ms.DB.Put(ms.WriteOpts, []byte(key), []byte(phase))
 }
 
 // =============================================================================
@@ -167,7 +192,7 @@ func (ms *metaStore) CommitCheckpoint(rangeID, ledgerSeq uint32, ledgerCount uin
 	txhashCountsKey := fmt.Sprintf("range:%d:txhash:cf_counts", rangeID)
 	batch.Put([]byte(txhashCountsKey), []byte(serializeCFCounts(txHashCounts)))
 
-	return ms.db.Write(ms.writeOpts, batch)
+	return ms.DB.Write(ms.WriteOpts, batch)
 }
 
 // =============================================================================
@@ -182,7 +207,7 @@ func (ms *metaStore) GetLFSLastChunkWritten(rangeID uint32) (int32, error) {
 	key := fmt.Sprintf("range:%d:ledger:lfs_last_chunk_written", rangeID)
 
 	// Check if key exists explicitly to distinguish "unset" from "chunk 0 written"
-	slice, err := ms.db.Get(ms.readOpts, []byte(key))
+	slice, err := ms.DB.Get(ms.ReadOpts, []byte(key))
 	if err != nil {
 		return -1, err
 	}
@@ -203,7 +228,7 @@ func (ms *metaStore) GetLFSLastChunkWritten(rangeID uint32) (int32, error) {
 // chunkID: int32 with -1 as sentinel for "no chunks written yet"
 func (ms *metaStore) SetLFSLastChunkWritten(rangeID uint32, chunkID int32) error {
 	key := fmt.Sprintf("range:%d:ledger:lfs_last_chunk_written", rangeID)
-	return ms.db.Put(ms.writeOpts, []byte(key), int32ToBytes(chunkID))
+	return ms.DB.Put(ms.WriteOpts, []byte(key), int32ToBytes(chunkID))
 }
 
 // =============================================================================
@@ -323,27 +348,7 @@ func (ms *metaStore) MaybeTransitionRangeState(rangeID uint32) (string, bool, er
 
 // Close releases all resources.
 func (ms *metaStore) Close() error {
-	if ms.writeOpts != nil {
-		ms.writeOpts.Destroy()
-		ms.writeOpts = nil
-	}
-
-	if ms.readOpts != nil {
-		ms.readOpts.Destroy()
-		ms.readOpts = nil
-	}
-
-	if ms.db != nil {
-		ms.db.Close()
-		ms.db = nil
-	}
-
-	if ms.opts != nil {
-		ms.opts.Destroy()
-		ms.opts = nil
-	}
-
-	return nil
+	return ms.CloseBase()
 }
 
 // =============================================================================
@@ -352,7 +357,7 @@ func (ms *metaStore) Close() error {
 
 // getString reads a string value from RocksDB.
 func (ms *metaStore) getString(key string) (string, error) {
-	slice, err := ms.db.Get(ms.readOpts, []byte(key))
+	slice, err := ms.DB.Get(ms.ReadOpts, []byte(key))
 	if err != nil {
 		return "", err
 	}
@@ -367,7 +372,7 @@ func (ms *metaStore) getString(key string) (string, error) {
 
 // getUint32 reads a uint32 value from RocksDB.
 func (ms *metaStore) getUint32(key string) (uint32, error) {
-	slice, err := ms.db.Get(ms.readOpts, []byte(key))
+	slice, err := ms.DB.Get(ms.ReadOpts, []byte(key))
 	if err != nil {
 		return 0, err
 	}
