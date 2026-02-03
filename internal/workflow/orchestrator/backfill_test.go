@@ -66,6 +66,8 @@ func TestBackfillCoordinator_OfflineIntegration(t *testing.T) {
 	err = coord.Run(context.Background())
 	require.NoError(t, err)
 
+	require.True(t, mockBackend.IsPreparedFlag(), "PrepareRange() should have been called on mock backend")
+
 	rangeState, err := metaStore.GetRangeState(0)
 	require.NoError(t, err)
 	require.Contains(t, []string{interfaces.RangeStateTransitioning, interfaces.RangeStateComplete}, rangeState)

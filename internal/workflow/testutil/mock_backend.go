@@ -49,3 +49,8 @@ func (m *MockLedgerBackend) GetLatestLedgerSequence(ctx context.Context) (uint32
 }
 
 func (m *MockLedgerBackend) Close() error { return nil }
+
+// IsPreparedFlag returns whether PrepareRange was called (for test assertions)
+func (m *MockLedgerBackend) IsPreparedFlag() bool {
+	return m.prepared
+}
