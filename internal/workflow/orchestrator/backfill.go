@@ -189,27 +189,30 @@ func (bc *backfillCoordinator) createBackendForRange(ctx context.Context, rangeI
 	return backend.NewGCSBackend(ctx, &bc.config.Backfill.BufferedStorage)
 }
 
-func ledgerRocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
-	return &types.RocksDBSettings{
-		BlockCacheMB:         cfg.RocksDB.Ledger.BlockCacheMB,
+func ledgerRocksDBSettings(cfg *config.Config) *types.LedgerRocksDBSettings {
+	return &types.LedgerRocksDBSettings{
 		WriteBufferMB:        cfg.RocksDB.Ledger.WriteBufferMB,
 		MaxWriteBufferNumber: cfg.RocksDB.Ledger.MaxWriteBufferNumber,
+		TargetFileSizeMB:     cfg.RocksDB.Ledger.TargetFileSizeMB,
+		BlockCacheMB:         cfg.RocksDB.Ledger.BlockCacheMB,
 	}
 }
 
-func txHashRocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
-	return &types.RocksDBSettings{
-		BlockCacheMB:         cfg.RocksDB.TxHash.BlockCacheMB,
+func txHashRocksDBSettings(cfg *config.Config) *types.TxHashRocksDBSettings {
+	return &types.TxHashRocksDBSettings{
 		WriteBufferMB:        cfg.RocksDB.TxHash.WriteBufferMB,
 		MaxWriteBufferNumber: cfg.RocksDB.TxHash.MaxWriteBufferNumber,
+		TargetFileSizeMB:     cfg.RocksDB.TxHash.TargetFileSizeMB,
+		BlockCacheMB:         cfg.RocksDB.TxHash.BlockCacheMB,
 	}
 }
 
-func metaRocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
-	return &types.RocksDBSettings{
-		BlockCacheMB:         cfg.RocksDB.Meta.BlockCacheMB,
+func metaRocksDBSettings(cfg *config.Config) *types.MetaRocksDBSettings {
+	return &types.MetaRocksDBSettings{
 		WriteBufferMB:        cfg.RocksDB.Meta.WriteBufferMB,
 		MaxWriteBufferNumber: cfg.RocksDB.Meta.MaxWriteBufferNumber,
+		TargetFileSizeMB:     cfg.RocksDB.Meta.TargetFileSizeMB,
+		BlockCacheMB:         cfg.RocksDB.Meta.BlockCacheMB,
 	}
 }
 
