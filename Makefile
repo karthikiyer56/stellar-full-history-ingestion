@@ -113,3 +113,77 @@ check-mdbx-env:
 	@echo ""
 	@echo "Source Check:"
 	@test -f mdbx/ingestion/full_mdbx_ingestion.go && echo "  ✅ full_mdbx_ingestion.go" || echo "  ❌ full_mdbx_ingestion.go NOT FOUND"
+
+##############
+# RocksDB Build (for ingestion-workflow)
+##############
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+    # macOS with Homebrew (works on both Intel and Apple Silicon)
+    ROCKSDB_PREFIX := $(shell brew --prefix rocksdb 2>/dev/null || echo /usr/local)
+    SNAPPY_PREFIX := $(shell brew --prefix snappy 2>/dev/null || echo /usr/local)
+    LZ4_PREFIX := $(shell brew --prefix lz4 2>/dev/null || echo /usr/local)
+    ZSTD_PREFIX := $(shell brew --prefix zstd 2>/dev/null || echo /usr/local)
+    
+    ROCKSDB_CGO_CFLAGS := -I$(ROCKSDB_PREFIX)/include
+    ROCKSDB_CGO_LDFLAGS := -L$(ROCKSDB_PREFIX)/lib -L$(SNAPPY_PREFIX)/lib -L$(LZ4_PREFIX)/lib -L$(ZSTD_PREFIX)/lib \
+                          -lrocksdb -lstdc++ -lm -lz -lsnappy -llz4 -lzstd \
+                          -Wl,-rpath,$(ROCKSDB_PREFIX)/lib
+    ROCKSDB_LIB_PATH := DYLD_LIBRARY_PATH=$(ROCKSDB_PREFIX)/lib
+endif
+
+ifeq ($(UNAME_S),Linux)
+    # Linux with system packages or /usr/local install
+    ROCKSDB_PREFIX := $(or $(ROCKSDB_HOME),/usr/local)
+    
+    ROCKSDB_CGO_CFLAGS := -I$(ROCKSDB_PREFIX)/include
+    ROCKSDB_CGO_LDFLAGS := -L$(ROCKSDB_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lsnappy -llz4 -lzstd
+    ROCKSDB_LIB_PATH := LD_LIBRARY_PATH=$(ROCKSDB_PREFIX)/lib:$(LD_LIBRARY_PATH)
+endif
+
+.PHONY: check-rocksdb-env build-workflow test-workflow test-stores
+
+# Verify RocksDB dependencies are installed
+check-rocksdb-env:
+	@echo "RocksDB Environment Check ($(UNAME_S)):"
+	@echo "  ROCKSDB_PREFIX: $(ROCKSDB_PREFIX)"
+	@echo "  CGO_CFLAGS: $(ROCKSDB_CGO_CFLAGS)"
+	@echo "  CGO_LDFLAGS: $(ROCKSDB_CGO_LDFLAGS)"
+ifeq ($(UNAME_S),Darwin)
+	@brew list rocksdb >/dev/null 2>&1 && echo "  ✅ rocksdb installed" || echo "  ❌ rocksdb NOT installed (brew install rocksdb)"
+	@brew list snappy >/dev/null 2>&1 && echo "  ✅ snappy installed" || echo "  ❌ snappy NOT installed"
+	@brew list lz4 >/dev/null 2>&1 && echo "  ✅ lz4 installed" || echo "  ❌ lz4 NOT installed"
+	@brew list zstd >/dev/null 2>&1 && echo "  ✅ zstd installed" || echo "  ❌ zstd NOT installed"
+endif
+ifeq ($(UNAME_S),Linux)
+	@test -f $(ROCKSDB_PREFIX)/lib/librocksdb.so && echo "  ✅ librocksdb.so found" || echo "  ❌ librocksdb.so NOT found"
+	@test -f $(ROCKSDB_PREFIX)/include/rocksdb/db.h && echo "  ✅ rocksdb headers found" || echo "  ❌ rocksdb headers NOT found"
+endif
+
+# Build ingestion-workflow binary with RocksDB
+build-workflow:
+	@echo "🔨 Building ingestion-workflow..."
+	CGO_ENABLED=1 \
+	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
+	go build -o bin/ingestion-workflow ./cmd/ingestion-workflow
+	@echo "✅ Binary created at: bin/ingestion-workflow"
+
+# Run all workflow tests with RocksDB
+test-workflow:
+	@echo "🧪 Testing ingestion-workflow (with RocksDB)..."
+	CGO_ENABLED=1 \
+	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
+	$(ROCKSDB_LIB_PATH) \
+	go test -v ./internal/workflow/...
+
+# Run store tests only
+test-stores:
+	@echo "🧪 Testing RocksDB stores only..."
+	CGO_ENABLED=1 \
+	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
+	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
+	$(ROCKSDB_LIB_PATH) \
+	go test -v ./internal/workflow/stores/...
