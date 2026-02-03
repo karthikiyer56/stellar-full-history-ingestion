@@ -8,23 +8,20 @@ import (
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/rocksdb"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/txhash/cf"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 	"github.com/linxGnu/grocksdb"
 )
 
 type txHashStore struct {
-	db         *grocksdb.DB
-	opts       *grocksdb.Options
-	cfHandles  map[string]*grocksdb.ColumnFamilyHandle
-	cfOpts     []*grocksdb.Options
-	writeOpts  *grocksdb.WriteOptions
-	readOpts   *grocksdb.ReadOptions
-	blockCache *grocksdb.Cache
-	path       string
+	rocksdb.BaseStore
+	cfHandles map[string]*grocksdb.ColumnFamilyHandle
+	cfOpts    []*grocksdb.Options
+	settings  *types.TxHashRocksDBSettings
 }
 
-func NewTxHashStore(dataDir string, rangeID uint32, settings *types.RocksDBSettings) (*txHashStore, error) {
+func NewTxHashStore(dataDir string, rangeID uint32, settings *types.TxHashRocksDBSettings) (*txHashStore, error) {
 	path := filepath.Join(dataDir, "active", "rocksdb", fmt.Sprintf("%04d-txhash-store", rangeID))
 
 	if err := helpers.EnsureDir(path); err != nil {
@@ -41,9 +38,12 @@ func NewTxHashStore(dataDir string, rangeID uint32, settings *types.RocksDBSetti
 	}
 
 	return &txHashStore{
-		opts:       opts,
-		blockCache: blockCache,
-		path:       path,
+		BaseStore: rocksdb.BaseStore{
+			Opts:       opts,
+			BlockCache: blockCache,
+			Path:       path,
+		},
+		settings: settings,
 	}, nil
 }
 
@@ -60,9 +60,20 @@ func (s *txHashStore) Open() (time.Duration, error) {
 		cfOpt := grocksdb.NewDefaultOptions()
 		cfOpt.SetDisableAutoCompactions(true)
 
-		if s.blockCache != nil {
+		// Apply per-store settings
+		if s.settings.WriteBufferMB > 0 {
+			cfOpt.SetWriteBufferSize(uint64(s.settings.WriteBufferMB * 1024 * 1024))
+		}
+		if s.settings.MaxWriteBufferNumber > 0 {
+			cfOpt.SetMaxWriteBufferNumber(s.settings.MaxWriteBufferNumber)
+		}
+		if s.settings.TargetFileSizeMB > 0 {
+			cfOpt.SetTargetFileSizeBase(uint64(s.settings.TargetFileSizeMB * 1024 * 1024))
+		}
+
+		if s.BlockCache != nil {
 			bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-			bbto.SetBlockCache(s.blockCache)
+			bbto.SetBlockCache(s.BlockCache)
 			bbto.SetFilterPolicy(grocksdb.NewBloomFilter(10))
 			cfOpt.SetBlockBasedTableFactory(bbto)
 		}
@@ -70,25 +81,25 @@ func (s *txHashStore) Open() (time.Duration, error) {
 		cfOptsList[i] = cfOpt
 	}
 
-	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(s.opts, s.path, cfNames, cfOptsList)
+	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(s.Opts, s.Path, cfNames, cfOptsList)
 	if err != nil {
-		s.opts.Destroy()
+		s.Opts.Destroy()
 		for _, opt := range cfOptsList {
 			if opt != nil {
 				opt.Destroy()
 			}
 		}
-		if s.blockCache != nil {
-			s.blockCache.Destroy()
+		if s.BlockCache != nil {
+			s.BlockCache.Destroy()
 		}
-		return 0, fmt.Errorf("failed to open RocksDB at %s: %w", s.path, err)
+		return 0, fmt.Errorf("failed to open RocksDB at %s: %w", s.Path, err)
 	}
 
-	s.db = db
+	s.DB = db
 	s.cfOpts = cfOptsList
-	s.writeOpts = grocksdb.NewDefaultWriteOptions()
-	s.writeOpts.SetSync(false)
-	s.readOpts = grocksdb.NewDefaultReadOptions()
+	s.WriteOpts = grocksdb.NewDefaultWriteOptions()
+	s.WriteOpts.SetSync(false)
+	s.ReadOpts = grocksdb.NewDefaultReadOptions()
 
 	s.cfHandles = make(map[string]*grocksdb.ColumnFamilyHandle)
 	for i, name := range cfNames {
@@ -113,7 +124,7 @@ func (s *txHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) erro
 		}
 	}
 
-	return s.db.Write(s.writeOpts, batch)
+	return s.DB.Write(s.WriteOpts, batch)
 }
 
 func (s *txHashStore) Get(txHash []byte) (uint32, bool, error) {
@@ -123,7 +134,7 @@ func (s *txHashStore) Get(txHash []byte) (uint32, bool, error) {
 		return 0, false, fmt.Errorf("unknown column family: %s", cfName)
 	}
 
-	slice, err := s.db.GetCF(s.readOpts, cfHandle, txHash)
+	slice, err := s.DB.GetCF(s.ReadOpts, cfHandle, txHash)
 	if err != nil {
 		return 0, false, err
 	}
@@ -151,7 +162,7 @@ func (s *txHashStore) NewScanIteratorCF(cfName string) interfaces.Iterator {
 	scanOpts.SetReadaheadSize(2 * 1024 * 1024)
 	scanOpts.SetFillCache(false)
 
-	iter := s.db.NewIteratorCF(scanOpts, cfHandle)
+	iter := s.DB.NewIteratorCF(scanOpts, cfHandle)
 	return &txHashIterator{
 		iter:     iter,
 		scanOpts: scanOpts,
@@ -170,7 +181,7 @@ func (s *txHashStore) CompactAll() (map[string]time.Duration, error) {
 
 			cfHandle := s.cfHandles[name]
 			start := time.Now()
-			s.db.CompactRangeCF(cfHandle, grocksdb.Range{})
+			s.DB.CompactRangeCF(cfHandle, grocksdb.Range{})
 			duration := time.Since(start)
 
 			mu.Lock()
@@ -184,35 +195,20 @@ func (s *txHashStore) CompactAll() (map[string]time.Duration, error) {
 }
 
 func (s *txHashStore) GetPath() string {
-	return s.path
+	return s.Path
 }
 
 func (s *txHashStore) GetSize() (int64, error) {
-	return helpers.GetDirSize(s.path), nil
+	return helpers.GetDirSize(s.Path), nil
 }
 
 func (s *txHashStore) Close() error {
-	if s.writeOpts != nil {
-		s.writeOpts.Destroy()
-		s.writeOpts = nil
-	}
-
-	if s.readOpts != nil {
-		s.readOpts.Destroy()
-		s.readOpts = nil
-	}
-
 	for _, cfHandle := range s.cfHandles {
 		if cfHandle != nil {
 			cfHandle.Destroy()
 		}
 	}
 	s.cfHandles = nil
-
-	if s.db != nil {
-		s.db.Close()
-		s.db = nil
-	}
 
 	for _, cfOpt := range s.cfOpts {
 		if cfOpt != nil {
@@ -221,17 +217,7 @@ func (s *txHashStore) Close() error {
 	}
 	s.cfOpts = nil
 
-	if s.opts != nil {
-		s.opts.Destroy()
-		s.opts = nil
-	}
-
-	if s.blockCache != nil {
-		s.blockCache.Destroy()
-		s.blockCache = nil
-	}
-
-	return nil
+	return s.CloseBase()
 }
 
 type txHashIterator struct {
