@@ -78,14 +78,32 @@ bucket_path = "sdf-ledger-close-meta/v1/ledgers/pubnet"
 	if cfg.ImmutableStores.TxHashBase != "immutable/txhash" {
 		t.Errorf("Expected txhash_base default='immutable/txhash', got '%s'", cfg.ImmutableStores.TxHashBase)
 	}
-	if cfg.RocksDB.BlockCacheMB != 8192 {
-		t.Errorf("Expected block_cache_mb default=8192, got %d", cfg.RocksDB.BlockCacheMB)
+	if cfg.RocksDB.Ledger.BlockCacheMB != 512 {
+		t.Errorf("Expected ledger block_cache_mb default=512, got %d", cfg.RocksDB.Ledger.BlockCacheMB)
 	}
-	if cfg.RocksDB.WriteBufferMB != 512 {
-		t.Errorf("Expected write_buffer_mb default=512, got %d", cfg.RocksDB.WriteBufferMB)
+	if cfg.RocksDB.Ledger.WriteBufferMB != 256 {
+		t.Errorf("Expected ledger write_buffer_mb default=256, got %d", cfg.RocksDB.Ledger.WriteBufferMB)
 	}
-	if cfg.RocksDB.MaxWriteBufferNumber != 2 {
-		t.Errorf("Expected max_write_buffer_number default=2, got %d", cfg.RocksDB.MaxWriteBufferNumber)
+	if cfg.RocksDB.Ledger.MaxWriteBufferNumber != 2 {
+		t.Errorf("Expected ledger max_write_buffer_number default=2, got %d", cfg.RocksDB.Ledger.MaxWriteBufferNumber)
+	}
+	if cfg.RocksDB.TxHash.BlockCacheMB != 256 {
+		t.Errorf("Expected txhash block_cache_mb default=256, got %d", cfg.RocksDB.TxHash.BlockCacheMB)
+	}
+	if cfg.RocksDB.TxHash.WriteBufferMB != 64 {
+		t.Errorf("Expected txhash write_buffer_mb default=64, got %d", cfg.RocksDB.TxHash.WriteBufferMB)
+	}
+	if cfg.RocksDB.TxHash.MaxWriteBufferNumber != 2 {
+		t.Errorf("Expected txhash max_write_buffer_number default=2, got %d", cfg.RocksDB.TxHash.MaxWriteBufferNumber)
+	}
+	if cfg.RocksDB.Meta.BlockCacheMB != 64 {
+		t.Errorf("Expected meta block_cache_mb default=64, got %d", cfg.RocksDB.Meta.BlockCacheMB)
+	}
+	if cfg.RocksDB.Meta.WriteBufferMB != 16 {
+		t.Errorf("Expected meta write_buffer_mb default=16, got %d", cfg.RocksDB.Meta.WriteBufferMB)
+	}
+	if cfg.RocksDB.Meta.MaxWriteBufferNumber != 2 {
+		t.Errorf("Expected meta max_write_buffer_number default=2, got %d", cfg.RocksDB.Meta.MaxWriteBufferNumber)
 	}
 	if cfg.Metrics.LogIntervalBatches != 10 {
 		t.Errorf("Expected log_interval_batches default=10, got %d", cfg.Metrics.LogIntervalBatches)
@@ -380,17 +398,20 @@ bucket_path = "sdf-ledger-close-meta/v1/ledgers/pubnet"
 
 	// All defaults should be applied
 	defaults := map[string]interface{}{
-		"parallel_ranges":         int(1),
-		"checkpoint_interval":     int(1000),
-		"buffer_size":             int(10000),
-		"num_workers":             int(200),
-		"base_path":               "active/rocksdb",
-		"ledgers_base":            "immutable/ledgers",
-		"txhash_base":             "immutable/txhash",
-		"block_cache_mb":          int(8192),
-		"write_buffer_mb":         int(512),
-		"max_write_buffer_number": int(2),
-		"log_interval_batches":    int(10),
+		"parallel_ranges":        int(1),
+		"checkpoint_interval":    int(1000),
+		"buffer_size":            int(10000),
+		"num_workers":            int(200),
+		"base_path":              "active/rocksdb",
+		"ledgers_base":           "immutable/ledgers",
+		"txhash_base":            "immutable/txhash",
+		"ledger_block_cache_mb":  int(512),
+		"ledger_write_buffer_mb": int(256),
+		"txhash_block_cache_mb":  int(256),
+		"txhash_write_buffer_mb": int(64),
+		"meta_block_cache_mb":    int(64),
+		"meta_write_buffer_mb":   int(16),
+		"log_interval_batches":   int(10),
 	}
 
 	if cfg.Backfill.ParallelRanges != defaults["parallel_ranges"] {
@@ -414,14 +435,23 @@ bucket_path = "sdf-ledger-close-meta/v1/ledgers/pubnet"
 	if cfg.ImmutableStores.TxHashBase != defaults["txhash_base"] {
 		t.Errorf("txhash_base: expected %v, got %v", defaults["txhash_base"], cfg.ImmutableStores.TxHashBase)
 	}
-	if cfg.RocksDB.BlockCacheMB != defaults["block_cache_mb"] {
-		t.Errorf("block_cache_mb: expected %v, got %v", defaults["block_cache_mb"], cfg.RocksDB.BlockCacheMB)
+	if cfg.RocksDB.Ledger.BlockCacheMB != defaults["ledger_block_cache_mb"] {
+		t.Errorf("ledger block_cache_mb: expected %v, got %v", defaults["ledger_block_cache_mb"], cfg.RocksDB.Ledger.BlockCacheMB)
 	}
-	if cfg.RocksDB.WriteBufferMB != defaults["write_buffer_mb"] {
-		t.Errorf("write_buffer_mb: expected %v, got %v", defaults["write_buffer_mb"], cfg.RocksDB.WriteBufferMB)
+	if cfg.RocksDB.Ledger.WriteBufferMB != defaults["ledger_write_buffer_mb"] {
+		t.Errorf("ledger write_buffer_mb: expected %v, got %v", defaults["ledger_write_buffer_mb"], cfg.RocksDB.Ledger.WriteBufferMB)
 	}
-	if cfg.RocksDB.MaxWriteBufferNumber != defaults["max_write_buffer_number"] {
-		t.Errorf("max_write_buffer_number: expected %v, got %v", defaults["max_write_buffer_number"], cfg.RocksDB.MaxWriteBufferNumber)
+	if cfg.RocksDB.TxHash.BlockCacheMB != defaults["txhash_block_cache_mb"] {
+		t.Errorf("txhash block_cache_mb: expected %v, got %v", defaults["txhash_block_cache_mb"], cfg.RocksDB.TxHash.BlockCacheMB)
+	}
+	if cfg.RocksDB.TxHash.WriteBufferMB != defaults["txhash_write_buffer_mb"] {
+		t.Errorf("txhash write_buffer_mb: expected %v, got %v", defaults["txhash_write_buffer_mb"], cfg.RocksDB.TxHash.WriteBufferMB)
+	}
+	if cfg.RocksDB.Meta.BlockCacheMB != defaults["meta_block_cache_mb"] {
+		t.Errorf("meta block_cache_mb: expected %v, got %v", defaults["meta_block_cache_mb"], cfg.RocksDB.Meta.BlockCacheMB)
+	}
+	if cfg.RocksDB.Meta.WriteBufferMB != defaults["meta_write_buffer_mb"] {
+		t.Errorf("meta write_buffer_mb: expected %v, got %v", defaults["meta_write_buffer_mb"], cfg.RocksDB.Meta.WriteBufferMB)
 	}
 	if cfg.Metrics.LogIntervalBatches != defaults["log_interval_batches"] {
 		t.Errorf("log_interval_batches: expected %v, got %v", defaults["log_interval_batches"], cfg.Metrics.LogIntervalBatches)
@@ -500,10 +530,23 @@ base_path = "custom/rocksdb"
 ledgers_base = "custom/ledgers"
 txhash_base = "custom/txhash"
 
-[rocksdb]
-block_cache_mb = 16384
-write_buffer_mb = 1024
-max_write_buffer_number = 4
+[rocksdb.ledger]
+write_buffer_mb = 256
+max_write_buffer_number = 2
+target_file_size_mb = 512
+block_cache_mb = 512
+
+[rocksdb.txhash]
+write_buffer_mb = 64
+max_write_buffer_number = 2
+target_file_size_mb = 256
+block_cache_mb = 256
+
+[rocksdb.meta]
+write_buffer_mb = 16
+max_write_buffer_number = 2
+target_file_size_mb = 64
+block_cache_mb = 64
 
 [metrics]
 csv_output = "/tmp/metrics.csv"
@@ -542,14 +585,14 @@ log_interval_batches = 20
 	if cfg.ImmutableStores.TxHashBase != "custom/txhash" {
 		t.Errorf("Expected txhash_base='custom/txhash', got '%s'", cfg.ImmutableStores.TxHashBase)
 	}
-	if cfg.RocksDB.BlockCacheMB != 16384 {
-		t.Errorf("Expected block_cache_mb=16384, got %d", cfg.RocksDB.BlockCacheMB)
+	if cfg.RocksDB.Ledger.BlockCacheMB != 512 {
+		t.Errorf("Expected ledger block_cache_mb=512, got %d", cfg.RocksDB.Ledger.BlockCacheMB)
 	}
-	if cfg.RocksDB.WriteBufferMB != 1024 {
-		t.Errorf("Expected write_buffer_mb=1024, got %d", cfg.RocksDB.WriteBufferMB)
+	if cfg.RocksDB.Ledger.WriteBufferMB != 256 {
+		t.Errorf("Expected ledger write_buffer_mb=256, got %d", cfg.RocksDB.Ledger.WriteBufferMB)
 	}
-	if cfg.RocksDB.MaxWriteBufferNumber != 4 {
-		t.Errorf("Expected max_write_buffer_number=4, got %d", cfg.RocksDB.MaxWriteBufferNumber)
+	if cfg.RocksDB.Ledger.MaxWriteBufferNumber != 2 {
+		t.Errorf("Expected ledger max_write_buffer_number=2, got %d", cfg.RocksDB.Ledger.MaxWriteBufferNumber)
 	}
 	if cfg.Metrics.CSVOutput != "/tmp/metrics.csv" {
 		t.Errorf("Expected csv_output='/tmp/metrics.csv', got '%s'", cfg.Metrics.CSVOutput)

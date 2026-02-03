@@ -109,7 +109,7 @@ func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32)
 	}
 	defer rangeBackend.Close()
 
-	settings := rocksDBSettings(bc.config)
+	settings := ledgerRocksDBSettings(bc.config)
 	lcmStore, err := lcm.NewLCMStore(bc.config.Service.DataDir, rangeID, settings)
 	if err != nil {
 		return fmt.Errorf("failed to create LCM store: %w", err)
@@ -120,7 +120,7 @@ func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32)
 		return fmt.Errorf("failed to open LCM store: %w", err)
 	}
 
-	txStore, err := txhash.NewTxHashStore(bc.config.Service.DataDir, rangeID, settings)
+	txStore, err := txhash.NewTxHashStore(bc.config.Service.DataDir, rangeID, txHashRocksDBSettings(bc.config))
 	if err != nil {
 		return fmt.Errorf("failed to create TxHash store: %w", err)
 	}
@@ -189,11 +189,27 @@ func (bc *backfillCoordinator) createBackendForRange(ctx context.Context, rangeI
 	return backend.NewGCSBackend(ctx, &bc.config.Backfill.BufferedStorage)
 }
 
-func rocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
+func ledgerRocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
 	return &types.RocksDBSettings{
-		BlockCacheMB:         cfg.RocksDB.BlockCacheMB,
-		WriteBufferMB:        cfg.RocksDB.WriteBufferMB,
-		MaxWriteBufferNumber: cfg.RocksDB.MaxWriteBufferNumber,
+		BlockCacheMB:         cfg.RocksDB.Ledger.BlockCacheMB,
+		WriteBufferMB:        cfg.RocksDB.Ledger.WriteBufferMB,
+		MaxWriteBufferNumber: cfg.RocksDB.Ledger.MaxWriteBufferNumber,
+	}
+}
+
+func txHashRocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
+	return &types.RocksDBSettings{
+		BlockCacheMB:         cfg.RocksDB.TxHash.BlockCacheMB,
+		WriteBufferMB:        cfg.RocksDB.TxHash.WriteBufferMB,
+		MaxWriteBufferNumber: cfg.RocksDB.TxHash.MaxWriteBufferNumber,
+	}
+}
+
+func metaRocksDBSettings(cfg *config.Config) *types.RocksDBSettings {
+	return &types.RocksDBSettings{
+		BlockCacheMB:         cfg.RocksDB.Meta.BlockCacheMB,
+		WriteBufferMB:        cfg.RocksDB.Meta.WriteBufferMB,
+		MaxWriteBufferNumber: cfg.RocksDB.Meta.MaxWriteBufferNumber,
 	}
 }
 

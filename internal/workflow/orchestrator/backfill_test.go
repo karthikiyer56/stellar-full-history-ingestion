@@ -13,6 +13,7 @@ import (
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/logging"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/meta"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/testutil"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 func TestBackfillCoordinator_OfflineIntegration(t *testing.T) {
@@ -37,10 +38,25 @@ func TestBackfillCoordinator_OfflineIntegration(t *testing.T) {
 			LedgersBase: "immutable/ledgers",
 			TxHashBase:  "immutable/txhash",
 		},
-		RocksDB: config.RocksDBConfig{
-			BlockCacheMB:         64,
-			WriteBufferMB:        32,
-			MaxWriteBufferNumber: 2,
+		RocksDB: config.RocksDBStoresConfig{
+			Ledger: types.LedgerRocksDBSettings{
+				BlockCacheMB:         64,
+				WriteBufferMB:        32,
+				MaxWriteBufferNumber: 2,
+				TargetFileSizeMB:     256,
+			},
+			TxHash: types.TxHashRocksDBSettings{
+				BlockCacheMB:         64,
+				WriteBufferMB:        32,
+				MaxWriteBufferNumber: 2,
+				TargetFileSizeMB:     256,
+			},
+			Meta: types.MetaRocksDBSettings{
+				BlockCacheMB:         64,
+				WriteBufferMB:        32,
+				MaxWriteBufferNumber: 2,
+				TargetFileSizeMB:     256,
+			},
 		},
 		Transition: config.TransitionConfig{
 			PreserveRocksDBAfterTransition: true,

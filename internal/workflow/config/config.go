@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 // Constants for configuration defaults and calculations.
@@ -29,8 +30,8 @@ type Config struct {
 	// ImmutableStores section: Configuration for immutable store locations
 	ImmutableStores ImmutableStoresConfig `toml:"immutable_stores"`
 
-	// RocksDB section: Global RocksDB tuning parameters
-	RocksDB RocksDBConfig `toml:"rocksdb"`
+	// RocksDB section: Per-store RocksDB tuning parameters
+	RocksDB RocksDBStoresConfig `toml:"rocksdb"`
 
 	// Transition section: Transition phase settings
 	Transition TransitionConfig `toml:"transition"`
@@ -115,19 +116,16 @@ type ImmutableStoresConfig struct {
 	TxHashBase string `toml:"txhash_base"`
 }
 
-// RocksDBConfig contains RocksDB tuning parameters.
-type RocksDBConfig struct {
-	// BlockCacheMB is the block cache size in megabytes.
-	// Optional. Default: 8192
-	BlockCacheMB int `toml:"block_cache_mb"`
+// RocksDBStoresConfig contains per-store RocksDB tuning parameters.
+type RocksDBStoresConfig struct {
+	// Ledger store configuration: holds LedgerCloseMeta objects
+	Ledger types.LedgerRocksDBSettings `toml:"ledger"`
 
-	// WriteBufferMB is the write buffer size in megabytes.
-	// Optional. Default: 512
-	WriteBufferMB int `toml:"write_buffer_mb"`
+	// TxHash store configuration: holds transaction hash to ledger sequence mappings
+	TxHash types.TxHashRocksDBSettings `toml:"txhash"`
 
-	// MaxWriteBufferNumber is the maximum number of write buffers.
-	// Optional. Default: 2
-	MaxWriteBufferNumber int `toml:"max_write_buffer_number"`
+	// Meta store configuration: holds checkpoint and progress data
+	Meta types.MetaRocksDBSettings `toml:"meta"`
 }
 
 // TransitionConfig contains transition phase settings.
@@ -193,17 +191,50 @@ func setDefaults(c *Config) {
 	if c.ImmutableStores.TxHashBase == "" {
 		c.ImmutableStores.TxHashBase = "immutable/txhash"
 	}
-	if c.RocksDB.BlockCacheMB == 0 {
-		c.RocksDB.BlockCacheMB = 8192
-	}
-	if c.RocksDB.WriteBufferMB == 0 {
-		c.RocksDB.WriteBufferMB = 512
-	}
-	if c.RocksDB.MaxWriteBufferNumber == 0 {
-		c.RocksDB.MaxWriteBufferNumber = 2
-	}
 	if c.Metrics.LogIntervalBatches == 0 {
 		c.Metrics.LogIntervalBatches = 10
+	}
+
+	// RocksDB Ledger store defaults
+	if c.RocksDB.Ledger.WriteBufferMB == 0 {
+		c.RocksDB.Ledger.WriteBufferMB = 256
+	}
+	if c.RocksDB.Ledger.MaxWriteBufferNumber == 0 {
+		c.RocksDB.Ledger.MaxWriteBufferNumber = 2
+	}
+	if c.RocksDB.Ledger.TargetFileSizeMB == 0 {
+		c.RocksDB.Ledger.TargetFileSizeMB = 512
+	}
+	if c.RocksDB.Ledger.BlockCacheMB == 0 {
+		c.RocksDB.Ledger.BlockCacheMB = 512
+	}
+
+	// RocksDB TxHash store defaults
+	if c.RocksDB.TxHash.WriteBufferMB == 0 {
+		c.RocksDB.TxHash.WriteBufferMB = 64
+	}
+	if c.RocksDB.TxHash.MaxWriteBufferNumber == 0 {
+		c.RocksDB.TxHash.MaxWriteBufferNumber = 2
+	}
+	if c.RocksDB.TxHash.TargetFileSizeMB == 0 {
+		c.RocksDB.TxHash.TargetFileSizeMB = 256
+	}
+	if c.RocksDB.TxHash.BlockCacheMB == 0 {
+		c.RocksDB.TxHash.BlockCacheMB = 256
+	}
+
+	// RocksDB Meta store defaults
+	if c.RocksDB.Meta.WriteBufferMB == 0 {
+		c.RocksDB.Meta.WriteBufferMB = 16
+	}
+	if c.RocksDB.Meta.MaxWriteBufferNumber == 0 {
+		c.RocksDB.Meta.MaxWriteBufferNumber = 2
+	}
+	if c.RocksDB.Meta.TargetFileSizeMB == 0 {
+		c.RocksDB.Meta.TargetFileSizeMB = 64
+	}
+	if c.RocksDB.Meta.BlockCacheMB == 0 {
+		c.RocksDB.Meta.BlockCacheMB = 64
 	}
 }
 

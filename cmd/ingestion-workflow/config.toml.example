@@ -1,0 +1,218 @@
+# =============================================================================
+# Stellar Ingestion Workflow Configuration
+# =============================================================================
+#
+# This configuration file controls the behavior of the ingestion workflow.
+# It defines settings for service mode, backfill operation, store locations,
+# and per-store RocksDB tuning parameters.
+#
+# =============================================================================
+
+# =============================================================================
+# SERVICE CONFIGURATION
+# =============================================================================
+[service]
+
+# data_dir: Base directory for all data operations
+# Required.
+data_dir = "/data/stellar-ingestion"
+
+# mode: Operation mode (e.g., "backfill")
+# Required.
+mode = "backfill"
+
+
+# =============================================================================
+# BACKFILL CONFIGURATION
+# =============================================================================
+[backfill]
+
+# start_ledger: First ledger sequence to backfill (inclusive)
+# Required.
+start_ledger = 1
+
+# end_ledger: Last ledger sequence to backfill (inclusive)
+# Required.
+end_ledger = 100000000
+
+# ledger_backend: Backend for reading ledgers
+# Supported: "buffered_storage"
+# Required.
+ledger_backend = "buffered_storage"
+
+# parallel_ranges: Number of ranges to process in parallel
+# Optional. Default: 1
+parallel_ranges = 4
+
+# checkpoint_interval: Checkpoint progress every N ledgers
+# Optional. Default: 1000
+checkpoint_interval = 1000
+
+
+# =============================================================================
+# BUFFERED STORAGE CONFIGURATION
+# =============================================================================
+[backfill.buffered_storage]
+
+# bucket_path: GCS bucket path for ledger close metadata
+# Example: "sdf-ledger-close-meta/v1/ledgers/pubnet"
+# Required if ledger_backend=buffered_storage.
+bucket_path = "sdf-ledger-close-meta/v1/ledgers/pubnet"
+
+# buffer_size: Buffer size for storage operations
+# Optional. Default: 10000
+buffer_size = 10000
+
+# num_workers: Number of worker goroutines for storage operations
+# Optional. Default: 200
+num_workers = 200
+
+
+# =============================================================================
+# ACTIVE STORES CONFIGURATION
+# =============================================================================
+[active_stores]
+
+# base_path: Base directory for active RocksDB stores
+# Relative to service.data_dir
+# Individual stores are named {rangeID:04d}-ledger-store and {rangeID:04d}-txhash-store
+# Optional. Default: "active/rocksdb"
+base_path = "active/rocksdb"
+
+
+# =============================================================================
+# IMMUTABLE STORES CONFIGURATION
+# =============================================================================
+[immutable_stores]
+
+# ledgers_base: Base directory for immutable ledger stores
+# Relative to service.data_dir
+# Optional. Default: "immutable/ledgers"
+ledgers_base = "immutable/ledgers"
+
+# txhash_base: Base directory for immutable txhash stores
+# Relative to service.data_dir
+# Optional. Default: "immutable/txhash"
+txhash_base = "immutable/txhash"
+
+
+# =============================================================================
+# ROCKSDB CONFIGURATION - LEDGER STORE
+# =============================================================================
+# The ledger store holds LedgerCloseMeta objects (~1MB each).
+# This is the largest store by value size.
+# 
+# Memory calculation:
+#   Total memtable RAM = write_buffer_mb × max_write_buffer_number
+#   With defaults: 256 MB × 2 = 512 MB per ledger store
+#
+[rocksdb.ledger]
+
+# write_buffer_mb: Size of each MemTable in MB
+# Larger values reduce flush frequency for high-throughput writes.
+# Default: 256
+write_buffer_mb = 256
+
+# max_write_buffer_number: Maximum number of MemTables before flushing
+# Total memtable RAM = write_buffer_mb × max_write_buffer_number
+# Default: 2
+max_write_buffer_number = 2
+
+# target_file_size_mb: Target size for SST files in MB
+# Larger files reduce file count but may impact read latency.
+# Default: 512
+target_file_size_mb = 512
+
+# block_cache_mb: Block cache size in MB for read operations
+# Used to cache frequently accessed blocks from disk.
+# Default: 512
+block_cache_mb = 512
+
+
+# =============================================================================
+# ROCKSDB CONFIGURATION - TRANSACTION HASH STORE
+# =============================================================================
+# The txhash store maps transaction hash to ledger sequence.
+# This store is partitioned into 16 column families by hash prefix.
+# Uses 16 CFs + "default" CF = 17 total, so memory needs scale accordingly.
+#
+# Memory calculation:
+#   Total memtable RAM = write_buffer_mb × max_write_buffer_number × 17 (CFs)
+#   With defaults: 64 MB × 2 × 17 = ~2.2 GB across all column families
+#
+[rocksdb.txhash]
+
+# write_buffer_mb: Size of each MemTable in MB per column family
+# Smaller than ledger store since keys are small (32-byte hash → 4-byte seq).
+# Default: 64
+write_buffer_mb = 64
+
+# max_write_buffer_number: Maximum number of MemTables before flushing
+# Total memtable RAM = write_buffer_mb × max_write_buffer_number × 17 (CFs)
+# Default: 2
+max_write_buffer_number = 2
+
+# target_file_size_mb: Target size for SST files in MB
+# Default: 256
+target_file_size_mb = 256
+
+# block_cache_mb: Block cache size in MB for read operations
+# Shared across all column families.
+# Default: 256
+block_cache_mb = 256
+
+
+# =============================================================================
+# ROCKSDB CONFIGURATION - META STORE
+# =============================================================================
+# The meta store holds checkpoint and progress data for crash recovery.
+# This is the smallest store, used only for internal bookkeeping.
+#
+# Memory calculation:
+#   Total memtable RAM = write_buffer_mb × max_write_buffer_number
+#   With defaults: 16 MB × 2 = 32 MB
+#
+[rocksdb.meta]
+
+# write_buffer_mb: Size of each MemTable in MB
+# Tiny store with minimal data, so small buffers are fine.
+# Default: 16
+write_buffer_mb = 16
+
+# max_write_buffer_number: Maximum number of MemTables before flushing
+# Total memtable RAM = write_buffer_mb × max_write_buffer_number
+# Default: 2
+max_write_buffer_number = 2
+
+# target_file_size_mb: Target size for SST files in MB
+# Default: 64
+target_file_size_mb = 64
+
+# block_cache_mb: Block cache size in MB for read operations
+# Default: 64
+block_cache_mb = 64
+
+
+# =============================================================================
+# TRANSITION CONFIGURATION
+# =============================================================================
+[transition]
+
+# preserve_rocksdb_after_transition: Keep active RocksDB stores after transition
+# Optional. Default: false
+preserve_rocksdb_after_transition = false
+
+
+# =============================================================================
+# METRICS CONFIGURATION
+# =============================================================================
+[metrics]
+
+# csv_output: Path for CSV metrics output
+# Leave empty to disable.
+# Optional. Default: "" (disabled)
+csv_output = ""
+
+# log_interval_batches: Log metrics every N batches
+# Optional. Default: 10
+log_interval_batches = 10
