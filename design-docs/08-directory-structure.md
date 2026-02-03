@@ -14,16 +14,11 @@ The Stellar Full History RPC Service organizes data across multiple storage type
 │   └── rocksdb/                          # RocksDB files (SST, WAL, MANIFEST, etc.)
 │
 ├── active/                               # Currently active stores (current range being ingested)
-│   ├── ledger/                           # Active Ledger Store (RocksDB)
-│   │   └── rocksdb/                      # LedgerSeq → Compressed LedgerCloseMeta
-│   └── txhash/                           # Active TxHash Store (RocksDB, 16 column families)
-│       └── rocksdb/                      # TxHash → LedgerSeq (partitioned by first hex char)
-│
-├── transitioning/                        # Previous range being transitioned (temporary)
-│   ├── ledger/                           # Previous Ledger Store (still serving queries during transition)
-│   │   └── rocksdb/
-│   └── txhash/                           # Previous TxHash Store (still serving queries during transition)
-│       └── rocksdb/
+│   ├── rocksdb/                          # Active stores (ledger + txhash combined)
+│   │   ├── 0000-ledger-store/            # Range 0 Ledger Store (RocksDB)
+│   │   ├── 0000-txhash-store/            # Range 0 TxHash Store (RocksDB, 16 CFs)
+│   │   ├── 0001-ledger-store/            # Range 1 (if multiple ranges in active)
+│   │   └── ...
 │
 └── immutable/                            # Completed immutable stores (historical ranges)
     ├── ledgers/                          # Single LFS store for ALL ranges (no per-range dirs)
@@ -38,21 +33,21 @@ The Stellar Full History RPC Service organizes data across multiple storage type
     │       │   ├── 001000.data
     │       │   ├── 001000.index
     │       │   └── ...
-│       ├── 0002/                     # Range 2: chunks 2000-2999 (ledgers 20,000,002 - 30,000,001)
-│       │   ├── 002000.data
-│       │   ├── 002000.index
-│       │   └── ...
-│       ├── 0005/                     # Range 5: chunks 5000-5999 (ledgers 50,000,002 - 60,000,001)
-│       │   ├── 005000.data           # First chunk (ledgers 50,000,002 - 50,010,001)
-│       │   ├── 005000.index
-│       │   ├── 005001.data           # Second chunk (ledgers 50,010,002 - 50,020,001)
-│       │   ├── 005001.index
-│       │   ├── ...
-│       │   ├── 005998.data           # Second-to-last chunk (ledgers 59,980,002 - 59,990,001)
-│       │   ├── 005998.index
-│       │   ├── 005999.data           # Last chunk (ledgers 59,990,002 - 60,000,001)
-│       │   └── 005999.index
-│       └── ...                       # More parent directories as ranges are ingested
+    │       ├── 0002/                     # Range 2: chunks 2000-2999 (ledgers 20,000,002 - 30,000,001)
+    │       │   ├── 002000.data
+    │       │   ├── 002000.index
+    │       │   └── ...
+    │       ├── 0005/                     # Range 5: chunks 5000-5999 (ledgers 50,000,002 - 60,000,001)
+    │       │   ├── 005000.data           # First chunk (ledgers 50,000,002 - 50,010,001)
+    │       │   ├── 005000.index
+    │       │   ├── 005001.data           # Second chunk (ledgers 50,010,002 - 50,020,001)
+    │       │   ├── 005001.index
+    │       │   ├── ...
+    │       │   ├── 005998.data           # Second-to-last chunk (ledgers 59,980,002 - 59,990,001)
+    │       │   ├── 005998.index
+    │       │   ├── 005999.data           # Last chunk (ledgers 59,990,002 - 60,000,001)
+    │       │   └── 005999.index
+    │       └── ...                       # More parent directories as ranges are ingested
     │
     └── txhash/                           # RecSplit indexes (minimal perfect hash) - per range
         ├── 0000/                         # Range 0 txhash index
@@ -77,17 +72,22 @@ The Stellar Full History RPC Service organizes data across multiple storage type
         │   └── index/
         │       ├── cf-0.idx
         │       └── ...
-├── 0002/                         # Range 2 txhash index
-│   └── index/
-├── 0005/                         # Range 5 txhash index
-│   └── index/
-│       ├── cf-0.idx              # First file
-│       ├── cf-1.idx              # Second file
-│       ├── ...
-│       ├── cf-e.idx              # Second-to-last file
-│       └── cf-f.idx              # Last file
-└── ...
+        ├── 0002/                         # Range 2 txhash index
+        │   └── index/
+        ├── 0005/                         # Range 5 txhash index
+        │   └── index/
+        │       ├── cf-0.idx              # First file
+        │       ├── cf-1.idx              # Second file
+        │       ├── ...
+        │       ├── cf-e.idx              # Second-to-last file
+        │       └── cf-f.idx              # Last file
+        └── ...
 ```
+
+**Key Changes from Stale Design**:
+- **No `transitioning/` directory**: Transition state is tracked in meta store (`range:{id}:state`), not filesystem
+- **Simplified active store structure**: All active stores under `active/rocksdb/` with range-prefixed names (`0000-ledger-store`, `0000-txhash-store`, etc.)
+- **Explanation**: "Transition state is tracked in meta store, not file system" - RocksDB stores stay in the same location and are deleted only after immutable stores are verified complete.
 
 ---
 
@@ -223,7 +223,7 @@ data_dir = "/data/stellar-rpc"
 
 **Result**:
 - Meta store: `/data/stellar-rpc/meta/rocksdb`
-- Active stores: `/data/stellar-rpc/active/ledger/rocksdb`, `/data/stellar-rpc/active/txhash/rocksdb`
+- Active stores: `/data/stellar-rpc/active/rocksdb/{rangeID}-ledger-store`, `/data/stellar-rpc/active/rocksdb/{rangeID}-txhash-store`
 - Immutable stores: `/data/stellar-rpc/immutable/ledgers/`, `/data/stellar-rpc/immutable/txhash/`
 
 ### Scenario 2: Separate Volumes for Active and Immutable
@@ -235,18 +235,13 @@ Place active stores on fast NVMe, immutable stores on cheaper HDD:
 data_dir = "/data/stellar-rpc"  # Default for meta store
 
 [active_stores]
-ledger_path = "/nvme/stellar-rpc/active/ledger/rocksdb"
-txhash_path = "/nvme/stellar-rpc/active/txhash/rocksdb"
-
-[immutable_stores]
-ledgers_base = "/hdd/stellar-rpc/immutable/ledgers"
-txhash_base = "/hdd/stellar-rpc/immutable/txhash"
+base_path = "/nvme/stellar-rpc/active/rocksdb"
 ```
 
 **Result**:
 - Meta store: `/data/stellar-rpc/meta/rocksdb` (default disk)
-- Active stores: `/nvme/stellar-rpc/active/...` (fast NVMe)
-- Immutable stores: `/hdd/stellar-rpc/immutable/...` (large HDD)
+- Active stores: `/nvme/stellar-rpc/active/rocksdb/{rangeID}-ledger-store`, etc. (fast NVMe)
+- Immutable stores: `/data/stellar-rpc/immutable/...` (auto-generated)
 
 ### Scenario 3: Dedicated Disk for Meta Store
 
@@ -260,8 +255,7 @@ data_dir = "/data/stellar-rpc"
 path = "/ssd1/stellar-rpc/meta/rocksdb"
 
 [active_stores]
-ledger_path = "/ssd2/stellar-rpc/active/ledger/rocksdb"
-txhash_path = "/ssd2/stellar-rpc/active/txhash/rocksdb"
+base_path = "/ssd2/stellar-rpc/active/rocksdb"
 
 [immutable_stores]
 ledgers_base = "/hdd/stellar-rpc/immutable/ledgers"

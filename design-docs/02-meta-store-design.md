@@ -96,9 +96,10 @@ Each 10M ledger range has its own set of keys:
 
 | Key Pattern | Type | Description | Triggers / Conditions |
 |-------------|------|-------------|----------------------|
-| `range:{id}:ledger:phase` | LedgerPhase | Ledger sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `WRITING_LFS` (when transition starts), `WRITING_LFS` → `IMMUTABLE` (when LFS writing completes). **Component**: Ledger sub-workflow. **Example**: `"WRITING_LFS"`. |
+| `range:{id}:ledger:phase` | LedgerPhase | Ledger sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `COMPACTING` (when transition starts), `COMPACTING` → `WRITING_LFS` (when compaction completes), `WRITING_LFS` → `IMMUTABLE` (when LFS writing completes). **Component**: Ledger sub-workflow. **Example**: `"COMPACTING"`. |
 | `range:{id}:ledger:last_committed_ledger` | uint32 | Last checkpointed ledger | **Set**: After first batch processed. **Updated**: At each checkpoint (every 1000 ledgers in backfill, every 1 ledger in streaming). **Component**: Ingestion loop. **Example**: `7499001`. |
 | `range:{id}:ledger:count` | uint64 | Total ledgers ingested | **Set**: After first batch processed. **Updated**: At each checkpoint (incremented by batch size). **Component**: Ingestion loop. **Example**: `7499000`. |
+| `range:{id}:ledger:lfs_last_chunk_written` | int32 | Last fully written chunk ID (crash recovery) | **Set**: To `-1` when transition starts (no chunks written yet). **Updated**: After each chunk successfully written and verified. **Type**: int32 (not uint32), with -1 as sentinel for "no chunks written". **Component**: LFS writer. **Example**: `42` (chunks 0-42 written, resume from 43), or `-1` (no chunks written yet). |
 | `range:{id}:ledger:immutable_path` | string | Path to LFS chunks after transition | **Set**: When LFS writing completes (phase becomes `IMMUTABLE`). **Updated**: Never. **Component**: LFS writer. **Example**: `"/data/stellar-rpc/immutable/ledgers/chunks/0000"` (for range 0, containing chunks 0-999). |
 
 ### Per-Range TxHash Store Keys
@@ -107,7 +108,7 @@ Each 10M ledger range has its own set of keys:
 |-------------|------|-------------|----------------------|
 | `range:{id}:txhash:phase` | TxHashPhase | TxHash sub-workflow phase | **Set**: To `"INGESTING"` when range ingestion starts. **Updated**: `INGESTING` → `COMPACTING` → `BUILDING_RECSPLIT` → `VERIFYING_RECSPLIT` → `COMPLETE` (see [Transition Workflow](./05-transition-workflow.md) for phase details). **Component**: TxHash sub-workflow. **Example**: `"BUILDING_RECSPLIT"`. |
 | `range:{id}:txhash:last_committed_ledger` | uint32 | Last checkpointed ledger | **Set**: After first batch processed. **Updated**: At each checkpoint (every 1000 ledgers in backfill, every 1 ledger in streaming). **Component**: Ingestion loop. **Example**: `7499001`. |
-| `range:{id}:txhash:cf_counts` | JSON | Per-CF counts: {"0": count, ..., "f": count} | **Set**: After first batch processed. **Updated**: At each checkpoint (counts incremented by transactions in batch). **Component**: Ingestion loop. **Example**: `{"0": 375, "1": 362, ..., "f": 368}`. |
+| `range:{id}:txhash:cf_counts` | String | Per-CF counts in compact string format | **Set**: After first batch processed. **Updated**: At each checkpoint (counts incremented by transactions in batch). **Format**: Compact string `"0:N,1:M,...,f:K"` where N, M, K are decimal counts. **Component**: Ingestion loop. **Example**: `"0:375,1:362,2:380,...,f:368"`. |
 | `range:{id}:txhash:rocksdb_path` | string | Path to Active Store RocksDB | **Set**: When range ingestion starts (RocksDB instance created). **Updated**: Never. **Component**: Range orchestrator. **Example**: `"/data/stellar-rpc/active/txhash/rocksdb"`. |
 | `range:{id}:txhash:recsplit_path` | string | Path to RecSplit indexes after transition | **Set**: When RecSplit building completes (phase becomes `COMPLETE`). **Updated**: Never. **Component**: RecSplit builder. **Example**: `"/data/stellar-rpc/immutable/txhash/0000"` (for range 0). |
 
@@ -156,6 +157,7 @@ type LedgerPhase string
 
 const (
     LedgerPhaseIngesting  LedgerPhase = "INGESTING"   // Writing to Active RocksDB
+    LedgerPhaseCompacting LedgerPhase = "COMPACTING"  // Full compaction of RocksDB
     LedgerPhaseWritingLFS LedgerPhase = "WRITING_LFS" // Creating LFS chunks
     LedgerPhaseImmutable  LedgerPhase = "IMMUTABLE"   // LFS complete, RocksDB deleted
 )
@@ -208,17 +210,19 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     [*] --> INGESTING: Range ingestion starts
-    INGESTING --> WRITING_LFS: Transition begins
+    INGESTING --> COMPACTING: Transition begins
+    COMPACTING --> WRITING_LFS: Compaction completes
     WRITING_LFS --> IMMUTABLE: LFS chunks written
     IMMUTABLE --> [*]
 ```
 
 **Transition Triggers**:
 - **[*] → INGESTING**: When range state changes to `INGESTING` (both ledger and txhash phases start together)
-- **INGESTING → WRITING_LFS**: When range state changes to `TRANSITIONING` (last ledger of range processed)
+- **INGESTING → COMPACTING**: When range state changes to `TRANSITIONING` (last ledger of range processed)
+- **COMPACTING → WRITING_LFS**: When full compaction across RocksDB completes
 - **WRITING_LFS → IMMUTABLE**: When all LFS chunks are written and verified. RocksDB is deleted at this point.
 
-**Key Insight**: The ledger sub-workflow is simpler than txhash because LFS writing is a single-step operation (read RocksDB, write chunks, verify).
+**Key Insight**: The ledger sub-workflow includes compaction before LFS writing to reduce data size and improve compression ratio. Compaction is a prerequisite to creating optimal LFS chunks.
 
 ### TxHashPhase Transitions
 
@@ -325,7 +329,7 @@ range:0:ledger:count                 = 5000
 
 range:0:txhash:phase                 = "INGESTING"
 range:0:txhash:last_committed_ledger = 5001
-range:0:txhash:cf_counts             = {"0": 312, "1": 298, ..., "f": 305}
+range:0:txhash:cf_counts             = "0:312,1:298,...,f:305"
 ```
 
 **Checkpoint Update (every 1000 ledgers in backfill)**:
@@ -334,7 +338,7 @@ range:0:txhash:cf_counts             = {"0": 312, "1": 298, ..., "f": 305}
 range:0:ledger:last_committed_ledger = 6001
 range:0:ledger:count                 = 6000
 range:0:txhash:last_committed_ledger = 6001
-range:0:txhash:cf_counts             = {"0": 375, "1": 362, ..., "f": 368}
+range:0:txhash:cf_counts             = "0:375,1:362,...,f:368"
 ```
 
 **Range 0 Ingestion Complete, Starting Transition (t=2)**:
@@ -619,14 +623,16 @@ Separate phase tracking enables:
 - Parallel execution
 - Granular crash recovery
 
-### Why JSON for cf_counts?
+### Why Compact String Format for cf_counts?
 
-The `cf_counts` field stores per-column-family transaction counts as JSON:
-```json
-{"0": 125000, "1": 123500, ..., "f": 124800}
+The `cf_counts` field stores per-column-family transaction counts as a compact string:
+```
+"0:125000,1:123500,...,f:124800"
 ```
 
-This enables:
+This format enables:
+- Efficient storage (no JSON overhead)
+- Atomic parsing (single key→value)
 - Accurate RecSplit sizing (each CF gets its own index)
 - Verification after transition (compare counts)
 - Debugging (identify imbalanced CFs)
@@ -643,9 +649,9 @@ This enables:
 
 **A**: The transition is crash-safe. Each sub-workflow (ledger and txhash) tracks its own phase. On recovery, the system reads the phase states and resumes from where it left off. For example, if `ledger:phase = "IMMUTABLE"` but `txhash:phase = "COMPACTING"`, only the txhash sub-workflow needs to resume. Checkpoint data is never deleted, so recovery is always possible. See [Crash Recovery - Scenario 5](./06-crash-recovery.md#scenario-5-crash-during-transition-both-sub-flows-both-modes---transition) for detailed examples.
 
-### Q: Why is cf_counts stored as JSON instead of separate keys?
+### Q: Why is cf_counts stored as compact string format?
 
-**A**: Storing all 16 column family counts as a single JSON value enables atomic updates and verification. During ingestion, all counts are updated together in one write operation, ensuring consistency. After transition, the entire JSON can be compared against RecSplit index sizes to verify completeness. Using separate keys would require 16 individual writes per checkpoint, increasing complexity and the risk of partial updates during crashes.
+**A**: Storing all 16 column family counts as a single compact string value enables atomic updates and efficient storage. During ingestion, all counts are updated together in one write operation, ensuring consistency. After transition, the entire string can be parsed and compared against RecSplit index sizes to verify completeness. The compact string format `"0:N,1:M,...,f:K"` is more space-efficient than alternative approaches and avoids unnecessary parsing overhead.
 
 ### Q: Can I query data while a range is TRANSITIONING?
 

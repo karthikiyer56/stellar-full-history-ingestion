@@ -148,7 +148,61 @@ These sub-flows are **independent** - a crash in one does not affect the other's
 
 ---
 
-### Scenario 3: Crash During Compaction [BOTH MODES - TRANSITION]
+### Scenario 2.5: Crash During Ledger Compaction [BOTH MODES - TRANSITION]
+
+**Situation**: Transition in progress, ledger RocksDB compaction running, crash occurs
+
+**State at Crash**:
+```
+range:3:state = "TRANSITIONING"
+range:3:ledger:phase = "COMPACTING"   # Interrupted during compaction
+range:3:ledger:lfs_last_chunk_written = -1  # No chunks written yet (still in COMPACTING)
+```
+
+**Recovery**:
+1. Restart streaming mode: `./stellar-rpc`
+2. Code finds `range:3:state = "TRANSITIONING"`
+3. **Restart ledger compaction from beginning** (compaction is not resumable, unlike LFS chunk writing)
+4. Once compaction completes → ledger:phase moves to `WRITING_LFS`
+5. Continue with LFS writing
+
+**Key Insight**: Compaction must restart from scratch, but this is acceptable because:
+- Ledger compaction is faster than LFS writing
+- Transitioning stores remain available for queries during recovery
+- No data loss
+
+---
+
+### Scenario 3: Crash During LFS Chunk Writing [BOTH MODES - TRANSITION]
+
+**Situation**: Transition in progress, LFS chunks being written, crash occurs at chunk 45
+
+**State at Crash**:
+```
+range:3:state = "TRANSITIONING"
+range:3:ledger:phase = "WRITING_LFS"
+range:3:ledger:lfs_last_chunk_written = 42  # Chunks 0-42 fully written and verified
+```
+
+**Recovery**:
+1. Restart streaming mode: `./stellar-rpc`
+2. Code finds `range:3:state = "TRANSITIONING"`
+3. Code finds `range:3:ledger:phase = "WRITING_LFS"`
+4. Code reads `range:3:ledger:lfs_last_chunk_written = 42`
+5. **Resume LFS writing from chunk 43** (skip chunks 0-42 which are verified)
+6. Continue writing chunks 43, 44, 45, ... until all chunks complete
+7. When all chunks written → ledger:phase moves to `IMMUTABLE`
+
+**Chunk Resume Logic**:
+```
+lfs_last_chunk_written = 42  →  Resume from chunk 43
+lfs_last_chunk_written = -1  →  Resume from chunk 0 (no chunks written yet)
+lfs_last_chunk_written = 999 →  Resume from chunk 1000 (all chunks 0-999 done)
+```
+
+**Key Insight**: LFS chunk writing is resumable because each chunk is an atomic write. The `lfs_last_chunk_written` key tracks progress at chunk granularity.
+
+---
 
 **Situation**: Transition in progress, compaction running, crash occurs
 
@@ -208,7 +262,7 @@ range:6:txhash:last_committed_ledger = 65000500
 ```
 range:3:state = "TRANSITIONING"
 range:3:ledger:phase = "WRITING_LFS"
-range:3:ledger:lfs_chunks_written = 450  # Tracks progress
+range:3:ledger:lfs_last_chunk_written = 449  # Chunks 0-449 written, crash during 450
 range:3:txhash:phase = "BUILDING_RECSPLIT"
 range:3:txhash:recsplit_cf_completed = 6  # CFs 0-6 done, crash during CF 7
 ```
@@ -216,13 +270,13 @@ range:3:txhash:recsplit_cf_completed = 6  # CFs 0-6 done, crash during CF 7
 **Recovery**:
 1. Restart service
 2. Detect `range:3:state = "TRANSITIONING"`
-3. **Ledger Sub-Flow**: Resume LFS writing from chunk 451 (chunks 1-450 verified)
+3. **Ledger Sub-Flow**: Resume LFS writing from chunk 450 (chunks 0-449 verified)
 4. **TxHash Sub-Flow**: Resume RecSplit build from CF 7 (CFs 0-6 already written to disk)
 5. Both sub-flows continue in parallel
 
 **What Happens to Partial Work**:
-- LFS chunks 1-450: Kept (each chunk is atomic write)
-- LFS chunk 451 (if partially written): Overwritten on resume
+- LFS chunks 0-449: Kept (each chunk is atomic write)
+- LFS chunk 450 (if partially written): Overwritten on resume
 - RecSplit CFs 0-6: Kept (each CF index is atomic write)
 - RecSplit CF 7 (if partially built): Discarded, rebuilt from scratch
 
@@ -234,7 +288,7 @@ range:3:txhash:recsplit_cf_completed = 6  # CFs 0-6 done, crash during CF 7
 ```
 range:3:state = "TRANSITIONING"
 range:3:ledger:phase = "WRITING_LFS"
-range:3:ledger:lfs_chunks_written = 749
+range:3:ledger:lfs_last_chunk_written = 749  # Chunks 0-749 written, crash during 750
 range:3:txhash:phase = "BUILDING_RECSPLIT"
 range:3:txhash:recsplit_cf_completed = 12
 ```
@@ -243,9 +297,9 @@ range:3:txhash:recsplit_cf_completed = 12
 1. Restart service
 2. Detect `range:3:state = "TRANSITIONING"`
 3. **Ledger Sub-Flow**:
-   - Resume LFS writing from chunk 750.
-   - Delete partial chunk 750 if exists, rewrite the chunk completely.
-   - Rewrite chunk 750 from scratch.
+   - Read `lfs_last_chunk_written = 749`
+   - Resume LFS writing from chunk 750
+   - Delete partial chunk 750 if exists, rewrite the chunk completely
 4. **TxHash Sub-Flow**: Resume RecSplit build from CF 13
 
 **If TxHash Finishes First**:

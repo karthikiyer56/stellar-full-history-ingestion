@@ -11,9 +11,11 @@ The Query Router directs requests to the correct data store based on ledger sequ
 
 **Key Responsibilities**:
 - Calculate range ID from ledger sequence
-- Check range state in meta store
-- Route to appropriate store
+- Check range state in meta store (not filesystem)
+- Route to appropriate store (determined by `range:{id}:state`)
 - Handle errors (range not found, not yet ingested, failed)
+
+**Important**: Transition state is tracked in the meta store (`range:{id}:state`), not by separate directories on the filesystem. Active stores remain at their original location throughout their lifecycle, including during transition.
 
 ---
 
@@ -534,14 +536,13 @@ func verifyTransactionInLedger(lcmBytes []byte, targetTxHash []byte) (bool, erro
 **Routing**:
 1. Calculate range: `(35000000 - 2) / 10000000 = 3`
 2. Check state: `range:3:state = "TRANSITIONING"`
-3. Route to: Transitioning Ledger RocksDB
-4. Path: `/data/transitioning/ledger/rocksdb`
-5. Key: `ledger:35000000`
-6. Return: LedgerCloseMeta
+3. Route to: Transitioning Ledger RocksDB (same path as active store)
+4. Key: `ledger:35000000`
+5. Return: LedgerCloseMeta
 
 **Response**: 200 OK
 
-**Key Insight**: Transitioning stores remain alive and queryable until transition completes.
+**Key Insight**: Transitioning stores remain at the active RocksDB location and remain queryable until transition completes. The meta store tracks that this range is `TRANSITIONING`, but the data is still in the active RocksDB path.
 
 ---
 

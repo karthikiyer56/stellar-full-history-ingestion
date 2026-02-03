@@ -30,8 +30,7 @@ Active store RocksDB settings.
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
-| `ledger_path` | string | Optional | `{data_dir}/active/ledger/rocksdb` | Active ledger store path |
-| `txhash_path` | string | Optional | `{data_dir}/active/txhash/rocksdb` | Active txhash store path |
+| `base_path` | string | Optional | `{data_dir}/active/rocksdb` | Base directory for all active range stores. Individual stores are created with range-prefixed names: `{base_path}/{rangeID:04d}-ledger-store` and `{base_path}/{rangeID:04d}-txhash-store` |
 
 ### [immutable_stores]
 
@@ -168,7 +167,7 @@ write_buffer_mb = 512
 max_write_buffer_number = 2
 ```
 
-**Description**: Ingests ledgers 2 to 30,000,001 (ranges 0, 1, 2) from GCS using 2 parallel orchestrators. Creates immutable stores directly, then exits.
+**Description**: Ingests ledgers 2 to 30,000,001 (ranges 0, 1, 2) from GCS using 2 parallel orchestrators. Creates immutable stores directly, then exits. Active stores created automatically under `/data/stellar-rpc/active/rocksdb/`.
 
 ---
 
@@ -231,8 +230,7 @@ mode = "streaming"
 path = "/ssd1/stellar-rpc/meta/rocksdb"  # Dedicated disk for meta store
 
 [active_stores]
-ledger_path = "/nvme/stellar-rpc/active/ledger/rocksdb"  # Fast NVMe for active stores
-txhash_path = "/nvme/stellar-rpc/active/txhash/rocksdb"
+base_path = "/nvme/stellar-rpc/active/rocksdb"  # Fast NVMe for active stores
 
 [immutable_stores]
 ledgers_base = "/hdd/stellar-rpc/immutable/ledgers"  # Large HDD for immutable data
@@ -281,13 +279,13 @@ TxHash Memory = (512 MB × 2 × 16) + 8192 MB = 24,576 MB (~24 GB)
 data_dir = "/data/stellar-rpc"
 
 [active_stores]
-ledger_path = "active/ledger/rocksdb"  # Resolves to /data/stellar-rpc/active/ledger/rocksdb
+base_path = "active/rocksdb"  # Resolves to /data/stellar-rpc/active/rocksdb
 ```
 
 **Absolute paths** (used as-is):
 ```toml
 [active_stores]
-ledger_path = "/nvme/stellar-rpc/active/ledger/rocksdb"  # Used exactly as specified
+base_path = "/nvme/stellar-rpc/active/rocksdb"  # Used exactly as specified
 ```
 
 ---

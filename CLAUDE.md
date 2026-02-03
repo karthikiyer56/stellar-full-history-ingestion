@@ -266,6 +266,27 @@ Before considering a tool complete:
 
 ---
 
+## Stellar SDK Usage
+
+**ALWAYS use `github.com/stellar/go-stellar-sdk`**
+
+The old `github.com/stellar/go` repository is ARCHIVED and not used in this codebase.
+
+- `go.mod` shows: `github.com/stellar/go-stellar-sdk v0.1.0`
+- The `LedgerBackend` interface exists in `go-stellar-sdk/ingest/ledgerbackend`
+- `BufferedStorageBackend` and `CaptiveStellarCore` are SDK implementations
+- Do NOT redefine `LedgerBackend` - import it from the SDK
+
+```go
+// CORRECT
+import "github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
+
+// WRONG - DO NOT USE
+import "github.com/stellar/go/ingest/ledgerbackend"
+```
+
+---
+
 ## Build Hygiene
 
 After verifying a build compiles successfully:
