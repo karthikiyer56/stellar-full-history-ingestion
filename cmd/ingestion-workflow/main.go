@@ -12,6 +12,7 @@ import (
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/logging"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/orchestrator"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/meta"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 const (
@@ -63,7 +64,13 @@ func main() {
 	logger.Info("Data directory: %s", cfg.Service.DataDir)
 
 	metaStorePath := filepath.Join(cfg.Service.DataDir, "meta")
-	metaStore, err := meta.NewMetaStore(metaStorePath)
+	metaSettings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        cfg.RocksDB.Meta.WriteBufferMB,
+		MaxWriteBufferNumber: cfg.RocksDB.Meta.MaxWriteBufferNumber,
+		TargetFileSizeMB:     cfg.RocksDB.Meta.TargetFileSizeMB,
+		BlockCacheMB:         cfg.RocksDB.Meta.BlockCacheMB,
+	}
+	metaStore, err := meta.NewMetaStore(metaStorePath, metaSettings)
 	if err != nil {
 		logger.Error("Failed to create meta store: %v", err)
 		os.Exit(1)
