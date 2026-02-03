@@ -7,19 +7,16 @@ import (
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/rocksdb"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 	"github.com/linxGnu/grocksdb"
 )
 
 type lcmStore struct {
-	db        *grocksdb.DB
-	opts      *grocksdb.Options
-	writeOpts *grocksdb.WriteOptions
-	readOpts  *grocksdb.ReadOptions
-	path      string
+	rocksdb.BaseStore
 }
 
-func NewLCMStore(dataDir string, rangeID uint32, settings *types.RocksDBSettings) (*lcmStore, error) {
+func NewLCMStore(dataDir string, rangeID uint32, settings *types.LedgerRocksDBSettings) (*lcmStore, error) {
 	path := filepath.Join(dataDir, "active", "rocksdb", fmt.Sprintf("%04d-ledger-store", rangeID))
 
 	if err := helpers.EnsureDir(path); err != nil {
@@ -30,10 +27,11 @@ func NewLCMStore(dataDir string, rangeID uint32, settings *types.RocksDBSettings
 	opts.SetCreateIfMissing(true)
 	opts.SetDisableAutoCompactions(true)
 
+	var blockCache *grocksdb.Cache
 	if settings.BlockCacheMB > 0 {
+		blockCache = grocksdb.NewLRUCache(uint64(settings.BlockCacheMB * 1024 * 1024))
 		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		cache := grocksdb.NewLRUCache(uint64(settings.BlockCacheMB * 1024 * 1024))
-		bbto.SetBlockCache(cache)
+		bbto.SetBlockCache(blockCache)
 		opts.SetBlockBasedTableFactory(bbto)
 	}
 
@@ -45,24 +43,31 @@ func NewLCMStore(dataDir string, rangeID uint32, settings *types.RocksDBSettings
 		opts.SetMaxWriteBufferNumber(settings.MaxWriteBufferNumber)
 	}
 
+	if settings.TargetFileSizeMB > 0 {
+		opts.SetTargetFileSizeBase(uint64(settings.TargetFileSizeMB * 1024 * 1024))
+	}
+
 	return &lcmStore{
-		opts: opts,
-		path: path,
+		BaseStore: rocksdb.BaseStore{
+			Opts:       opts,
+			BlockCache: blockCache,
+			Path:       path,
+		},
 	}, nil
 }
 
 func (s *lcmStore) Open() (time.Duration, error) {
 	start := time.Now()
 
-	db, err := grocksdb.OpenDb(s.opts, s.path)
+	db, err := grocksdb.OpenDb(s.Opts, s.Path)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open RocksDB at %s: %w", s.path, err)
+		return 0, fmt.Errorf("failed to open RocksDB at %s: %w", s.Path, err)
 	}
 
-	s.db = db
-	s.writeOpts = grocksdb.NewDefaultWriteOptions()
-	s.writeOpts.SetSync(false)
-	s.readOpts = grocksdb.NewDefaultReadOptions()
+	s.DB = db
+	s.WriteOpts = grocksdb.NewDefaultWriteOptions()
+	s.WriteOpts.SetSync(false)
+	s.ReadOpts = grocksdb.NewDefaultReadOptions()
 
 	return time.Since(start), nil
 }
@@ -76,13 +81,13 @@ func (s *lcmStore) WriteBatch(entries map[uint32][]byte) error {
 		batch.Put(key, lcmBytes)
 	}
 
-	return s.db.Write(s.writeOpts, batch)
+	return s.DB.Write(s.WriteOpts, batch)
 }
 
 func (s *lcmStore) Get(ledgerSeq uint32) ([]byte, error) {
 	key := helpers.Uint32ToBytes(ledgerSeq)
 
-	slice, err := s.db.Get(s.readOpts, key)
+	slice, err := s.DB.Get(s.ReadOpts, key)
 	if err != nil {
 		return nil, err
 	}
@@ -98,46 +103,26 @@ func (s *lcmStore) Get(ledgerSeq uint32) ([]byte, error) {
 }
 
 func (s *lcmStore) NewIterator() interfaces.Iterator {
-	iter := s.db.NewIterator(s.readOpts)
+	iter := s.DB.NewIterator(s.ReadOpts)
 	return &lcmIterator{iter: iter}
 }
 
 func (s *lcmStore) Compact() (time.Duration, error) {
 	start := time.Now()
-	s.db.CompactRange(grocksdb.Range{})
+	s.DB.CompactRange(grocksdb.Range{})
 	return time.Since(start), nil
 }
 
 func (s *lcmStore) GetPath() string {
-	return s.path
+	return s.Path
 }
 
 func (s *lcmStore) GetSize() (int64, error) {
-	return helpers.GetDirSize(s.path), nil
+	return helpers.GetDirSize(s.Path), nil
 }
 
 func (s *lcmStore) Close() error {
-	if s.writeOpts != nil {
-		s.writeOpts.Destroy()
-		s.writeOpts = nil
-	}
-
-	if s.readOpts != nil {
-		s.readOpts.Destroy()
-		s.readOpts = nil
-	}
-
-	if s.db != nil {
-		s.db.Close()
-		s.db = nil
-	}
-
-	if s.opts != nil {
-		s.opts.Destroy()
-		s.opts = nil
-	}
-
-	return nil
+	return s.CloseBase()
 }
 
 type lcmIterator struct {
