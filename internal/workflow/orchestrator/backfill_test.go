@@ -67,7 +67,13 @@ func TestBackfillCoordinator_OfflineIntegration(t *testing.T) {
 	mockBackend := testutil.NewMockLedgerBackend(ledgers)
 
 	metaStorePath := filepath.Join(tmpDir, "meta")
-	metaStore, err := meta.NewMetaStore(metaStorePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	metaStore, err := meta.NewMetaStore(metaStorePath, settings)
 	require.NoError(t, err)
 	defer metaStore.Close()
 

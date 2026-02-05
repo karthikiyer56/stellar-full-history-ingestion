@@ -28,7 +28,7 @@ import (
 // TransitionCoordinator orchestrates ledger + txhash transition phases.
 type TransitionCoordinator struct {
 	metaStore       interfaces.MetaStore
-	lcmStore        interfaces.LCMStore
+	lcmStore        interfaces.LedgerStore
 	txStore         interfaces.TxHashStore
 	lfsWriter       interfaces.LFSWriter
 	recsplitBuilder interfaces.RecSplitBuilder
@@ -40,7 +40,7 @@ type TransitionCoordinator struct {
 // NewTransitionCoordinator creates a new transition coordinator.
 func NewTransitionCoordinator(
 	metaStore interfaces.MetaStore,
-	lcmStore interfaces.LCMStore,
+	lcmStore interfaces.LedgerStore,
 	txStore interfaces.TxHashStore,
 	lfsWriter interfaces.LFSWriter,
 	recsplitBuilder interfaces.RecSplitBuilder,
@@ -211,6 +211,9 @@ func (tc *TransitionCoordinator) Run(rangeID uint32) error {
 	// Wait for both goroutines to complete
 	wg.Wait()
 
+	// Error aggregation: Collect errors from BOTH paths before failing.
+	// Why not fail-fast? We want to log complete failure context (both goroutine results)
+	// so operators can see the full scope of issues (e.g., both compactions failed).
 	if ledgerErr != nil || txhashErr != nil {
 		if ledgerErr != nil && txhashErr != nil {
 			return fmt.Errorf("transition errors: ledger=%v; txhash=%v", ledgerErr, txhashErr)
@@ -229,6 +232,10 @@ func (tc *TransitionCoordinator) Run(rangeID uint32) error {
 		tc.log.Info("Range %d: state transitioned to %s", rangeID, newState)
 	}
 
+	// Deletion gate: Only delete RocksDB stores when range is COMPLETE.
+	// Why check newState? MaybeTransitionRangeState() checks both ledger + txhash phases.
+	// COMPLETE means: ledger=IMMUTABLE AND txhash=COMPLETE (both compactions + transitions done).
+	// Safe to delete active stores only when both immutable replacements exist.
 	if newState == interfaces.RangeStateComplete {
 		if err := tc.maybeDeleteRocksDB(rangeID); err != nil {
 			return err
@@ -250,6 +257,10 @@ func (tc *TransitionCoordinator) maybeDeleteRocksDB(rangeID uint32) error {
 		return fmt.Errorf("failed to get txhash phase: %w", err)
 	}
 
+	// Double-check both phases before deletion (defense in depth).
+	// Why check again? Caller already verified via MaybeTransitionRangeState, but
+	// this method can be called independently. Ensures we never delete active stores
+	// while immutable replacements (LFS chunks + RecSplit indexes) don't exist yet.
 	if ledgerPhase == interfaces.LedgerPhaseImmutable && txhashPhase == interfaces.TxHashPhaseComplete {
 		if tc.config.PreserveRocksDBAfterTransition {
 			tc.log.Info("Preserving RocksDB stores (PreserveRocksDBAfterTransition=true)")

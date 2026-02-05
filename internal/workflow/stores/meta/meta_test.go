@@ -6,13 +6,20 @@ import (
 	"testing"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 func TestMetaStore_RangeState(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -46,7 +53,13 @@ func TestMetaStore_LedgerPhase(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -81,7 +94,13 @@ func TestMetaStore_TxHashPhase(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -117,7 +136,13 @@ func TestMetaStore_CommitCheckpoint(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -171,7 +196,13 @@ func TestMetaStore_LFSLastChunkWritten(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -255,7 +286,13 @@ func TestMetaStore_BothSubPhasesFinishedIngesting(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -296,7 +333,13 @@ func TestMetaStore_BothSubPhasesComplete(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -337,7 +380,13 @@ func TestMetaStore_MaybeTransitionRangeState(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -422,7 +471,13 @@ func TestMetaStore_Persistence(t *testing.T) {
 	}
 
 	{
-		ms, err := NewMetaStore(storePath)
+		settings := &types.MetaRocksDBSettings{
+			WriteBufferMB:        64,
+			MaxWriteBufferNumber: 2,
+			TargetFileSizeMB:     64,
+			BlockCacheMB:         128,
+		}
+		ms, err := NewMetaStore(storePath, settings)
 		if err != nil {
 			t.Fatalf("Failed to create meta store: %v", err)
 		}
@@ -437,7 +492,13 @@ func TestMetaStore_Persistence(t *testing.T) {
 	}
 
 	{
-		ms, err := NewMetaStore(storePath)
+		settings := &types.MetaRocksDBSettings{
+			WriteBufferMB:        64,
+			MaxWriteBufferNumber: 2,
+			TargetFileSizeMB:     64,
+			BlockCacheMB:         128,
+		}
+		ms, err := NewMetaStore(storePath, settings)
 		if err != nil {
 			t.Fatalf("Failed to reopen meta store: %v", err)
 		}
@@ -481,7 +542,13 @@ func TestMetaStore_MultipleRanges(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -522,7 +589,13 @@ func TestMetaStore_CleanupOnClose(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "meta")
 
-	ms, err := NewMetaStore(storePath)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	ms, err := NewMetaStore(storePath, settings)
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -532,7 +605,7 @@ func TestMetaStore_CleanupOnClose(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	if ms.db != nil || ms.opts != nil || ms.readOpts != nil || ms.writeOpts != nil {
+	if ms.DB != nil || ms.Opts != nil || ms.ReadOpts != nil || ms.WriteOpts != nil {
 		t.Error("Resources not cleaned up after Close()")
 	}
 

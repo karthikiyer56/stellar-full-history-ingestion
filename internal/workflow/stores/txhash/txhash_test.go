@@ -20,14 +20,14 @@ func TestTxHashStorePath(t *testing.T) {
 		{9999, "testdata/active/rocksdb/9999-txhash-store"},
 	}
 
-	settings := &types.RocksDBSettings{
+	settings := &types.TxHashRocksDBSettings{
 		BlockCacheMB:         8,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 4,
 	}
 
 	for _, tt := range tests {
-		store, err := NewTxHashStore("testdata", tt.rangeID, settings)
+		store, err := NewRocksDbTxHashStore("testdata", tt.rangeID, settings)
 		if err != nil {
 			t.Fatalf("NewTxHashStore failed: %v", err)
 		}
@@ -69,13 +69,13 @@ func TestCFRouting(t *testing.T) {
 func TestTxHashStoreWriteAndGet(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	settings := &types.RocksDBSettings{
+	settings := &types.TxHashRocksDBSettings{
 		BlockCacheMB:         8,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 4,
 	}
 
-	store, err := NewTxHashStore(tmpDir, 1, settings)
+	store, err := NewRocksDbTxHashStore(tmpDir, 1, settings)
 	if err != nil {
 		t.Fatalf("NewTxHashStore failed: %v", err)
 	}
@@ -162,13 +162,13 @@ func TestTxHashStoreWriteAndGet(t *testing.T) {
 func TestTxHashStoreIterator(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	settings := &types.RocksDBSettings{
+	settings := &types.TxHashRocksDBSettings{
 		BlockCacheMB:         8,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 4,
 	}
 
-	store, err := NewTxHashStore(tmpDir, 1, settings)
+	store, err := NewRocksDbTxHashStore(tmpDir, 1, settings)
 	if err != nil {
 		t.Fatalf("NewTxHashStore failed: %v", err)
 	}
@@ -232,13 +232,13 @@ func TestTxHashStoreIterator(t *testing.T) {
 func TestTxHashStoreCompactAll(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	settings := &types.RocksDBSettings{
+	settings := &types.TxHashRocksDBSettings{
 		BlockCacheMB:         8,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 4,
 	}
 
-	store, err := NewTxHashStore(tmpDir, 1, settings)
+	store, err := NewRocksDbTxHashStore(tmpDir, 1, settings)
 	if err != nil {
 		t.Fatalf("NewTxHashStore failed: %v", err)
 	}
@@ -295,13 +295,13 @@ func TestTxHashStoreCompactAll(t *testing.T) {
 func TestTxHashStoreClose(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	settings := &types.RocksDBSettings{
+	settings := &types.TxHashRocksDBSettings{
 		BlockCacheMB:         8,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 4,
 	}
 
-	store, err := NewTxHashStore(tmpDir, 1, settings)
+	store, err := NewRocksDbTxHashStore(tmpDir, 1, settings)
 	if err != nil {
 		t.Fatalf("NewTxHashStore failed: %v", err)
 	}

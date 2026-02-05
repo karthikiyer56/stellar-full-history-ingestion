@@ -1,3 +1,29 @@
+// =============================================================================
+// txhash.go - Transaction Hash Store (RocksDB Implementation)
+// =============================================================================
+//
+// PURPOSE:
+//   Maps transaction hashes (32 bytes) to ledger sequence numbers (4 bytes).
+//   Enables fast lookups: "Which ledger contains this transaction?"
+//
+// STORAGE DESIGN:
+//   - Backend: RocksDB with 16 column families (CFs)
+//   - Partitioning: By first hex character of tx hash (high nibble)
+//   - Key: 32-byte transaction hash (raw bytes)
+//   - Value: 4-byte ledger sequence number (big-endian uint32)
+//
+// COLUMN FAMILY PARTITIONING:
+//   - 16 CFs: "0", "1", ..., "9", "a", "b", ..., "f"
+//   - Why 16: Balance between parallelism (good for compaction/RecSplit) and overhead
+//   - Partition by high nibble: SHA-256 hashes are uniformly distributed
+//
+// ITERATOR OPTIMIZATION:
+//   - Custom ReadOptions per iterator (owned, destroyed in Close)
+//   - 2MB readahead: Prefetches data for sequential scans (I/O optimization)
+//   - FillCache=false: Prevents cache pollution during full-table scans
+//
+// =============================================================================
+
 package txhash
 
 import (
@@ -14,14 +40,17 @@ import (
 	"github.com/linxGnu/grocksdb"
 )
 
-type txHashStore struct {
+// RocksDbTxHashStore is a RocksDB-backed implementation of transaction hash storage.
+// It partitions transaction hashes across column families for efficient lookups.
+type RocksDbTxHashStore struct {
 	rocksdb.BaseStore
 	cfHandles map[string]*grocksdb.ColumnFamilyHandle
 	cfOpts    []*grocksdb.Options
 	settings  *types.TxHashRocksDBSettings
 }
 
-func NewTxHashStore(dataDir string, rangeID uint32, settings *types.TxHashRocksDBSettings) (*txHashStore, error) {
+// NewRocksDbTxHashStore creates a new RocksDB-backed transaction hash store.
+func NewRocksDbTxHashStore(dataDir string, rangeID uint32, settings *types.TxHashRocksDBSettings) (*RocksDbTxHashStore, error) {
 	path := filepath.Join(dataDir, "active", "rocksdb", fmt.Sprintf("%04d-txhash-store", rangeID))
 
 	if err := helpers.EnsureDir(path); err != nil {
@@ -37,7 +66,7 @@ func NewTxHashStore(dataDir string, rangeID uint32, settings *types.TxHashRocksD
 		blockCache = grocksdb.NewLRUCache(uint64(settings.BlockCacheMB * 1024 * 1024))
 	}
 
-	return &txHashStore{
+	return &RocksDbTxHashStore{
 		BaseStore: rocksdb.BaseStore{
 			Opts:       opts,
 			BlockCache: blockCache,
@@ -47,7 +76,7 @@ func NewTxHashStore(dataDir string, rangeID uint32, settings *types.TxHashRocksD
 	}, nil
 }
 
-func (s *txHashStore) Open() (time.Duration, error) {
+func (s *RocksDbTxHashStore) Open() (time.Duration, error) {
 	start := time.Now()
 
 	cfNames := []string{"default"}
@@ -109,7 +138,7 @@ func (s *txHashStore) Open() (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-func (s *txHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) error {
+func (s *RocksDbTxHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) error {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
@@ -127,7 +156,7 @@ func (s *txHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) erro
 	return s.DB.Write(s.WriteOpts, batch)
 }
 
-func (s *txHashStore) Get(txHash []byte) (uint32, bool, error) {
+func (s *RocksDbTxHashStore) Get(txHash []byte) (uint32, bool, error) {
 	cfName := cf.GetName(txHash)
 	cfHandle, ok := s.cfHandles[cfName]
 	if !ok {
@@ -152,7 +181,7 @@ func (s *txHashStore) Get(txHash []byte) (uint32, bool, error) {
 	return ledgerSeq, true, nil
 }
 
-func (s *txHashStore) NewScanIteratorCF(cfName string) interfaces.Iterator {
+func (s *RocksDbTxHashStore) NewScanIteratorCF(cfName string) interfaces.Iterator {
 	cfHandle, ok := s.cfHandles[cfName]
 	if !ok {
 		return nil
@@ -163,13 +192,13 @@ func (s *txHashStore) NewScanIteratorCF(cfName string) interfaces.Iterator {
 	scanOpts.SetFillCache(false)
 
 	iter := s.DB.NewIteratorCF(scanOpts, cfHandle)
-	return &txHashIterator{
+	return &RocksDbTxHashStoreIterator{
 		iter:     iter,
 		scanOpts: scanOpts,
 	}
 }
 
-func (s *txHashStore) CompactAll() (map[string]time.Duration, error) {
+func (s *RocksDbTxHashStore) CompactAll() (map[string]time.Duration, error) {
 	results := make(map[string]time.Duration)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -194,15 +223,15 @@ func (s *txHashStore) CompactAll() (map[string]time.Duration, error) {
 	return results, nil
 }
 
-func (s *txHashStore) GetPath() string {
+func (s *RocksDbTxHashStore) GetPath() string {
 	return s.Path
 }
 
-func (s *txHashStore) GetSize() (int64, error) {
+func (s *RocksDbTxHashStore) GetSize() (int64, error) {
 	return helpers.GetDirSize(s.Path), nil
 }
 
-func (s *txHashStore) Close() error {
+func (s *RocksDbTxHashStore) Close() error {
 	for _, cfHandle := range s.cfHandles {
 		if cfHandle != nil {
 			cfHandle.Destroy()
@@ -220,41 +249,43 @@ func (s *txHashStore) Close() error {
 	return s.CloseBase()
 }
 
-type txHashIterator struct {
+// RocksDbTxHashStoreIterator efficiently iterates over transaction hashes in a column family.
+// It uses optimized read settings: 2MB readahead and disabled fill cache for sequential scans.
+type RocksDbTxHashStoreIterator struct {
 	iter     *grocksdb.Iterator
 	scanOpts *grocksdb.ReadOptions
 }
 
-func (it *txHashIterator) SeekToFirst() {
+func (it *RocksDbTxHashStoreIterator) SeekToFirst() {
 	it.iter.SeekToFirst()
 }
 
-func (it *txHashIterator) Valid() bool {
+func (it *RocksDbTxHashStoreIterator) Valid() bool {
 	return it.iter.Valid()
 }
 
-func (it *txHashIterator) Next() {
+func (it *RocksDbTxHashStoreIterator) Next() {
 	it.iter.Next()
 }
 
-func (it *txHashIterator) Key() []byte {
+func (it *RocksDbTxHashStoreIterator) Key() []byte {
 	return it.iter.Key().Data()
 }
 
-func (it *txHashIterator) Value() []byte {
+func (it *RocksDbTxHashStoreIterator) Value() []byte {
 	return it.iter.Value().Data()
 }
 
-func (it *txHashIterator) Error() error {
+func (it *RocksDbTxHashStoreIterator) Error() error {
 	return it.iter.Err()
 }
 
-func (it *txHashIterator) Close() {
+func (it *RocksDbTxHashStoreIterator) Close() {
 	it.iter.Close()
 	if it.scanOpts != nil {
 		it.scanOpts.Destroy()
 	}
 }
 
-var _ interfaces.TxHashStore = (*txHashStore)(nil)
-var _ interfaces.Iterator = (*txHashIterator)(nil)
+var _ interfaces.TxHashStore = (*RocksDbTxHashStore)(nil)
+var _ interfaces.Iterator = (*RocksDbTxHashStoreIterator)(nil)

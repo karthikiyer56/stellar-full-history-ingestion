@@ -20,13 +20,13 @@ func TestRecSplitBuilder_BuildAll_BasicOperation(t *testing.T) {
 	defer logger.Close()
 
 	rocksdbPath := filepath.Join(tmpDir, "rocksdb")
-	settings := types.RocksDBSettings{
+	settings := types.TxHashRocksDBSettings{
 		BlockCacheMB:         64,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 2,
 	}
 
-	store, err := txhash.NewTxHashStore(rocksdbPath, 0, &settings)
+	store, err := txhash.NewRocksDbTxHashStore(rocksdbPath, 0, &settings)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -113,13 +113,13 @@ func TestRecSplitBuilder_BuildAll_PathFormat(t *testing.T) {
 			defer logger.Close()
 
 			rocksdbPath := filepath.Join(tmpDir, "rocksdb")
-			settings := types.RocksDBSettings{
+			settings := types.TxHashRocksDBSettings{
 				BlockCacheMB:         64,
 				WriteBufferMB:        32,
 				MaxWriteBufferNumber: 2,
 			}
 
-			store, err := txhash.NewTxHashStore(rocksdbPath, tt.rangeID, &settings)
+			store, err := txhash.NewRocksDbTxHashStore(rocksdbPath, tt.rangeID, &settings)
 			if err != nil {
 				t.Fatalf("Failed to create store: %v", err)
 			}
@@ -174,13 +174,13 @@ func TestRecSplitBuilder_BuildAll_EmptyCFs(t *testing.T) {
 	defer logger.Close()
 
 	rocksdbPath := filepath.Join(tmpDir, "rocksdb")
-	settings := types.RocksDBSettings{
+	settings := types.TxHashRocksDBSettings{
 		BlockCacheMB:         64,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 2,
 	}
 
-	store, err := txhash.NewTxHashStore(rocksdbPath, 0, &settings)
+	store, err := txhash.NewRocksDbTxHashStore(rocksdbPath, 0, &settings)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
@@ -231,13 +231,13 @@ func TestRecSplitBuilder_BuildAll_ParallelExecution(t *testing.T) {
 	defer logger.Close()
 
 	rocksdbPath := filepath.Join(tmpDir, "rocksdb")
-	settings := types.RocksDBSettings{
+	settings := types.TxHashRocksDBSettings{
 		BlockCacheMB:         64,
 		WriteBufferMB:        32,
 		MaxWriteBufferNumber: 2,
 	}
 
-	store, err := txhash.NewTxHashStore(rocksdbPath, 0, &settings)
+	store, err := txhash.NewRocksDbTxHashStore(rocksdbPath, 0, &settings)
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}

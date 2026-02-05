@@ -191,7 +191,11 @@ func (rb *recsplitBuilder) buildCF(
 	}
 	defer rs.Close()
 
-	// Iterate CF and add keys
+	// Iterate CF and add keys.
+	// Why NewScanIteratorCF? It's optimized for full sequential scans with:
+	//   - 2MB readahead buffer (reduces I/O syscalls)
+	//   - FillCache=false (don't pollute block cache during one-time full scan)
+	// Alternative NewIteratorCF would use default 256KB readahead and fill cache.
 	iter := store.NewScanIteratorCF(cfName)
 	defer iter.Close()
 

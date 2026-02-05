@@ -74,7 +74,10 @@ type lfsWriter struct {
 // NewLFSWriter creates a new LFS chunk writer.
 // dataDir: base directory for LFS storage (typically <data_dir>/immutable/lfs)
 func NewLFSWriter(dataDir string, log interfaces.Logger) (interfaces.LFSWriter, error) {
-	// Create zstd encoder (reused across all chunks)
+	// Create zstd encoder (reused across all chunks).
+	// Why zstd? Best balance between compression ratio (~3-4x) and speed (~200-300 MB/s).
+	// Alternatives: gzip (slower), snappy (lower ratio), lz4 (lower ratio).
+	// Zstd level 3 (default) provides excellent compression without excessive CPU usage.
 	encoder, err := zstd.NewWriter(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
@@ -100,7 +103,7 @@ func NewLFSWriter(dataDir string, log interfaces.Logger) (interfaces.LFSWriter, 
 //   - Scenario A: Fresh start (lastWritten == -1) → startChunk = firstChunk
 //   - Scenario B: Crashed after chunk 0 (lastWritten == 0) → startChunk = 1
 //   - Scenario C: Crashed after chunk N (lastWritten == N) → startChunk = N+1
-func (lfs *lfsWriter) WriteRange(rangeID uint32, lcmStore interfaces.LCMStore, metaStore interfaces.MetaStore) error {
+func (lfs *lfsWriter) WriteRange(rangeID uint32, lcmStore interfaces.LedgerStore, metaStore interfaces.MetaStore) error {
 	// Calculate chunk range for this 10M ledger range
 	firstChunk := rangeID * ChunksPerRange       // e.g., Range 0 → chunk 0
 	lastChunk := firstChunk + ChunksPerRange - 1 // e.g., Range 0 → chunk 999
@@ -178,7 +181,7 @@ func (lfs *lfsWriter) WriteRange(rangeID uint32, lcmStore interfaces.LCMStore, m
 //  3. For each ledger: read from LCM store, compress, write, track offset
 //  4. Flush data file
 //  5. Write index file in single write
-func (lfs *lfsWriter) writeChunk(chunkID uint32, lcmStore interfaces.LCMStore) error {
+func (lfs *lfsWriter) writeChunk(chunkID uint32, lcmStore interfaces.LedgerStore) error {
 	// Calculate ledger range for this chunk
 	firstLedger := lfs.chunkFirstLedger(chunkID)
 	lastLedger := lfs.chunkLastLedger(chunkID)

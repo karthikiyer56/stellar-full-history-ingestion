@@ -179,7 +179,7 @@ func (i *Ingester) Run() error {
 	i.log.Info("")
 
 	// Create LFS iterator
-	iterator, err := lfs.NewLedgerIterator(
+	iterator, err := lfs.NewLFSLedgerIterator(
 		i.config.LFSStorePath,
 		i.config.StartLedger,
 		i.config.EndLedger,

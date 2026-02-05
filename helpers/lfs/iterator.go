@@ -14,8 +14,8 @@ import (
 // Timing Structures
 // =============================================================================
 
-// LedgerTiming holds granular timing for reading a single ledger.
-type LedgerTiming struct {
+// LFSLedgerTiming holds granular timing for reading a single ledger from LFS store.
+type LFSLedgerTiming struct {
 	IndexLookupTime time.Duration // Time to read offsets from index file
 	DataReadTime    time.Duration // Time to read compressed data from data file
 	DecompressTime  time.Duration // Time to decompress
@@ -27,10 +27,10 @@ type LedgerTiming struct {
 // Ledger Iterator
 // =============================================================================
 
-// LedgerIterator efficiently iterates over a range of ledgers,
+// LFSLedgerIterator efficiently iterates over a range of ledgers from LFS store,
 // minimizing file I/O by keeping chunk files open while reading
 // ledgers from the same chunk.
-type LedgerIterator struct {
+type LFSLedgerIterator struct {
 	dataDir    string
 	startSeq   uint32
 	endSeq     uint32
@@ -49,14 +49,14 @@ type LedgerIterator struct {
 	decoder *zstd.Decoder
 }
 
-// NewLedgerIterator creates a new iterator for the given range.
-func NewLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LedgerIterator, error) {
+// NewLFSLedgerIterator creates a new iterator for the given range.
+func NewLFSLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LFSLedgerIterator, error) {
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 	}
 
-	return &LedgerIterator{
+	return &LFSLedgerIterator{
 		dataDir:        dataDir,
 		startSeq:       startSeq,
 		endSeq:         endSeq,
@@ -70,9 +70,9 @@ func NewLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LedgerIterator
 // Returns (lcm, ledgerSeq, timing, true, nil) for each ledger.
 // Returns (empty, 0, timing, false, nil) when iteration is complete.
 // Returns (empty, seq, timing, false, err) on error.
-func (it *LedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, LedgerTiming, bool, error) {
+func (it *LFSLedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, LFSLedgerTiming, bool, error) {
 	var lcm xdr.LedgerCloseMeta
-	var timing LedgerTiming
+	var timing LFSLedgerTiming
 	totalStart := time.Now()
 
 	if it.currentSeq > it.endSeq {
@@ -127,7 +127,7 @@ func (it *LedgerIterator) Next() (xdr.LedgerCloseMeta, uint32, LedgerTiming, boo
 }
 
 // loadChunk loads a new chunk's index and opens its data file.
-func (it *LedgerIterator) loadChunk(chunkID uint32) error {
+func (it *LFSLedgerIterator) loadChunk(chunkID uint32) error {
 	// Close previous chunk files if open
 	it.closeChunkFiles()
 
@@ -197,7 +197,7 @@ func (it *LedgerIterator) loadChunk(chunkID uint32) error {
 }
 
 // closeChunkFiles closes the current chunk's files.
-func (it *LedgerIterator) closeChunkFiles() {
+func (it *LFSLedgerIterator) closeChunkFiles() {
 	if it.indexFile != nil {
 		it.indexFile.Close()
 		it.indexFile = nil
@@ -210,7 +210,7 @@ func (it *LedgerIterator) closeChunkFiles() {
 }
 
 // Close closes the iterator and releases resources.
-func (it *LedgerIterator) Close() {
+func (it *LFSLedgerIterator) Close() {
 	it.closeChunkFiles()
 	if it.decoder != nil {
 		it.decoder.Close()
@@ -219,12 +219,12 @@ func (it *LedgerIterator) Close() {
 }
 
 // CurrentSequence returns the current ledger sequence (next to be read).
-func (it *LedgerIterator) CurrentSequence() uint32 {
+func (it *LFSLedgerIterator) CurrentSequence() uint32 {
 	return it.currentSeq
 }
 
 // Progress returns the progress as a fraction (0.0 to 1.0).
-func (it *LedgerIterator) Progress() float64 {
+func (it *LFSLedgerIterator) Progress() float64 {
 	total := float64(it.endSeq - it.startSeq + 1)
 	done := float64(it.currentSeq - it.startSeq)
 	if total <= 0 {
@@ -252,7 +252,7 @@ type RawLedgerData struct {
 //
 // USAGE:
 //
-//	iterator, err := NewRawLedgerIterator(dataDir, startSeq, endSeq)
+//	iterator, err := NewLFSRawLedgerIterator(dataDir, startSeq, endSeq)
 //	if err != nil { ... }
 //	defer iterator.Close()
 //
@@ -267,7 +267,7 @@ type RawLedgerData struct {
 //
 //	RawLedgerIterator is NOT thread-safe. Each goroutine should have
 //	its own iterator instance for a non-overlapping range of ledgers.
-type RawLedgerIterator struct {
+type LFSRawLedgerIterator struct {
 	dataDir    string
 	startSeq   uint32
 	endSeq     uint32
@@ -281,13 +281,13 @@ type RawLedgerIterator struct {
 	offsetSize     uint8
 }
 
-// NewRawLedgerIterator creates a new iterator for reading raw compressed
+// NewLFSRawLedgerIterator creates a new iterator for reading raw compressed
 // ledger data from the given range.
 //
-// Unlike LedgerIterator, this does NOT decompress or unmarshal the data.
+// Unlike LFSLedgerIterator, this does NOT decompress or unmarshal the data.
 // It returns raw zstd-compressed bytes for processing by workers.
-func NewRawLedgerIterator(dataDir string, startSeq, endSeq uint32) (*RawLedgerIterator, error) {
-	return &RawLedgerIterator{
+func NewLFSRawLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LFSRawLedgerIterator, error) {
+	return &LFSRawLedgerIterator{
 		dataDir:        dataDir,
 		startSeq:       startSeq,
 		endSeq:         endSeq,
@@ -305,7 +305,7 @@ func NewRawLedgerIterator(dataDir string, startSeq, endSeq uint32) (*RawLedgerIt
 //
 // The CompressedData field contains raw zstd-compressed bytes that must
 // be decompressed before unmarshaling to xdr.LedgerCloseMeta.
-func (it *RawLedgerIterator) Next() (RawLedgerData, bool, error) {
+func (it *LFSRawLedgerIterator) Next() (RawLedgerData, bool, error) {
 	var data RawLedgerData
 	readStart := time.Now()
 
@@ -344,7 +344,7 @@ func (it *RawLedgerIterator) Next() (RawLedgerData, bool, error) {
 }
 
 // loadChunk loads a new chunk's index and opens its data file.
-func (it *RawLedgerIterator) loadChunk(chunkID uint32) error {
+func (it *LFSRawLedgerIterator) loadChunk(chunkID uint32) error {
 	// Close previous chunk files if open
 	it.closeChunkFiles()
 
@@ -412,7 +412,7 @@ func (it *RawLedgerIterator) loadChunk(chunkID uint32) error {
 }
 
 // closeChunkFiles closes the current chunk's files.
-func (it *RawLedgerIterator) closeChunkFiles() {
+func (it *LFSRawLedgerIterator) closeChunkFiles() {
 	if it.indexFile != nil {
 		it.indexFile.Close()
 		it.indexFile = nil
@@ -425,17 +425,17 @@ func (it *RawLedgerIterator) closeChunkFiles() {
 }
 
 // Close closes the iterator and releases resources.
-func (it *RawLedgerIterator) Close() {
+func (it *LFSRawLedgerIterator) Close() {
 	it.closeChunkFiles()
 }
 
 // CurrentSequence returns the current ledger sequence (next to be read).
-func (it *RawLedgerIterator) CurrentSequence() uint32 {
+func (it *LFSRawLedgerIterator) CurrentSequence() uint32 {
 	return it.currentSeq
 }
 
 // Progress returns the progress as a fraction (0.0 to 1.0).
-func (it *RawLedgerIterator) Progress() float64 {
+func (it *LFSRawLedgerIterator) Progress() float64 {
 	total := float64(it.endSeq - it.startSeq + 1)
 	done := float64(it.currentSeq - it.startSeq)
 	if total <= 0 {

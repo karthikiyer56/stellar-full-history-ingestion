@@ -27,8 +27,8 @@ func TestLCMStorePath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.expectedPath, func(t *testing.T) {
-			settings := &types.RocksDBSettings{}
-			store, err := NewLCMStore(tmpDir, tt.rangeID, settings)
+			settings := &types.LedgerRocksDBSettings{}
+			store, err := NewRocksDbLedgerStore(tmpDir, tt.rangeID, settings)
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.expectedPath, store.GetPath())
@@ -45,12 +45,12 @@ func TestLCMStoreWriteBatchAndGet(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	settings := &types.RocksDBSettings{
+	settings := &types.LedgerRocksDBSettings{
 		BlockCacheMB:         8,
 		WriteBufferMB:        4,
 		MaxWriteBufferNumber: 2,
 	}
-	store, err := NewLCMStore(tmpDir, 0, settings)
+	store, err := NewRocksDbLedgerStore(tmpDir, 0, settings)
 	require.NoError(t, err)
 
 	openDuration, err := store.Open()
@@ -87,8 +87,8 @@ func TestLCMStoreIterator(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	settings := &types.RocksDBSettings{}
-	store, err := NewLCMStore(tmpDir, 0, settings)
+	settings := &types.LedgerRocksDBSettings{}
+	store, err := NewRocksDbLedgerStore(tmpDir, 0, settings)
 	require.NoError(t, err)
 
 	_, err = store.Open()
@@ -122,8 +122,8 @@ func TestLCMStoreCompact(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	settings := &types.RocksDBSettings{}
-	store, err := NewLCMStore(tmpDir, 0, settings)
+	settings := &types.LedgerRocksDBSettings{}
+	store, err := NewRocksDbLedgerStore(tmpDir, 0, settings)
 	require.NoError(t, err)
 
 	_, err = store.Open()
@@ -151,8 +151,8 @@ func TestLCMStoreGetSize(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	settings := &types.RocksDBSettings{}
-	store, err := NewLCMStore(tmpDir, 0, settings)
+	settings := &types.LedgerRocksDBSettings{}
+	store, err := NewRocksDbLedgerStore(tmpDir, 0, settings)
 	require.NoError(t, err)
 
 	_, err = store.Open()
@@ -176,8 +176,8 @@ func TestLCMStoreClose(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	settings := &types.RocksDBSettings{}
-	store, err := NewLCMStore(tmpDir, 0, settings)
+	settings := &types.LedgerRocksDBSettings{}
+	store, err := NewRocksDbLedgerStore(tmpDir, 0, settings)
 	require.NoError(t, err)
 
 	_, err = store.Open()

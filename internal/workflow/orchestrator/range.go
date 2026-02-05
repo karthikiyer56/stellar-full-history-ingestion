@@ -1,3 +1,24 @@
+// =============================================================================
+// range.go - Range Orchestrator (Single 10M Ledger Range)
+// =============================================================================
+//
+// Manages ingestion and transition for a single ledger range (typically 10M ledgers).
+//
+// STATE MACHINE:
+//   PENDING → INGESTING → TRANSITIONING → COMPLETE
+//
+// KEY RESPONSIBILITIES:
+//   - Ingestion: Fetch ledgers from backend, extract transactions, store in RocksDB
+//   - Checkpointing: Track progress every N ledgers for crash recovery
+//   - Transition: Trigger compaction and conversion to immutable formats (LFS, RecSplit)
+//
+// CRASH RECOVERY:
+//   - Reads last committed ledger from meta store on restart
+//   - Resumes from resumeFrom = max(lastLedgerLCM, lastLedgerTxHash) + 1
+//   - Uses fallthrough in state machine to continue where it left off
+//
+// =============================================================================
+
 package orchestrator
 
 import (
@@ -16,11 +37,15 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
+// =============================================================================
+// Range Orchestrator Type
+// =============================================================================
+
 type rangeOrchestrator struct {
 	rangeID           uint32
 	backend           ledgerbackend.LedgerBackend
 	metaStore         interfaces.MetaStore
-	lcmStore          interfaces.LCMStore
+	lcmStore          interfaces.LedgerStore
 	txStore           interfaces.TxHashStore
 	config            *config.Config
 	log               interfaces.Logger
@@ -34,7 +59,7 @@ func NewRangeOrchestrator(
 	rangeID uint32,
 	backend ledgerbackend.LedgerBackend,
 	metaStore interfaces.MetaStore,
-	lcmStore interfaces.LCMStore,
+	lcmStore interfaces.LedgerStore,
 	txStore interfaces.TxHashStore,
 	config *config.Config,
 	log interfaces.Logger,
@@ -78,6 +103,13 @@ func NewRangeOrchestrator(
 	}
 }
 
+// =============================================================================
+// State Machine Execution (Run)
+// =============================================================================
+
+// Run executes the state machine for this range. Uses fallthrough to continue
+// execution across states after transitions, enabling crash recovery to resume
+// from the exact state where it left off.
 func (ro *rangeOrchestrator) Run(ctx context.Context) error {
 	rangeState, err := ro.metaStore.GetRangeState(ro.rangeID)
 	if err != nil {
@@ -98,6 +130,8 @@ func (ro *rangeOrchestrator) Run(ctx context.Context) error {
 			return fmt.Errorf("failed to initialize sub-phases: %w", err)
 		}
 		ro.state = interfaces.RangeStateIngesting
+		// fallthrough: Continue immediately to ingestion without returning.
+		// This enables a fresh range to start ingestion in the same Run() call.
 		fallthrough
 
 	case interfaces.RangeStateIngesting:
@@ -111,6 +145,7 @@ func (ro *rangeOrchestrator) Run(ctx context.Context) error {
 			return fmt.Errorf("failed to transition range state: %w", err)
 		}
 		ro.refreshState()
+		// fallthrough: Continue to transitioning phase immediately after ingestion completes.
 		fallthrough
 
 	case interfaces.RangeStateTransitioning:
@@ -129,6 +164,10 @@ func (ro *rangeOrchestrator) Run(ctx context.Context) error {
 	return nil
 }
 
+// =============================================================================
+// Public Getters
+// =============================================================================
+
 func (ro *rangeOrchestrator) GetRangeID() uint32 {
 	return ro.rangeID
 }
@@ -140,6 +179,15 @@ func (ro *rangeOrchestrator) GetState() string {
 	return ro.state
 }
 
+// =============================================================================
+// Ingestion Phase
+// =============================================================================
+
+// runIngestion processes all ledgers in this range, extracting transaction hashes
+// and storing both ledger data and tx mappings. Implements crash recovery by:
+//  1. Reading last committed ledger from meta store
+//  2. Calculating resumeFrom = min(lastLedgerLCM, lastLedgerTxHash) + 1
+//  3. Checkpointing progress every N ledgers (default 1000)
 func (ro *rangeOrchestrator) runIngestion(ctx context.Context) error {
 	lastLedgerLCM, err := ro.metaStore.GetLastCommittedLedger(ro.rangeID, "ledger")
 	if err != nil {
@@ -150,6 +198,8 @@ func (ro *rangeOrchestrator) runIngestion(ctx context.Context) error {
 		return fmt.Errorf("failed to get last committed ledger (txhash): %w", err)
 	}
 
+	// Crash recovery: Resume from the minimum of both stores + 1.
+	// This ensures both stores stay in sync even if one crashes during a checkpoint.
 	resumeFrom := helpers.MinUint32(lastLedgerLCM, lastLedgerTxHash) + 1
 	if resumeFrom < ro.startLedger {
 		resumeFrom = ro.startLedger
@@ -243,6 +293,10 @@ func (ro *rangeOrchestrator) runIngestion(ctx context.Context) error {
 	return nil
 }
 
+// =============================================================================
+// Transition Phase
+// =============================================================================
+
 func (ro *rangeOrchestrator) runTransition(ctx context.Context) error {
 	ro.log.Info("Range %d: transition phase (compaction, LFS, RecSplit)", ro.rangeID)
 
@@ -265,6 +319,13 @@ func (ro *rangeOrchestrator) runTransition(ctx context.Context) error {
 	return nil
 }
 
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+// ensureIngestingSubPhases initializes ledger and txhash sub-phase tracking
+// if not already set. Called when entering INGESTING state to ensure phase
+// metadata exists for progress tracking.
 func (ro *rangeOrchestrator) ensureIngestingSubPhases() error {
 	ledgerPhase, err := ro.metaStore.GetLedgerPhase(ro.rangeID)
 	if err != nil {
@@ -299,6 +360,9 @@ func (ro *rangeOrchestrator) refreshState() {
 	}
 }
 
+// flushAndCheckpoint atomically writes batches to both stores and commits
+// the checkpoint to meta store. This ensures crash recovery can resume from
+// the exact ledger where the checkpoint occurred.
 func (ro *rangeOrchestrator) flushAndCheckpoint(
 	ledgerSeq uint32,
 	lcmBatch map[uint32][]byte,

@@ -1,3 +1,27 @@
+// =============================================================================
+// cf.go - Column Family Partitioning for TxHash Store
+// =============================================================================
+//
+// DESIGN: Partition transaction hashes across 16 column families based on
+// the first hex character (high nibble) of the hash.
+//
+// WHY 16 COLUMN FAMILIES:
+//   - Parallelism: Enables concurrent compaction and RecSplit building
+//   - Overhead: Not too many (like 256) to avoid excessive file handles
+//   - Balance: 16 is the sweet spot for both parallelism and overhead
+//
+// WHY PARTITION BY HIGH NIBBLE:
+//   - Transaction hashes are SHA-256 (uniformly distributed)
+//   - High nibble (first hex char) gives uniform distribution across 16 CFs
+//   - Each CF gets ~1/16 of total data (balanced load)
+//
+// USAGE:
+//   - Ingestion: Router determines which CF to write to (GetName)
+//   - RecSplit: Builds index per CF in parallel
+//   - Lookup: Router determines which CF to query
+//
+// =============================================================================
+
 package cf
 
 // Names contains the names of all 16 column families.

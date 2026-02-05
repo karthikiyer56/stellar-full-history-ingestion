@@ -503,7 +503,7 @@ func (pi *ParallelIngester) reader(id int, startSeq, endSeq uint32, errChan chan
 	defer pi.readerWg.Done()
 
 	// Use RawLedgerIterator - only reads compressed bytes, no decompression
-	iterator, err := lfs.NewRawLedgerIterator(pi.config.LFSStorePath, startSeq, endSeq)
+	iterator, err := lfs.NewLFSRawLedgerIterator(pi.config.LFSStorePath, startSeq, endSeq)
 	if err != nil {
 		select {
 		case errChan <- fmt.Errorf("reader %d: failed to create iterator: %w", id, err):

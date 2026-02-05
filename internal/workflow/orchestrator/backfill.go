@@ -1,3 +1,29 @@
+// =============================================================================
+// backfill.go - Backfill Coordinator (Parallel Range Management)
+// =============================================================================
+//
+// Manages parallel ingestion across multiple 10M ledger ranges. Acts as the
+// top-level orchestrator for the entire backfill operation.
+//
+// PARALLELISM:
+//   - Runs up to N ranges concurrently (configured via ParallelRanges)
+//   - Uses channel-based semaphore (activeRanges) to limit concurrency
+//   - Each range is independent with its own backend and stores
+//
+// LIFECYCLE PER RANGE:
+//   1. Create ledger backend (captive-core or buffered-storage)
+//   2. Create RocksDB stores (ledger + txhash)
+//   3. Create transition components (LFS writer, RecSplit builder)
+//   4. Run range orchestrator (ingestion → transition)
+//   5. Close all resources (defer cleanup)
+//
+// ERROR HANDLING:
+//   - Collects errors from all ranges (doesn't fail-fast)
+//   - Reports total failure count at end
+//   - Allows partial success (some ranges complete, others fail)
+//
+// =============================================================================
+
 package orchestrator
 
 import (
@@ -17,9 +43,18 @@ import (
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
+// =============================================================================
+// Backend Factory
+// =============================================================================
+
 // BackendFactory creates a LedgerBackend for a given range.
+// Each range gets its own backend for isolation and parallel processing.
 // Includes context for GCS initialization.
 type BackendFactory func(ctx context.Context, rangeID uint32) (ledgerbackend.LedgerBackend, error)
+
+// =============================================================================
+// Backfill Coordinator Type
+// =============================================================================
 
 type backfillCoordinator struct {
 	config         *config.Config
@@ -27,6 +62,10 @@ type backfillCoordinator struct {
 	logger         interfaces.Logger
 	backendFactory BackendFactory
 }
+
+// =============================================================================
+// Constructor
+// =============================================================================
 
 func NewBackfillCoordinator(
 	cfg *config.Config,
@@ -55,7 +94,12 @@ func (bc *backfillCoordinator) SetBackendFactory(f BackendFactory) {
 	bc.backendFactory = f
 }
 
-// Run executes the backfill workflow for all ranges.
+// =============================================================================
+// Parallel Range Execution (Run)
+// =============================================================================
+
+// Run executes the backfill workflow for all ranges in parallel.
+// Uses channel-based concurrency limiting (activeRanges semaphore pattern).
 func (bc *backfillCoordinator) Run(ctx context.Context) error {
 	totalRanges := bc.config.CalculateRangeCount()
 	parallelRanges := bc.config.Backfill.ParallelRanges
@@ -65,21 +109,25 @@ func (bc *backfillCoordinator) Run(ctx context.Context) error {
 
 	bc.logger.Info("Starting backfill for %d ranges (parallel=%d)", totalRanges, parallelRanges)
 
+	// Concurrency limiting: Channel acts as semaphore with capacity = parallelRanges.
+	// Each goroutine takes a slot (send), processes range, then releases slot (receive).
 	activeRanges := make(chan struct{}, parallelRanges)
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	errCount := 0
 
 	for rangeID := uint32(0); rangeID < totalRanges; rangeID++ {
-		activeRanges <- struct{}{}
+		activeRanges <- struct{}{} // Block if parallelRanges limit reached
 		wg.Add(1)
 
 		go func(id uint32) {
 			defer func() {
-				<-activeRanges
+				<-activeRanges // Release semaphore slot
 				wg.Done()
 			}()
 
+			// Error aggregation: Don't fail-fast, collect all errors.
+			// Allows partial success (some ranges complete even if others fail).
 			if err := bc.processRange(ctx, id); err != nil {
 				bc.logger.Error("Range %d: failed: %v", id, err)
 				errMu.Lock()
@@ -99,7 +147,16 @@ func (bc *backfillCoordinator) Run(ctx context.Context) error {
 	return nil
 }
 
-// processRange handles the complete lifecycle for a single range.
+// =============================================================================
+// Per-Range Lifecycle (processRange)
+// =============================================================================
+
+// processRange handles the complete lifecycle for a single range:
+//  1. Create backend (why not shared: each range needs independent ledger access)
+//  2. Create stores (LedgerStore, TxHashStore)
+//  3. Create transition components (LFS writer, RecSplit builder)
+//  4. Run range orchestrator
+//  5. Clean up resources (deferred)
 func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32) error {
 	bc.logger.Info("Range %d: starting", rangeID)
 
@@ -110,7 +167,7 @@ func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32)
 	defer rangeBackend.Close()
 
 	settings := ledgerRocksDBSettings(bc.config)
-	lcmStore, err := lcm.NewLCMStore(bc.config.Service.DataDir, rangeID, settings)
+	lcmStore, err := lcm.NewRocksDbLedgerStore(bc.config.Service.DataDir, rangeID, settings)
 	if err != nil {
 		return fmt.Errorf("failed to create LCM store: %w", err)
 	}
@@ -120,7 +177,7 @@ func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32)
 		return fmt.Errorf("failed to open LCM store: %w", err)
 	}
 
-	txStore, err := txhash.NewTxHashStore(bc.config.Service.DataDir, rangeID, txHashRocksDBSettings(bc.config))
+	txStore, err := txhash.NewRocksDbTxHashStore(bc.config.Service.DataDir, rangeID, txHashRocksDBSettings(bc.config))
 	if err != nil {
 		return fmt.Errorf("failed to create TxHash store: %w", err)
 	}
@@ -179,8 +236,12 @@ func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32)
 	return nil
 }
 
-// createBackendForRange creates a new GCS backend for a specific range.
-// Each range gets its own backend instance.
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+// createBackendForRange creates a new backend for a specific range.
+// Why not shared: Each range needs independent ledger access for parallel processing.
 func (bc *backfillCoordinator) createBackendForRange(ctx context.Context, rangeID uint32) (ledgerbackend.LedgerBackend, error) {
 	if bc.backendFactory != nil {
 		return bc.backendFactory(ctx, rangeID)
@@ -188,6 +249,8 @@ func (bc *backfillCoordinator) createBackendForRange(ctx context.Context, rangeI
 
 	return backend.NewGCSBackend(ctx, &bc.config.Backfill.BufferedStorage)
 }
+
+// Settings converters: Transform generic config settings into store-specific types.
 
 func ledgerRocksDBSettings(cfg *config.Config) *types.LedgerRocksDBSettings {
 	return &types.LedgerRocksDBSettings{

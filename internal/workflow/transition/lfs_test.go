@@ -10,6 +10,7 @@ import (
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/logging"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/meta"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 // =============================================================================
@@ -77,7 +78,13 @@ func TestLFSWriter_FreshStart(t *testing.T) {
 	log := logging.NewTestLogger()
 	defer log.Sync()
 
-	metaStore, err := meta.NewMetaStore(metaDir)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	metaStore, err := meta.NewMetaStore(metaDir, settings)
 	if err != nil {
 		t.Fatalf("failed to create meta store: %v", err)
 	}
@@ -146,7 +153,13 @@ func TestLFSWriter_ResumeFromCrash(t *testing.T) {
 	log := logging.NewTestLogger()
 	defer log.Sync()
 
-	metaStore, err := meta.NewMetaStore(metaDir)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	metaStore, err := meta.NewMetaStore(metaDir, settings)
 	if err != nil {
 		t.Fatalf("failed to create meta store: %v", err)
 	}
@@ -206,7 +219,13 @@ func TestLFSWriter_SentinelValue(t *testing.T) {
 	tmpDir := t.TempDir()
 	metaDir := filepath.Join(tmpDir, "meta")
 
-	metaStore, err := meta.NewMetaStore(metaDir)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	metaStore, err := meta.NewMetaStore(metaDir, settings)
 	if err != nil {
 		t.Fatalf("failed to create meta store: %v", err)
 	}
@@ -259,7 +278,13 @@ func TestLFSWriter_PhaseTransitions(t *testing.T) {
 	log := logging.NewTestLogger()
 	defer log.Sync()
 
-	metaStore, err := meta.NewMetaStore(metaDir)
+	settings := &types.MetaRocksDBSettings{
+		WriteBufferMB:        64,
+		MaxWriteBufferNumber: 2,
+		TargetFileSizeMB:     64,
+		BlockCacheMB:         128,
+	}
+	metaStore, err := meta.NewMetaStore(metaDir, settings)
 	if err != nil {
 		t.Fatalf("failed to create meta store: %v", err)
 	}

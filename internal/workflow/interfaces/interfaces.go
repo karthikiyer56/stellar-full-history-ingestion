@@ -27,6 +27,16 @@ const (
 	TxHashPhaseComplete         = "COMPLETE"
 )
 
+/*
+	Each of the 3 rocksdb stores has its own interface here.
+	Implementations are in internal/workflow/stores/...
+
+	This design choice of having separate interfaces for the 3 stores, as opposed to a single "type Rocksdb interface"
+	is deliberate since each store has different methods and responsibilities, but more importantly, the key value types are different,
+	and so are the access patterns. Trying to unify them into a single interface would lead to awkward method signatures
+	We want to avoid a "one size fits all" interface that ends up being a leaky abstraction.
+*/
+
 // MetaStore tracks workflow state and checkpoints (two-level phase tracking)
 type MetaStore interface {
 	// Range-level state management
@@ -73,8 +83,8 @@ type MetaStore interface {
 	Close() error
 }
 
-// LCMStore stores ledger data in RocksDB
-type LCMStore interface {
+// LedgerStore stores ledger data in RocksDB
+type LedgerStore interface {
 	Open() (openDuration time.Duration, err error)
 	WriteBatch(entries map[uint32][]byte) error
 	Get(ledgerSeq uint32) ([]byte, error)
@@ -97,9 +107,9 @@ type TxHashStore interface {
 	Close() error
 }
 
-// LFSWriter writes LFS chunks from LCMStore
+// LFSWriter writes LFS chunks from LedgerStore
 type LFSWriter interface {
-	WriteRange(rangeID uint32, lcmStore LCMStore, metaStore MetaStore) error
+	WriteRange(rangeID uint32, lcmStore LedgerStore, metaStore MetaStore) error
 	Close() error
 }
 

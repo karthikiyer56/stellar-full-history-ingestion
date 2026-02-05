@@ -12,11 +12,14 @@ import (
 	"github.com/linxGnu/grocksdb"
 )
 
-type lcmStore struct {
+// RocksDbLedgerStore is a RocksDB-backed implementation of LedgerStore interface.
+// It stores serialized LCM (Ledger Close Meta) data indexed by ledger sequence number.
+type RocksDbLedgerStore struct {
 	rocksdb.BaseStore
 }
 
-func NewLCMStore(dataDir string, rangeID uint32, settings *types.LedgerRocksDBSettings) (*lcmStore, error) {
+// NewRocksDbLedgerStore creates a new RocksDB ledger store for the given range.
+func NewRocksDbLedgerStore(dataDir string, rangeID uint32, settings *types.LedgerRocksDBSettings) (*RocksDbLedgerStore, error) {
 	path := filepath.Join(dataDir, "active", "rocksdb", fmt.Sprintf("%04d-ledger-store", rangeID))
 
 	if err := helpers.EnsureDir(path); err != nil {
@@ -47,7 +50,7 @@ func NewLCMStore(dataDir string, rangeID uint32, settings *types.LedgerRocksDBSe
 		opts.SetTargetFileSizeBase(uint64(settings.TargetFileSizeMB * 1024 * 1024))
 	}
 
-	return &lcmStore{
+	return &RocksDbLedgerStore{
 		BaseStore: rocksdb.BaseStore{
 			Opts:       opts,
 			BlockCache: blockCache,
@@ -56,7 +59,7 @@ func NewLCMStore(dataDir string, rangeID uint32, settings *types.LedgerRocksDBSe
 	}, nil
 }
 
-func (s *lcmStore) Open() (time.Duration, error) {
+func (s *RocksDbLedgerStore) Open() (time.Duration, error) {
 	start := time.Now()
 
 	db, err := grocksdb.OpenDb(s.Opts, s.Path)
@@ -72,7 +75,7 @@ func (s *lcmStore) Open() (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-func (s *lcmStore) WriteBatch(entries map[uint32][]byte) error {
+func (s *RocksDbLedgerStore) WriteBatch(entries map[uint32][]byte) error {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
@@ -84,7 +87,7 @@ func (s *lcmStore) WriteBatch(entries map[uint32][]byte) error {
 	return s.DB.Write(s.WriteOpts, batch)
 }
 
-func (s *lcmStore) Get(ledgerSeq uint32) ([]byte, error) {
+func (s *RocksDbLedgerStore) Get(ledgerSeq uint32) ([]byte, error) {
 	key := helpers.Uint32ToBytes(ledgerSeq)
 
 	slice, err := s.DB.Get(s.ReadOpts, key)
@@ -102,60 +105,71 @@ func (s *lcmStore) Get(ledgerSeq uint32) ([]byte, error) {
 	return value, nil
 }
 
-func (s *lcmStore) NewIterator() interfaces.Iterator {
-	iter := s.DB.NewIterator(s.ReadOpts)
-	return &lcmIterator{iter: iter}
+func (s *RocksDbLedgerStore) NewIterator() interfaces.Iterator {
+	readOpts := grocksdb.NewDefaultReadOptions()
+	readOpts.SetReadaheadSize(2 * 1024 * 1024) // 2MB prefetch for sequential scans
+	readOpts.SetFillCache(false)               // Don't pollute block cache during iteration
+
+	iter := s.DB.NewIterator(readOpts)
+	return &RocksDbLedgerStoreIterator{iter: iter, readOpts: readOpts}
 }
 
-func (s *lcmStore) Compact() (time.Duration, error) {
+func (s *RocksDbLedgerStore) Compact() (time.Duration, error) {
 	start := time.Now()
 	s.DB.CompactRange(grocksdb.Range{})
 	return time.Since(start), nil
 }
 
-func (s *lcmStore) GetPath() string {
+func (s *RocksDbLedgerStore) GetPath() string {
 	return s.Path
 }
 
-func (s *lcmStore) GetSize() (int64, error) {
+func (s *RocksDbLedgerStore) GetSize() (int64, error) {
 	return helpers.GetDirSize(s.Path), nil
 }
 
-func (s *lcmStore) Close() error {
+func (s *RocksDbLedgerStore) Close() error {
 	return s.CloseBase()
 }
 
-type lcmIterator struct {
-	iter *grocksdb.Iterator
+// RocksDbLedgerStoreIterator provides optimized sequential iteration over ledgers.
+// It uses 2MB readahead and disables block cache insertion to improve throughput
+// for full-range scans without affecting point lookup performance.
+type RocksDbLedgerStoreIterator struct {
+	iter     *grocksdb.Iterator
+	readOpts *grocksdb.ReadOptions
 }
 
-func (it *lcmIterator) SeekToFirst() {
+func (it *RocksDbLedgerStoreIterator) SeekToFirst() {
 	it.iter.SeekToFirst()
 }
 
-func (it *lcmIterator) Valid() bool {
+func (it *RocksDbLedgerStoreIterator) Valid() bool {
 	return it.iter.Valid()
 }
 
-func (it *lcmIterator) Next() {
+func (it *RocksDbLedgerStoreIterator) Next() {
 	it.iter.Next()
 }
 
-func (it *lcmIterator) Key() []byte {
+func (it *RocksDbLedgerStoreIterator) Key() []byte {
 	return it.iter.Key().Data()
 }
 
-func (it *lcmIterator) Value() []byte {
+func (it *RocksDbLedgerStoreIterator) Value() []byte {
 	return it.iter.Value().Data()
 }
 
-func (it *lcmIterator) Error() error {
+func (it *RocksDbLedgerStoreIterator) Error() error {
 	return it.iter.Err()
 }
 
-func (it *lcmIterator) Close() {
+func (it *RocksDbLedgerStoreIterator) Close() {
 	it.iter.Close()
+	if it.readOpts != nil {
+		it.readOpts.Destroy()
+	}
 }
 
-var _ interfaces.LCMStore = (*lcmStore)(nil)
-var _ interfaces.Iterator = (*lcmIterator)(nil)
+var _ interfaces.LedgerStore = (*RocksDbLedgerStore)(nil)
+var _ interfaces.Iterator = (*RocksDbLedgerStoreIterator)(nil)
