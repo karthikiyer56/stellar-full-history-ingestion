@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,169 +25,250 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
-const BatchSize = 1000
-const ProgressInterval = 60 * time.Second
+// Architecture constants
+const (
+	BatchSize        = 5000
+	NumWorkers       = 16
+	NumReaders       = 4
+	WorkChanBuffer   = 200
+	EntryChanBuffer  = 100
+	ProgressInterval = 60 * time.Second
+)
 
-type WorkerResult struct {
-	WorkerID      int
-	StartLedger   uint32
-	EndLedger     uint32
-	LedgersRead   int64
-	TxHashesFound int64
-	Duration      time.Duration
-	Err           error
+// LedgerWork represents compressed ledger data ready for processing
+type LedgerWork struct {
+	LedgerSeq      uint32
+	CompressedData []byte
 }
 
-func runWorker(
-	workerID int,
-	startLedger, endLedger uint32,
-	lfsPath string,
-	txStore interfaces.TxHashStore,
-	progressChan chan<- WorkerResult,
-	globalProgressChan chan<- struct{},
-) {
-	var ledgersRead, txHashesFound int64
-	startTime := time.Now()
+// LedgerEntries represents extracted entries from a single ledger
+type LedgerEntries struct {
+	LedgerSeq   uint32
+	EntriesByCF map[string][]types.Entry
+	TxCount     int
+}
 
-	iterator, err := lfs.NewLFSRawLedgerIterator(lfsPath, startLedger, endLedger)
+// copyBytes creates a copy of the byte slice
+func copyBytes(b []byte) []byte {
+	c := make([]byte, len(b))
+	copy(c, b)
+	return c
+}
+
+// reader reads compressed ledger data from LFS
+func reader(
+	id int,
+	lfsPath string,
+	startSeq, endSeq uint32,
+	workChan chan<- LedgerWork,
+	errChan chan<- error,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	iterator, err := lfs.NewLFSRawLedgerIterator(lfsPath, startSeq, endSeq)
 	if err != nil {
-		progressChan <- WorkerResult{
-			WorkerID: workerID,
-			Err:      fmt.Errorf("worker %d: failed to create iterator: %w", workerID, err),
+		select {
+		case errChan <- fmt.Errorf("reader %d: failed to create iterator: %w", id, err):
+		default:
 		}
 		return
 	}
 	defer iterator.Close()
 
-	entriesByCF := make(map[string][]types.Entry)
-	for _, cfName := range cf.Names {
-		entriesByCF[cfName] = make([]types.Entry, 0)
+	for {
+		data, hasMore, err := iterator.Next()
+		if err != nil {
+			select {
+			case errChan <- fmt.Errorf("reader %d: failed to read ledger: %w", id, err):
+			default:
+			}
+			return
+		}
+		if !hasMore {
+			break
+		}
+
+		workChan <- LedgerWork{
+			LedgerSeq:      data.LedgerSeq,
+			CompressedData: data.CompressedData,
+		}
 	}
+}
+
+// worker processes ledger data (decompress, unmarshal, extract)
+func worker(
+	id int,
+	workChan <-chan LedgerWork,
+	entryChan chan<- LedgerEntries,
+	errChan chan<- error,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
 
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
-		progressChan <- WorkerResult{
-			WorkerID: workerID,
-			Err:      fmt.Errorf("worker %d: failed to create zstd decoder: %w", workerID, err),
+		select {
+		case errChan <- fmt.Errorf("worker %d: failed to create zstd decoder: %w", id, err):
+		default:
 		}
 		return
 	}
 	defer decoder.Close()
 
-	batchLedgerCount := int64(0)
+	ledgerSeqBytes := make([]byte, 4)
 
-	for {
-		rawData, hasMore, err := iterator.Next()
+	for work := range workChan {
+		// 1. Decompress
+		uncompressed, err := decoder.DecodeAll(work.CompressedData, nil)
 		if err != nil {
-			progressChan <- WorkerResult{
-				WorkerID: workerID,
-				Err:      fmt.Errorf("worker %d: iterator error: %w", workerID, err),
+			select {
+			case errChan <- fmt.Errorf("worker %d: decompress failed for ledger %d: %w", id, work.LedgerSeq, err):
+			default:
 			}
 			return
 		}
 
-		if !hasMore {
-			break
-		}
-
-		decompressed, err := decoder.DecodeAll(rawData.CompressedData, nil)
-		if err != nil {
-			progressChan <- WorkerResult{
-				WorkerID: workerID,
-				Err:      fmt.Errorf("worker %d: decompress error: %w", workerID, err),
+		// 2. Unmarshal XDR
+		var lcm xdr.LedgerCloseMeta
+		if err := lcm.UnmarshalBinary(uncompressed); err != nil {
+			select {
+			case errChan <- fmt.Errorf("worker %d: unmarshal failed for ledger %d: %w", id, work.LedgerSeq, err):
+			default:
 			}
 			return
 		}
 
-		var xdrLedger xdr.LedgerCloseMeta
-		if err := xdrLedger.UnmarshalBinary(decompressed); err != nil {
-			progressChan <- WorkerResult{
-				WorkerID: workerID,
-				Err:      fmt.Errorf("worker %d: unmarshal error: %w", workerID, err),
-			}
-			return
+		// 3. Extract transaction hashes
+		entriesByCF := make(map[string][]types.Entry)
+		for _, cfName := range cf.Names {
+			entriesByCF[cfName] = make([]types.Entry, 0, 32)
 		}
 
 		txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(
-			network.PublicNetworkPassphrase, xdrLedger)
+			network.PublicNetworkPassphrase, lcm)
 		if err != nil {
-			progressChan <- WorkerResult{
-				WorkerID: workerID,
-				Err:      fmt.Errorf("worker %d: failed to create tx reader: %w", workerID, err),
+			select {
+			case errChan <- fmt.Errorf("worker %d: failed to create tx reader for ledger %d: %w", id, work.LedgerSeq, err):
+			default:
 			}
 			return
 		}
 
-		ledgerSeqBytes := make([]byte, 4)
-		binary.BigEndian.PutUint32(ledgerSeqBytes, rawData.LedgerSeq)
+		binary.BigEndian.PutUint32(ledgerSeqBytes, work.LedgerSeq)
 
+		txCount := 0
 		for {
 			tx, err := txReader.Read()
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
-				if err.Error() == "EOF" {
-					break
-				}
-				progressChan <- WorkerResult{
-					WorkerID: workerID,
-					Err:      fmt.Errorf("worker %d: failed to read tx: %w", workerID, err),
-				}
 				txReader.Close()
+				select {
+				case errChan <- fmt.Errorf("worker %d: failed to read tx from ledger %d: %w", id, work.LedgerSeq, err):
+				default:
+				}
 				return
 			}
 
 			txHash := tx.Result.TransactionHash[:]
 			cfName := cf.GetName(txHash)
 
-			entry := types.Entry{
-				Key:   txHash,
-				Value: ledgerSeqBytes,
-			}
-
-			entriesByCF[cfName] = append(entriesByCF[cfName], entry)
-			txHashesFound++
+			entriesByCF[cfName] = append(entriesByCF[cfName], types.Entry{
+				Key:   copyBytes(txHash),
+				Value: copyBytes(ledgerSeqBytes),
+			})
+			txCount++
 		}
 		txReader.Close()
 
-		ledgersRead++
-		batchLedgerCount++
-
-		select {
-		case globalProgressChan <- struct{}{}:
-		default:
-		}
-
-		if batchLedgerCount >= BatchSize {
-			if err := txStore.WriteBatch(entriesByCF); err != nil {
-				progressChan <- WorkerResult{
-					WorkerID: workerID,
-					Err:      fmt.Errorf("worker %d: write batch error: %w", workerID, err),
-				}
-				return
-			}
-
-			for cfName := range entriesByCF {
-				entriesByCF[cfName] = make([]types.Entry, 0)
-			}
-			batchLedgerCount = 0
+		entryChan <- LedgerEntries{
+			LedgerSeq:   work.LedgerSeq,
+			EntriesByCF: entriesByCF,
+			TxCount:     txCount,
 		}
 	}
+}
 
+// processBatch processes a single batch of ledgers using the Reader→Worker→Collector pipeline
+func processBatch(
+	lfsPath string,
+	batchStart, batchEnd uint32,
+	numWorkers, numReaders int,
+	txStore interfaces.TxHashStore,
+	logger interfaces.Logger,
+) (int64, error) {
+	workChan := make(chan LedgerWork, WorkChanBuffer)
+	entryChan := make(chan LedgerEntries, EntryChanBuffer)
+	errChan := make(chan error, numReaders+numWorkers)
+
+	entriesByCF := make(map[string][]types.Entry)
+	for _, cfName := range cf.Names {
+		entriesByCF[cfName] = make([]types.Entry, 0)
+	}
+
+	var totalTxCount int64
+	var readerWg, workerWg sync.WaitGroup
+
+	// Start workers first (before readers, so they're ready)
+	for w := 0; w < numWorkers; w++ {
+		workerWg.Add(1)
+		go worker(w, workChan, entryChan, errChan, &workerWg)
+	}
+
+	// Calculate ledger distribution across readers
+	batchLedgers := int(batchEnd - batchStart + 1)
+	ledgersPerReader := batchLedgers / numReaders
+	remainder := batchLedgers % numReaders
+
+	// Start readers
+	readerStart := batchStart
+	for r := 0; r < numReaders; r++ {
+		count := ledgersPerReader
+		if r < remainder {
+			count++
+		}
+		readerEnd := readerStart + uint32(count) - 1
+		readerWg.Add(1)
+		go reader(r, lfsPath, readerStart, readerEnd, workChan, errChan, &readerWg)
+		readerStart = readerEnd + 1
+	}
+
+	// Start collector
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		for entries := range entryChan {
+			for cfName, cfEntries := range entries.EntriesByCF {
+				entriesByCF[cfName] = append(entriesByCF[cfName], cfEntries...)
+			}
+			totalTxCount += int64(entries.TxCount)
+		}
+	}()
+
+	// Wait sequence
+	readerWg.Wait()
+	close(workChan)
+
+	workerWg.Wait()
+	close(entryChan)
+
+	<-collectorDone
+
+	// Check for errors
+	select {
+	case err := <-errChan:
+		return 0, err
+	default:
+	}
+
+	// Write batch to RocksDB
 	if err := txStore.WriteBatch(entriesByCF); err != nil {
-		progressChan <- WorkerResult{
-			WorkerID: workerID,
-			Err:      fmt.Errorf("worker %d: write final batch error: %w", workerID, err),
-		}
-		return
+		return 0, fmt.Errorf("failed to write batch: %w", err)
 	}
 
-	progressChan <- WorkerResult{
-		WorkerID:      workerID,
-		StartLedger:   startLedger,
-		EndLedger:     endLedger,
-		LedgersRead:   ledgersRead,
-		TxHashesFound: txHashesFound,
-		Duration:      time.Since(startTime),
-	}
+	return totalTxCount, nil
 }
 
 func main() {
@@ -196,7 +278,8 @@ func main() {
 	outputDir := flag.String("output-dir", "", "Base output directory (required)")
 	logFile := flag.String("log-file", "", "Path to log file (required)")
 	errorFile := flag.String("error-file", "", "Path to error file (required)")
-	numWorkers := flag.Int("workers", 16, "Number of parallel workers (default 16)")
+	numWorkers := flag.Int("workers", NumWorkers, "Number of workers (default 16)")
+	numReaders := flag.Int("readers", NumReaders, "Number of LFS readers (default 4)")
 
 	flag.Parse()
 
@@ -234,7 +317,9 @@ func main() {
 	logger.Info("  Start Ledger:    %d", *startLedger)
 	logger.Info("  End Ledger:      %d", *endLedger)
 	logger.Info("  Output Dir:      %s", *outputDir)
-	logger.Info("  Workers:         %d", *numWorkers)
+	logger.Info("  Workers:         %d (decompress/unmarshal/extract)", *numWorkers)
+	logger.Info("  Readers:         %d (LFS I/O)", *numReaders)
+	logger.Info("  Batch Size:      %d ledgers", BatchSize)
 	logger.Info("")
 
 	memMonitor := memory.NewMemoryMonitor(logger, memory.DefaultRAMWarningThresholdGB)
@@ -255,57 +340,20 @@ func main() {
 
 	startTime := time.Now()
 	totalLedgers := *endLedger - *startLedger + 1
-	totalLedgersCompleted := atomic.Int64{}
-	totalTxHashesFound := atomic.Int64{}
+	ledgersCompleted := atomic.Int64{}
+	txHashesFound := atomic.Int64{}
 
 	logger.Separator()
-	logger.Info("                    STARTING INGESTION")
+	logger.Info("                    STARTING INGESTION (PARALLEL)")
 	logger.Separator()
 	logger.Info("")
-
-	ledgersPerWorker := totalLedgers / uint64(*numWorkers)
-	remainder := totalLedgers % uint64(*numWorkers)
-
-	progressChan := make(chan WorkerResult, *numWorkers)
-	globalProgressChan := make(chan struct{}, 100)
 
 	ticker := time.NewTicker(ProgressInterval)
 	defer ticker.Stop()
 
-	var wg sync.WaitGroup
-	currentStart := *startLedger
-
-	for i := 0; i < *numWorkers; i++ {
-		count := ledgersPerWorker
-		if i < int(remainder) {
-			count++
-		}
-
-		workerStart := currentStart
-		workerEnd := workerStart + count - 1
-
-		wg.Add(1)
-		go runWorker(
-			i,
-			uint32(workerStart), uint32(workerEnd),
-			*lfsStore,
-			txStore,
-			progressChan,
-			globalProgressChan,
-		)
-
-		currentStart = workerEnd + 1
-	}
-
-	go func() {
-		for range globalProgressChan {
-			totalLedgersCompleted.Add(1)
-		}
-	}()
-
 	go func() {
 		for range ticker.C {
-			completed := totalLedgersCompleted.Load()
+			completed := ledgersCompleted.Load()
 			if completed > 0 {
 				elapsed := time.Since(startTime)
 				rate := float64(completed) / elapsed.Seconds()
@@ -323,30 +371,32 @@ func main() {
 		}
 	}()
 
-	wg.Wait()
-	ticker.Stop()
-	close(progressChan)
-
+	// Process ledgers in batches
+	currentLedger := uint32(*startLedger)
+	endLedgerSeq := uint32(*endLedger)
 	var hasError bool
-	totalDuration := time.Duration(0)
-	for result := range progressChan {
-		if result.Err != nil {
-			logger.Error("Worker %d error: %v", result.WorkerID, result.Err)
-			hasError = true
-		} else {
-			logger.Info("Worker %d completed: %d ledgers, %d txHashes (%.2f ledgers/s)",
-				result.WorkerID,
-				result.LedgersRead,
-				result.TxHashesFound,
-				float64(result.LedgersRead)/result.Duration.Seconds(),
-			)
-			totalLedgersCompleted.Store(result.LedgersRead)
-			totalTxHashesFound.Add(result.TxHashesFound)
-			if result.Duration > totalDuration {
-				totalDuration = result.Duration
-			}
+
+	for currentLedger <= endLedgerSeq {
+		batchStart := currentLedger
+		batchEnd := currentLedger + uint32(BatchSize) - 1
+		if batchEnd > endLedgerSeq {
+			batchEnd = endLedgerSeq
 		}
+
+		txCount, err := processBatch(*lfsStore, batchStart, batchEnd, *numWorkers, *numReaders, txStore, logger)
+		if err != nil {
+			logger.Error("Failed to process batch %d-%d: %v", batchStart, batchEnd, err)
+			hasError = true
+			break
+		}
+
+		ledgersCompleted.Add(int64(batchEnd - batchStart + 1))
+		txHashesFound.Add(txCount)
+
+		currentLedger = batchEnd + 1
 	}
+
+	ticker.Stop()
 
 	if hasError {
 		logger.Error("Ingestion failed")
@@ -354,7 +404,7 @@ func main() {
 	}
 
 	totalElapsed := time.Since(startTime)
-	totalTxHashes := totalTxHashesFound.Load()
+	totalTxHashes := txHashesFound.Load()
 	txHashRate := float64(totalTxHashes) / totalElapsed.Seconds()
 
 	logger.Separator()
