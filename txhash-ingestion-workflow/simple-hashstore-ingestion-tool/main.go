@@ -324,7 +324,7 @@ func processBatchLFS(
 
 	// Write batch to RocksDB and time it
 	writeStart := time.Now()
-	if err := txStore.WriteBatch(entriesByCF); err != nil {
+	if _, err := txStore.WriteBatchParallel(entriesByCF); err != nil {
 		return 0, 0, fmt.Errorf("failed to write batch: %w", err)
 	}
 	writeDuration := time.Since(writeStart)
@@ -536,7 +536,7 @@ func runGCSIngestion(
 		// Write batch when size reached
 		if int64(ledgerSeq-startLedger+1)%int64(BatchSize) == 0 || ledgerSeq == endLedger {
 			writeBatchStart := time.Now()
-			if err := txStore.WriteBatch(entriesByCF); err != nil {
+			if _, err := txStore.WriteBatchParallel(entriesByCF); err != nil {
 				return fmt.Errorf("failed to write batch: %w", err)
 			}
 			writeBatchDuration := time.Since(writeBatchStart)

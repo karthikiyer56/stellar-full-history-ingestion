@@ -472,7 +472,7 @@ func (pi *ParallelIngester) processBatch(batchNum int, startLedger, endLedger ui
 
 	// Write to RocksDB
 	writeStart := time.Now()
-	if err := pi.store.WriteBatch(entriesByCF); err != nil {
+	if _, err := pi.store.WriteBatchParallel(entriesByCF); err != nil {
 		return nil, fmt.Errorf("failed to write batch to RocksDB: %w", err)
 	}
 	timing.TotalWriteTime = time.Since(writeStart)
