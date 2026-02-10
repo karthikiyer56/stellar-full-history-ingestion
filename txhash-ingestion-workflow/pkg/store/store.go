@@ -257,86 +257,40 @@ func createCFOptions(settings *types.RocksDBSettings, blockCache *grocksdb.Cache
 // TxHashStore Interface Implementation
 // =============================================================================
 
-// WriteBatch writes a batch of entries to the appropriate column families.
-// Panics if the store was opened in read-only mode.
-func (s *RocksDBTxHashStore) WriteBatch(entriesByCF map[string][]types.Entry) error {
+// WriteBatch writes entries to column families without holding a lock, returning timing info.
+func (s *RocksDBTxHashStore) WriteBatch(entriesByCF map[string][]types.Entry) (map[string]time.Duration, error) {
 	if s.readOnly {
 		panic("WriteBatch called on read-only store")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
-
-	for cfName, entries := range entriesByCF {
-		cfHandle := s.getCFHandleByName(cfName)
-		for _, entry := range entries {
-			batch.PutCF(cfHandle, entry.Key, entry.Value)
-		}
-	}
-
-	return s.db.Write(s.writeOpts, batch)
-}
-
-// WriteBatchParallel writes entries to column families in parallel, returning per-CF write durations.
-//
-// NOTE: This method does NOT hold a lock during writes. RocksDB is thread-safe and handles
-// concurrent writes internally. Each goroutine creates its own WriteBatch and WriteOptions
-// with proper cleanup.
-//
-// Panics if the store was opened in read-only mode.
-func (s *RocksDBTxHashStore) WriteBatchParallel(entriesByCF map[string][]types.Entry) (map[string]time.Duration, error) {
-	if s.readOnly {
-		panic("WriteBatchParallel called on read-only store")
-	}
-
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
 
 	timings := make(map[string]time.Duration)
-	var timingsMu sync.Mutex
+
+	batchStart := time.Now()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
 
 	for cfName, entries := range entriesByCF {
 		if len(entries) == 0 {
 			continue
 		}
-
-		wg.Add(1)
-		go func(cf string, cfEntries []types.Entry) {
-			defer wg.Done()
-			start := time.Now()
-
-			wo := grocksdb.NewDefaultWriteOptions()
-			wo.SetSync(false)
-			defer wo.Destroy()
-
-			batch := grocksdb.NewWriteBatch()
-			defer batch.Destroy()
-
-			cfHandle := s.getCFHandleByName(cf)
-			for _, entry := range cfEntries {
-				batch.PutCF(cfHandle, entry.Key, entry.Value)
-			}
-
-			if err := s.db.Write(wo, batch); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-				return
-			}
-
-			timingsMu.Lock()
-			timings[cf] = time.Since(start)
-			timingsMu.Unlock()
-		}(cfName, entries)
+		cfHandle := s.getCFHandleByName(cfName)
+		for _, entry := range entries {
+			batch.PutCF(cfHandle, entry.Key, entry.Value)
+		}
 	}
+	timings["batch_build"] = time.Since(batchStart)
 
-	wg.Wait()
-	return timings, firstErr
+	writeStart := time.Now()
+	wo := grocksdb.NewDefaultWriteOptions()
+	wo.SetSync(false)
+	defer wo.Destroy()
+
+	if err := s.db.Write(wo, batch); err != nil {
+		return timings, err
+	}
+	timings["total"] = time.Since(writeStart)
+
+	return timings, nil
 }
 
 // Get retrieves the ledger sequence for a transaction hash.

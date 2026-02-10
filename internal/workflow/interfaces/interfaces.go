@@ -98,9 +98,7 @@ type LedgerStore interface {
 // TxHashStore stores txhash→ledgerSeq in RocksDB with 16 CFs
 type TxHashStore interface {
 	Open() (openDuration time.Duration, err error)
-	WriteBatch(entriesByCF map[string][]Entry) error
-	// WriteBatchParallel writes a batch of entries to column families in parallel, returning per-CF write durations
-	WriteBatchParallel(entriesByCF map[string][]Entry) (map[string]time.Duration, error)
+	WriteBatch(entriesByCF map[string][]Entry) (map[string]time.Duration, error)
 	Get(txHash []byte) (uint32, bool, error)
 	NewScanIteratorCF(cfName string) Iterator
 	CompactAll() (map[string]time.Duration, error)

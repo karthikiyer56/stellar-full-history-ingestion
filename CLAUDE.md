@@ -250,6 +250,15 @@ When partitioning by key prefix (e.g., first hex char of hash):
 - Run manual full compaction after ingestion completes
 - Verify counts after compaction by iterating store
 
+### WAL (Write-Ahead Log) - NEVER DISABLE
+**CRITICAL**: NEVER use `DisableWAL(true)` or suggest disabling WAL.
+
+- WAL is required for crash recovery and data durability
+- All RocksDB stores in this project MUST have WAL enabled
+- The checkpoint/recovery system depends on WAL for correctness
+- Performance optimizations must NOT compromise data safety
+- Use `SetSync(false)` for async writes, but WAL must remain enabled
+
 ---
 
 ## Testing Checklist

@@ -110,7 +110,7 @@ func TestTxHashStoreWriteAndGet(t *testing.T) {
 		{Key: txHash3, Value: helpers.Uint32ToBytes(ledgerSeq3)},
 	}
 
-	err = store.WriteBatch(entriesByCF)
+	_, err = store.WriteBatch(entriesByCF)
 	if err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestTxHashStoreIterator(t *testing.T) {
 
 	entriesByCF["0"] = cf0Entries
 
-	err = store.WriteBatch(entriesByCF)
+	_, err = store.WriteBatch(entriesByCF)
 	if err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestTxHashStoreCompactAll(t *testing.T) {
 		}
 	}
 
-	err = store.WriteBatch(entriesByCF)
+	_, err = store.WriteBatch(entriesByCF)
 	if err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}

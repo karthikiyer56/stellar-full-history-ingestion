@@ -73,11 +73,8 @@ type Iterator interface {
 //   - 16 column families (0-f) partitioned by first hex char of txHash
 //   - Each entry: 32-byte txHash -> 4-byte ledgerSeq
 type TxHashStore interface {
-	// WriteBatch writes a batch of entries to the appropriate column families.
-	WriteBatch(entriesByCF map[string][]types.Entry) error
-
-	// WriteBatchParallel writes a batch of entries to column families in parallel, returning per-CF write durations.
-	WriteBatchParallel(entriesByCF map[string][]types.Entry) (map[string]time.Duration, error)
+	// WriteBatch writes entries to column families without holding a lock, returning timing info.
+	WriteBatch(entriesByCF map[string][]types.Entry) (map[string]time.Duration, error)
 
 	// Get retrieves the ledger sequence for a transaction hash.
 	Get(txHash []byte) (value []byte, found bool, err error)

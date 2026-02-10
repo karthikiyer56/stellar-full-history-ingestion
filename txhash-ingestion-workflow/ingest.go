@@ -334,7 +334,7 @@ func (i *Ingester) commitBatch() error {
 
 	// Write to RocksDB
 	writeStart := time.Now()
-	if _, err := i.store.WriteBatchParallel(i.entriesByCF); err != nil {
+	if _, err := i.store.WriteBatch(i.entriesByCF); err != nil {
 		return fmt.Errorf("failed to write batch %d to RocksDB: %w", batch.BatchNumber, err)
 	}
 	batch.WriteTime = time.Since(writeStart)

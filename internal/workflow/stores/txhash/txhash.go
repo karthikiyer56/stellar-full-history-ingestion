@@ -138,72 +138,35 @@ func (s *RocksDbTxHashStore) Open() (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-func (s *RocksDbTxHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) error {
+func (s *RocksDbTxHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) (map[string]time.Duration, error) {
+	timings := make(map[string]time.Duration)
+
+	batchStart := time.Now()
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
-
-	for cfName, entries := range entriesByCF {
-		cfHandle, ok := s.cfHandles[cfName]
-		if !ok {
-			return fmt.Errorf("unknown column family: %s", cfName)
-		}
-
-		for _, entry := range entries {
-			batch.PutCF(cfHandle, entry.Key, entry.Value)
-		}
-	}
-
-	return s.DB.Write(s.WriteOpts, batch)
-}
-
-func (s *RocksDbTxHashStore) WriteBatchParallel(entriesByCF map[string][]interfaces.Entry) (map[string]time.Duration, error) {
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
-
-	timings := make(map[string]time.Duration)
-	var timingsMu sync.Mutex
 
 	for cfName, entries := range entriesByCF {
 		if len(entries) == 0 {
 			continue
 		}
-
-		wg.Add(1)
-		go func(cf string, cfEntries []interfaces.Entry) {
-			defer wg.Done()
-			start := time.Now()
-
-			// Each goroutine needs its own WriteOptions
-			wo := grocksdb.NewDefaultWriteOptions()
-			wo.SetSync(false)
-			defer wo.Destroy()
-
-			batch := grocksdb.NewWriteBatch()
-			defer batch.Destroy()
-
-			cfHandle := s.cfHandles[cf]
-			for _, entry := range cfEntries {
-				batch.PutCF(cfHandle, entry.Key, entry.Value)
-			}
-
-			if err := s.DB.Write(wo, batch); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-				return
-			}
-
-			timingsMu.Lock()
-			timings[cf] = time.Since(start)
-			timingsMu.Unlock()
-		}(cfName, entries)
+		cfHandle := s.cfHandles[cfName]
+		for _, entry := range entries {
+			batch.PutCF(cfHandle, entry.Key, entry.Value)
+		}
 	}
+	timings["batch_build"] = time.Since(batchStart)
 
-	wg.Wait()
-	return timings, firstErr
+	writeStart := time.Now()
+	wo := grocksdb.NewDefaultWriteOptions()
+	wo.SetSync(false)
+	defer wo.Destroy()
+
+	if err := s.DB.Write(wo, batch); err != nil {
+		return timings, err
+	}
+	timings["total"] = time.Since(writeStart)
+
+	return timings, nil
 }
 
 func (s *RocksDbTxHashStore) Get(txHash []byte) (uint32, bool, error) {

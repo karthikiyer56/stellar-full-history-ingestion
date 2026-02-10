@@ -51,7 +51,7 @@ func TestRecSplitBuilder_BuildAll_BasicOperation(t *testing.T) {
 		},
 	}
 
-	if err := store.WriteBatch(testData); err != nil {
+	if _, err := store.WriteBatch(testData); err != nil {
 		t.Fatalf("Failed to write batch: %v", err)
 	}
 
@@ -135,7 +135,7 @@ func TestRecSplitBuilder_BuildAll_PathFormat(t *testing.T) {
 				},
 			}
 
-			if err := store.WriteBatch(testData); err != nil {
+			if _, err := store.WriteBatch(testData); err != nil {
 				t.Fatalf("Failed to write batch: %v", err)
 			}
 
@@ -258,7 +258,7 @@ func TestRecSplitBuilder_BuildAll_ParallelExecution(t *testing.T) {
 		testData[cfName] = entries
 	}
 
-	if err := store.WriteBatch(testData); err != nil {
+	if _, err := store.WriteBatch(testData); err != nil {
 		t.Fatalf("Failed to write batch: %v", err)
 	}
 

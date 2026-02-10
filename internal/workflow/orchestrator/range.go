@@ -373,7 +373,7 @@ func (ro *rangeOrchestrator) flushAndCheckpoint(
 	if err := ro.lcmStore.WriteBatch(lcmBatch); err != nil {
 		return fmt.Errorf("LCM WriteBatch failed: %w", err)
 	}
-	if _, err := ro.txStore.WriteBatchParallel(txHashBatch); err != nil {
+	if _, err := ro.txStore.WriteBatch(txHashBatch); err != nil {
 		return fmt.Errorf("TxHash WriteBatch failed: %w", err)
 	}
 
