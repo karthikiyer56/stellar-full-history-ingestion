@@ -279,6 +279,66 @@ func (s *RocksDBTxHashStore) WriteBatch(entriesByCF map[string][]types.Entry) er
 	return s.db.Write(s.writeOpts, batch)
 }
 
+// WriteBatchParallel writes entries to column families in parallel, returning per-CF write durations.
+//
+// NOTE: This method does NOT hold a lock during writes. RocksDB is thread-safe and handles
+// concurrent writes internally. Each goroutine creates its own WriteBatch and WriteOptions
+// with proper cleanup.
+//
+// Panics if the store was opened in read-only mode.
+func (s *RocksDBTxHashStore) WriteBatchParallel(entriesByCF map[string][]types.Entry) (map[string]time.Duration, error) {
+	if s.readOnly {
+		panic("WriteBatchParallel called on read-only store")
+	}
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+
+	timings := make(map[string]time.Duration)
+	var timingsMu sync.Mutex
+
+	for cfName, entries := range entriesByCF {
+		if len(entries) == 0 {
+			continue
+		}
+
+		wg.Add(1)
+		go func(cf string, cfEntries []types.Entry) {
+			defer wg.Done()
+			start := time.Now()
+
+			wo := grocksdb.NewDefaultWriteOptions()
+			wo.SetSync(false)
+			defer wo.Destroy()
+
+			batch := grocksdb.NewWriteBatch()
+			defer batch.Destroy()
+
+			cfHandle := s.getCFHandleByName(cf)
+			for _, entry := range cfEntries {
+				batch.PutCF(cfHandle, entry.Key, entry.Value)
+			}
+
+			if err := s.db.Write(wo, batch); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+
+			timingsMu.Lock()
+			timings[cf] = time.Since(start)
+			timingsMu.Unlock()
+		}(cfName, entries)
+	}
+
+	wg.Wait()
+	return timings, firstErr
+}
+
 // Get retrieves the ledger sequence for a transaction hash.
 func (s *RocksDBTxHashStore) Get(txHash []byte) (value []byte, found bool, err error) {
 	s.mu.RLock()
