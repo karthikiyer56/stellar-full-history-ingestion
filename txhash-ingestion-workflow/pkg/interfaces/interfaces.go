@@ -76,6 +76,9 @@ type TxHashStore interface {
 	// WriteBatch writes a batch of entries to the appropriate column families.
 	WriteBatch(entriesByCF map[string][]types.Entry) error
 
+	// WriteBatchParallel writes a batch of entries to column families in parallel, returning per-CF write durations.
+	WriteBatchParallel(entriesByCF map[string][]types.Entry) (map[string]time.Duration, error)
+
 	// Get retrieves the ledger sequence for a transaction hash.
 	Get(txHash []byte) (value []byte, found bool, err error)
 
