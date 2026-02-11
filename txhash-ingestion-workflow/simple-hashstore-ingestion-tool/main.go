@@ -620,6 +620,8 @@ func main() {
 	numReaders := flag.Int("readers", NumReaders, "Number of LFS readers (default 4)")
 	gcsBufferSize := flag.Int("gcs-buffer-size", DefaultGCSBufferSize, "GCS BufferedStorageBackend buffer size")
 	gcsNumWorkers := flag.Int("gcs-workers", DefaultGCSNumWorkers, "GCS BufferedStorageBackend num workers")
+	gcsParallelBackends := flag.Int("gcs-parallel-backends", 10, "GCS parallel backends (min 1)")
+	gcsBatchSize := flag.Int("gcs-batch-size", 5000, "GCS batch size in ledgers")
 
 	flag.Parse()
 
@@ -643,6 +645,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: --start-ledger, --end-ledger, --output-dir, --log-file, and --error-file are required")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	// Validate GCS-specific flags
+	if useGCS {
+		if *gcsParallelBackends < 1 {
+			fmt.Fprintln(os.Stderr, "Error: --gcs-parallel-backends must be >= 1")
+			os.Exit(1)
+		}
+		if *gcsBatchSize < 100 {
+			fmt.Fprintln(os.Stderr, "Error: --gcs-batch-size must be >= 100")
+			os.Exit(1)
+		}
 	}
 
 	logger, err := logging.NewDualLogger(*logFile, *errorFile)
@@ -673,6 +687,8 @@ func main() {
 		logger.Info("  Bucket Path:     %s", *gcsBucketPath)
 		logger.Info("  Buffer Size:     %d", *gcsBufferSize)
 		logger.Info("  GCS Workers:     %d", *gcsNumWorkers)
+		logger.Info("  Parallel Backends: %d", *gcsParallelBackends)
+		logger.Info("  Batch Size:      %d ledgers", *gcsBatchSize)
 	} else {
 		logger.Info("  Mode:            LFS (Local File System)")
 		logger.Info("  LFS Store:       %s", *lfsStore)
