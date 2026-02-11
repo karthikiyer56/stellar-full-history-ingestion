@@ -11,6 +11,9 @@ package store
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -693,6 +696,59 @@ func (s *RocksDBTxHashStore) logStoreStats(openDuration time.Duration) {
 	}
 
 	s.logger.Info("")
+}
+
+// LogMemTableAndWALStats displays MemTable statistics and actual WAL file sizes from the filesystem.
+func (s *RocksDBTxHashStore) LogMemTableAndWALStats(logger interfaces.Logger, rocksdbPath string, label string) {
+	logger.Info("")
+	logger.Info("================================================================================")
+	logger.Info("                    %s", label)
+	logger.Info("================================================================================")
+
+	curSizeActiveMemTable := s.db.GetProperty("rocksdb.cur-size-active-mem-table")
+	curSizeAllMemTables := s.db.GetProperty("rocksdb.cur-size-all-mem-tables")
+	sizeAllMemTables := s.db.GetProperty("rocksdb.size-all-mem-tables")
+	numEntriesActiveMemTable := s.db.GetProperty("rocksdb.num-entries-active-mem-table")
+	numEntriesImmMemTables := s.db.GetProperty("rocksdb.num-entries-imm-mem-tables")
+
+	logger.Info("")
+	logger.Info("  MEMTABLE STATE:")
+	logger.Info("    Active MemTable Size:     %s", formatPropertyBytes(curSizeActiveMemTable))
+	logger.Info("    All MemTables Size:       %s", formatPropertyBytes(curSizeAllMemTables))
+	logger.Info("    MemTables + Pending Flush: %s", formatPropertyBytes(sizeAllMemTables))
+
+	var activeEntries, immEntries int64
+	fmt.Sscanf(numEntriesActiveMemTable, "%d", &activeEntries)
+	fmt.Sscanf(numEntriesImmMemTables, "%d", &immEntries)
+
+	logger.Info("    Active MemTable Entries:  %s", helpers.FormatNumber(activeEntries))
+	logger.Info("    Immutable MemTable Entries: %s", helpers.FormatNumber(immEntries))
+
+	var walSize int64
+	var walCount int
+
+	entries, err := os.ReadDir(rocksdbPath)
+	if err != nil {
+		logger.Error("Failed to read RocksDB directory: %v", err)
+		logger.Info("")
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".log") {
+			walCount++
+			info, err := os.Stat(filepath.Join(rocksdbPath, entry.Name()))
+			if err == nil {
+				walSize += info.Size()
+			}
+		}
+	}
+
+	logger.Info("")
+	logger.Info("  WAL FILES:")
+	logger.Info("    Count:                    %s", helpers.FormatNumber(int64(walCount)))
+	logger.Info("    Total Size:               %s", helpers.FormatBytes(walSize))
+	logger.Info("")
 }
 
 // GetLiveDataSize returns the total size of live data in the store.

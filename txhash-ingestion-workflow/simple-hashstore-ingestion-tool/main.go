@@ -753,8 +753,69 @@ func main() {
 	gcsNumWorkers := flag.Int("gcs-workers", DefaultGCSNumWorkers, "GCS BufferedStorageBackend num workers")
 	gcsParallelBackends := flag.Int("gcs-parallel-backends", 10, "GCS parallel backends (min 1)")
 	gcsBatchSize := flag.Int("gcs-batch-size", 5000, "GCS batch size in ledgers")
+	flushOnly := flag.Bool("flush-only", false, "Flush existing RocksDB store and exit (no ingestion)")
+	rocksdbPath := flag.String("rocksdb-path", "", "Path to existing RocksDB store (required for --flush-only)")
 
 	flag.Parse()
+
+	// Handle flush-only mode separately
+	if *flushOnly {
+		if *rocksdbPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: --rocksdb-path is required when using --flush-only")
+			os.Exit(1)
+		}
+		if *logFile == "" || *errorFile == "" {
+			fmt.Fprintln(os.Stderr, "Error: --log-file and --error-file are required")
+			os.Exit(1)
+		}
+
+		logger, err := logging.NewDualLogger(*logFile, *errorFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating logger: %v\n", err)
+			os.Exit(1)
+		}
+		defer logger.Close()
+
+		logger.Separator()
+		logger.Info("                    FLUSH-ONLY MODE")
+		logger.Separator()
+		logger.Info("")
+		logger.Info("RocksDB Path: %s", *rocksdbPath)
+		logger.Info("")
+
+		// Open existing store in read-write mode
+		settings := types.DefaultRocksDBSettings()
+		settings.ReadOnly = false
+
+		openStart := time.Now()
+		txStore, err := store.OpenRocksDBTxHashStore(*rocksdbPath, &settings, logger)
+		if err != nil {
+			logger.Error("Failed to open RocksDB: %v", err)
+			os.Exit(1)
+		}
+		logger.Info("RocksDB opened in %s", helpers.FormatDuration(time.Since(openStart)))
+		defer txStore.Close()
+
+		// Show stats BEFORE flush
+		txStore.LogMemTableAndWALStats(logger, *rocksdbPath, "BEFORE FLUSH")
+
+		// Flush all MemTables to SST files
+		logger.Info("Flushing all MemTables to disk...")
+		flushStart := time.Now()
+		if err := txStore.FlushAll(); err != nil {
+			logger.Error("Failed to flush MemTables: %v", err)
+			os.Exit(1)
+		}
+		logger.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
+
+		// Show stats AFTER flush
+		txStore.LogMemTableAndWALStats(logger, *rocksdbPath, "AFTER FLUSH")
+
+		logger.Info("")
+		logger.Info("Flush-only mode complete. WAL should now be minimal.")
+		logger.Sync()
+		return
+	}
 
 	// Mode detection: exactly one of LFS or GCS must be specified
 	useGCS := *gcsBucketPath != ""
@@ -863,6 +924,18 @@ func main() {
 		logger.Error("Ingestion failed: %v", ingestionErr)
 		os.Exit(1)
 	}
+
+	// Flush all MemTables to SST files before closing
+	// This ensures WAL can be cleaned up and no recovery is needed on next open
+	logger.Info("")
+	logger.Info("Flushing all MemTables to disk...")
+	flushStart := time.Now()
+	if err := txStore.FlushAll(); err != nil {
+		logger.Error("Failed to flush MemTables: %v", err)
+		os.Exit(1)
+	}
+	logger.Info("Flush completed in %s", helpers.FormatDuration(time.Since(flushStart)))
+	logger.Info("")
 
 	logger.Sync()
 }
