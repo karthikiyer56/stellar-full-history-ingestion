@@ -38,6 +38,7 @@ const (
 	ProgressInterval     = 60 * time.Second
 	DefaultGCSBufferSize = 10000
 	DefaultGCSNumWorkers = 200
+	DefaultGCSBucketPath = "sdf-ledger-close-meta/v1/ledgers/pubnet"
 )
 
 // LedgerWork represents compressed ledger data ready for processing
@@ -546,6 +547,18 @@ func runGCSIngestion(
 		backends[i] = backendPair{backend: backend, dataStore: dataStore}
 	}
 	logger.Info("All %d backends created successfully", actualWorkers)
+
+	logger.Info("Calling PrepareRange for each backend...")
+	for i := 0; i < actualWorkers; i++ {
+		ledgerRange := ledgerbackend.BoundedRange(ranges[i].start, ranges[i].end)
+		if err := backends[i].backend.PrepareRange(ctx, ledgerRange); err != nil {
+			for j := 0; j < actualWorkers; j++ {
+				backends[j].backend.Close()
+			}
+			return fmt.Errorf("failed to prepare range for worker %d (%d-%d): %w", i, ranges[i].start, ranges[i].end, err)
+		}
+	}
+	logger.Info("All %d backends prepared successfully", actualWorkers)
 	logger.Info("")
 
 	defer func() {
@@ -763,8 +776,10 @@ func runGCSIngestion(
 }
 
 func main() {
-	lfsStore := flag.String("lfs-store", "", "Path to LFS ledger store")
-	gcsBucketPath := flag.String("gcs-bucket-path", "", "GCS bucket path (e.g., 'sdf-ledger-close-meta/v1/ledgers/pubnet')")
+	useLFS := flag.Bool("use-lfs", false, "Use LFS (Local File System) as data source")
+	useGCS := flag.Bool("use-gcs", false, "Use GCS (Google Cloud Storage) as data source")
+	lfsStore := flag.String("lfs-store", "", "Path to LFS ledger store (required with --use-lfs)")
+	gcsBucketPath := flag.String("gcs-bucket-path", DefaultGCSBucketPath, "GCS bucket path")
 	startLedger := flag.Uint64("start-ledger", 0, "First ledger to ingest (required)")
 	endLedger := flag.Uint64("end-ledger", 0, "Last ledger to ingest (required)")
 	outputDir := flag.String("output-dir", "", "Base output directory (required)")
@@ -840,17 +855,21 @@ func main() {
 		return
 	}
 
-	// Mode detection: exactly one of LFS or GCS must be specified
-	useGCS := *gcsBucketPath != ""
-	useLFS := *lfsStore != ""
-
-	if !useGCS && !useLFS {
-		fmt.Fprintln(os.Stderr, "Error: must specify either --lfs-store or --gcs-bucket-path")
+	// Mode validation: exactly one of --use-lfs or --use-gcs must be specified
+	if !*useLFS && !*useGCS {
+		fmt.Fprintln(os.Stderr, "Error: must specify either --use-lfs or --use-gcs")
 		flag.Usage()
 		os.Exit(1)
 	}
-	if useGCS && useLFS {
-		fmt.Fprintln(os.Stderr, "Error: cannot specify both --lfs-store and --gcs-bucket-path (choose one)")
+	if *useLFS && *useGCS {
+		fmt.Fprintln(os.Stderr, "Error: cannot specify both --use-lfs and --use-gcs (choose one)")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// Validate LFS-specific requirements
+	if *useLFS && *lfsStore == "" {
+		fmt.Fprintln(os.Stderr, "Error: --lfs-store is required when using --use-lfs")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -863,7 +882,7 @@ func main() {
 	}
 
 	// Validate GCS-specific flags
-	if useGCS {
+	if *useGCS {
 		if *gcsParallelBackends < 1 {
 			fmt.Fprintln(os.Stderr, "Error: --gcs-parallel-backends must be >= 1")
 			os.Exit(1)
@@ -897,7 +916,7 @@ func main() {
 	logger.Separator()
 	logger.Info("")
 	logger.Info("Configuration:")
-	if useGCS {
+	if *useGCS {
 		logger.Info("  Mode:            GCS (Google Cloud Storage)")
 		logger.Info("  Bucket Path:     %s", *gcsBucketPath)
 		logger.Info("  Buffer Size:     %d", *gcsBufferSize)
@@ -933,7 +952,7 @@ func main() {
 	logger.Info("")
 
 	var ingestionErr error
-	if useGCS {
+	if *useGCS {
 		ctx := context.Background()
 		ingestionErr = runGCSIngestion(ctx, *gcsBucketPath, *gcsBufferSize, *gcsNumWorkers,
 			*gcsParallelBackends, *gcsBatchSize,
