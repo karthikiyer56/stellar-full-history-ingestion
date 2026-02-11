@@ -594,6 +594,7 @@ func runGCSIngestion(
 				entriesByCF[cfName] = make([]types.Entry, 0)
 			}
 			var batchTxCount int64
+			var batchLedgerCount int64
 
 			for ledgerSeq := workerStart; ledgerSeq <= workerEnd; ledgerSeq++ {
 				select {
@@ -629,12 +630,7 @@ func runGCSIngestion(
 					entriesByCF[cfName] = append(entriesByCF[cfName], cfEntries...)
 				}
 				batchTxCount += int64(txCount)
-
-				batchCurrentSize := 0
-				for _, cfName := range cf.Names {
-					batchCurrentSize += len(entriesByCF[cfName])
-					break
-				}
+				batchLedgerCount++
 
 				shouldWriteBatch := false
 				ledgersProcessed := int(ledgerSeq - workerStart + 1)
@@ -658,7 +654,7 @@ func runGCSIngestion(
 					totalWriteBatchNanos.Add(time.Since(writeBatchStart).Nanoseconds())
 					writeBatchCallCount.Add(1)
 
-					ledgersCompleted.Add(int64(ledgersProcessed))
+					ledgersCompleted.Add(batchLedgerCount)
 					txHashesFound.Add(batchTxCount)
 
 					entriesByCF = make(map[string][]types.Entry)
@@ -666,6 +662,7 @@ func runGCSIngestion(
 						entriesByCF[cfName] = make([]types.Entry, 0)
 					}
 					batchTxCount = 0
+					batchLedgerCount = 0
 				}
 			}
 
@@ -682,10 +679,7 @@ func runGCSIngestion(
 				totalWriteBatchNanos.Add(time.Since(writeBatchStart).Nanoseconds())
 				writeBatchCallCount.Add(1)
 
-				finalLedgers := int64(workerEnd-workerStart+1) - ledgersCompleted.Load()
-				if finalLedgers > 0 {
-					ledgersCompleted.Add(finalLedgers)
-				}
+				ledgersCompleted.Add(batchLedgerCount)
 				txHashesFound.Add(batchTxCount)
 			}
 		}(ranges[i].id, ranges[i].start, ranges[i].end, backends[i].backend)
@@ -718,7 +712,9 @@ func runGCSIngestion(
 					}
 					avgWriteBatch := time.Duration(0)
 					if count := writeBatchCallCount.Load(); count > 0 {
-						avgWriteBatch = time.Duration(totalWriteBatchNanos.Load() / count)
+						// Divide by actualWorkers to estimate serial write time per batch
+						// (parallel workers inflate wall-clock time due to RocksDB internal contention)
+						avgWriteBatch = time.Duration(totalWriteBatchNanos.Load() / count / int64(actualWorkers))
 					}
 
 					logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %.0f/s | GetLedger avg: %s | WriteBatch avg: %s (5k ledger batch) | ETA: %s | TxHashes: %s",
@@ -729,7 +725,7 @@ func runGCSIngestion(
 						formatDurationShort(avgGetLedger),
 						formatDurationShort(avgWriteBatch),
 						helpers.FormatDuration(etaSeconds),
-						txHashesFound.Load(),
+						helpers.FormatNumber(txHashesFound.Load()),
 					)
 
 					// Reset timing counters for next rolling window
