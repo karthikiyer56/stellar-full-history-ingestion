@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/txhash-ingestion-workflow/pkg/compact"
@@ -52,11 +53,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := helpers.EnsureDir(*logFile); err != nil {
+	// Ensure parent directories exist for log files
+	if err := helpers.EnsureDir(filepath.Dir(*logFile)); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to create log directory: %v\n", err)
 		os.Exit(1)
 	}
-	if err := helpers.EnsureDir(*errorFile); err != nil {
+	if err := helpers.EnsureDir(filepath.Dir(*errorFile)); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to create error directory: %v\n", err)
 		os.Exit(1)
 	}
