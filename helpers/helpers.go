@@ -72,13 +72,13 @@ func FormatDuration(d time.Duration) string {
 	// Milliseconds (< 1s): up to 3 decimal places
 	if d < time.Second {
 		ms := float64(d.Nanoseconds()) / float64(time.Millisecond)
-		return formatFloat(ms, 3) + "ms"
+		return FormatFloat(ms, 3) + "ms"
 	}
 
 	// Seconds (< 1m): up to 2 decimal places
 	if d < time.Minute {
 		secs := float64(d.Nanoseconds()) / float64(time.Second)
-		return formatFloat(secs, 2) + "s"
+		return FormatFloat(secs, 2) + "s"
 	}
 
 	// Minutes (< 1h): Xm + seconds with 2 decimal places
@@ -88,7 +88,7 @@ func FormatDuration(d time.Duration) string {
 		if remainingSecs < 0.01 {
 			return fmt.Sprintf("%dm", mins)
 		}
-		return fmt.Sprintf("%dm %ss", mins, formatFloat(remainingSecs, 2))
+		return fmt.Sprintf("%dm %ss", mins, FormatFloat(remainingSecs, 2))
 	}
 
 	// Hours (< 1 day): Xh Ym Zs (whole seconds)
@@ -137,8 +137,8 @@ func FormatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dy %dmo %dd", years, months, days)
 }
 
-// formatFloat formats a float with up to maxDecimals, trimming trailing zeros.
-func formatFloat(value float64, maxDecimals int) string {
+// FormatFloat formats a float with up to maxDecimals, trimming trailing zeros.
+func FormatFloat(value float64, maxDecimals int) string {
 	format := fmt.Sprintf("%%.%df", maxDecimals)
 	s := fmt.Sprintf(format, value)
 

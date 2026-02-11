@@ -717,11 +717,11 @@ func runGCSIngestion(
 						avgWriteBatch = time.Duration(totalWriteBatchNanos.Load() / count / int64(actualWorkers))
 					}
 
-					logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %d/s | GetLedger avg: %s | WriteBatch avg: %s (5k ledger batch) | ETA: %s | TxHashes: %s",
+					logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %s/s | GetLedger avg: %s | WriteBatch avg: %s (5k ledger batch) | ETA: %s | TxHashes: %s",
 						helpers.FormatNumber(currentCompleted),
 						totalLedgers,
-						helpers.FormatNumber(currentPercent),
-						rate,
+						currentPercent,
+						helpers.FormatFloat(rate, 2),
 						formatDurationShort(avgGetLedger),
 						formatDurationShort(avgWriteBatch),
 						helpers.FormatDuration(etaSeconds),
