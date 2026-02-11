@@ -444,12 +444,65 @@ func runGCSIngestion(
 	ctx context.Context,
 	gcsBucketPath string,
 	gcsBufferSize, gcsNumWorkers int,
+	parallelBackends, batchSize int,
 	startLedger, endLedger uint32,
 	txStore interfaces.TxHashStore,
 	logger interfaces.Logger,
 	memMonitor *memory.MemoryMonitor,
 ) error {
-	// Set up GCS backend
+	startTime := time.Now()
+	totalLedgers := int64(endLedger - startLedger + 1)
+
+	actualWorkers := parallelBackends
+	if int64(actualWorkers) > totalLedgers {
+		actualWorkers = int(totalLedgers)
+	}
+
+	logger.Separator()
+	logger.Info("                    STARTING INGESTION (GCS - PARALLEL)")
+	logger.Separator()
+	logger.Info("")
+	logger.Info("Configuration:")
+	logger.Info("  Ledger Range:      %d to %d (%d total)", startLedger, endLedger, totalLedgers)
+	logger.Info("  Parallel Backends: %d (requested: %d)", actualWorkers, parallelBackends)
+	logger.Info("  Batch Size:        %d ledgers", batchSize)
+	logger.Info("  GCS Buffer Size:   %d", gcsBufferSize)
+	logger.Info("  GCS Workers:       %d", gcsNumWorkers)
+	logger.Info("")
+
+	ledgersPerWorker := int(totalLedgers) / actualWorkers
+	remainder := int(totalLedgers) % actualWorkers
+
+	type workerRange struct {
+		id    int
+		start uint32
+		end   uint32
+	}
+
+	ranges := make([]workerRange, actualWorkers)
+	currentStart := startLedger
+
+	for i := 0; i < actualWorkers; i++ {
+		workerCount := ledgersPerWorker
+		if i < remainder {
+			workerCount++
+		}
+
+		ranges[i] = workerRange{
+			id:    i,
+			start: currentStart,
+			end:   currentStart + uint32(workerCount) - 1,
+		}
+		currentStart += uint32(workerCount)
+	}
+
+	logger.Info("Worker Sub-Ranges:")
+	for _, r := range ranges {
+		count := r.end - r.start + 1
+		logger.Info("  Worker %d: ledgers %d to %d (%d ledgers)", r.id, r.start, r.end, count)
+	}
+	logger.Info("")
+
 	datastoreConfig := datastore.DataStoreConfig{
 		Type:   "GCS",
 		Params: map[string]string{"destination_bucket_path": gcsBucketPath},
@@ -458,12 +511,6 @@ func runGCSIngestion(
 		LedgersPerFile:    1,
 		FilesPerPartition: 64000,
 	}
-
-	dataStore, err := datastore.NewDataStore(ctx, datastoreConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create GCS datastore: %w", err)
-	}
-
 	backendConfig := ledgerbackend.BufferedStorageBackendConfig{
 		BufferSize: uint32(gcsBufferSize),
 		NumWorkers: uint32(gcsNumWorkers),
@@ -471,137 +518,221 @@ func runGCSIngestion(
 		RetryWait:  5 * time.Second,
 	}
 
-	backend, err := ledgerbackend.NewBufferedStorageBackend(backendConfig, dataStore, dataStoreSchema)
-	if err != nil {
-		return fmt.Errorf("failed to create GCS backend: %w", err)
-	}
-	defer backend.Close()
+	logger.Info("Creating %d BufferedStorageBackend instances...", actualWorkers)
 
-	startTime := time.Now()
-	totalLedgers := int64(endLedger - startLedger + 1)
+	type backendPair struct {
+		backend   *ledgerbackend.BufferedStorageBackend
+		dataStore datastore.DataStore
+	}
+	backends := make([]backendPair, actualWorkers)
+
+	for i := 0; i < actualWorkers; i++ {
+		dataStore, err := datastore.NewDataStore(ctx, datastoreConfig)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				backends[j].backend.Close()
+			}
+			return fmt.Errorf("failed to create GCS datastore for worker %d: %w", i, err)
+		}
+
+		backend, err := ledgerbackend.NewBufferedStorageBackend(backendConfig, dataStore, dataStoreSchema)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				backends[j].backend.Close()
+			}
+			return fmt.Errorf("failed to create GCS backend for worker %d: %w", i, err)
+		}
+
+		backends[i] = backendPair{backend: backend, dataStore: dataStore}
+	}
+	logger.Info("All %d backends created successfully", actualWorkers)
+	logger.Info("")
+
+	defer func() {
+		for _, bp := range backends {
+			bp.backend.Close()
+		}
+	}()
+
 	ledgersCompleted := atomic.Int64{}
 	txHashesFound := atomic.Int64{}
 
-	logger.Separator()
-	logger.Info("                    STARTING INGESTION (GCS)")
-	logger.Separator()
-	logger.Info("")
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Track timing metrics
-	var getLedgerTotalDuration time.Duration
-	var writeBatchTotalDuration time.Duration
-	var recentGetLedgerTime time.Duration
-	var recentGetLedgerCount int64
-	var recentWriteBatchTime time.Duration
-	var recentWriteBatchCount int64
+	errChan := make(chan error, actualWorkers)
 
-	entriesByCF := make(map[string][]types.Entry)
-	for _, cfName := range cf.Names {
-		entriesByCF[cfName] = make([]types.Entry, 0)
-	}
+	var wg sync.WaitGroup
 
-	var totalTxCount int64
-	onePercent := totalLedgers / 100
-	if onePercent == 0 {
-		onePercent = 1
-	}
-	lastProgressPercent := int64(0)
+	logger.Info("Starting %d parallel workers...", actualWorkers)
+	for i := 0; i < actualWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int, workerStart, workerEnd uint32, backend *ledgerbackend.BufferedStorageBackend) {
+			defer wg.Done()
 
-	// Sequential loop - SDK handles buffering internally
-	for ledgerSeq := startLedger; ledgerSeq <= endLedger; ledgerSeq++ {
-		// Get ledger and time it
-		getLedgerStart := time.Now()
-		ledger, err := backend.GetLedger(ctx, ledgerSeq)
-		getLedgerDuration := time.Since(getLedgerStart)
-
-		if err != nil {
-			return fmt.Errorf("failed to get ledger %d from GCS: %w", ledgerSeq, err)
-		}
-
-		getLedgerTotalDuration += getLedgerDuration
-		recentGetLedgerTime += getLedgerDuration
-		recentGetLedgerCount++
-
-		// Extract transaction hashes
-		entries, txCount, err := extractTxHashesFromLCM(ledger, ledgerSeq)
-		if err != nil {
-			return fmt.Errorf("failed to extract hashes from ledger %d: %w", ledgerSeq, err)
-		}
-
-		for cfName, cfEntries := range entries {
-			entriesByCF[cfName] = append(entriesByCF[cfName], cfEntries...)
-		}
-		totalTxCount += int64(txCount)
-
-		// Write batch when size reached
-		if int64(ledgerSeq-startLedger+1)%int64(BatchSize) == 0 || ledgerSeq == endLedger {
-			writeBatchStart := time.Now()
-			if _, err := txStore.WriteBatch(entriesByCF); err != nil {
-				return fmt.Errorf("failed to write batch: %w", err)
-			}
-			writeBatchDuration := time.Since(writeBatchStart)
-			writeBatchTotalDuration += writeBatchDuration
-			recentWriteBatchTime += writeBatchDuration
-			recentWriteBatchCount++
-
-			// Reset batch
-			entriesByCF = make(map[string][]types.Entry)
+			entriesByCF := make(map[string][]types.Entry)
 			for _, cfName := range cf.Names {
 				entriesByCF[cfName] = make([]types.Entry, 0)
 			}
+			var batchTxCount int64
+
+			for ledgerSeq := workerStart; ledgerSeq <= workerEnd; ledgerSeq++ {
+				select {
+				case <-workerCtx.Done():
+					return
+				default:
+				}
+
+				ledger, err := backend.GetLedger(workerCtx, ledgerSeq)
+				if err != nil {
+					select {
+					case errChan <- fmt.Errorf("worker %d failed to get ledger %d: %w", workerID, ledgerSeq, err):
+					default:
+					}
+					cancel()
+					return
+				}
+
+				entries, txCount, err := extractTxHashesFromLCM(ledger, ledgerSeq)
+				if err != nil {
+					select {
+					case errChan <- fmt.Errorf("worker %d failed to extract hashes from ledger %d: %w", workerID, ledgerSeq, err):
+					default:
+					}
+					cancel()
+					return
+				}
+
+				for cfName, cfEntries := range entries {
+					entriesByCF[cfName] = append(entriesByCF[cfName], cfEntries...)
+				}
+				batchTxCount += int64(txCount)
+
+				batchCurrentSize := 0
+				for _, cfName := range cf.Names {
+					batchCurrentSize += len(entriesByCF[cfName])
+					break
+				}
+
+				shouldWriteBatch := false
+				ledgersProcessed := int(ledgerSeq - workerStart + 1)
+
+				if ledgersProcessed%batchSize == 0 {
+					shouldWriteBatch = true
+				} else if ledgerSeq == workerEnd {
+					shouldWriteBatch = true
+				}
+
+				if shouldWriteBatch && len(entriesByCF[cf.Names[0]]) > 0 {
+					if _, err := txStore.WriteBatch(entriesByCF); err != nil {
+						select {
+						case errChan <- fmt.Errorf("worker %d failed to write batch: %w", workerID, err):
+						default:
+						}
+						cancel()
+						return
+					}
+
+					ledgersCompleted.Add(int64(ledgersProcessed))
+					txHashesFound.Add(batchTxCount)
+
+					entriesByCF = make(map[string][]types.Entry)
+					for _, cfName := range cf.Names {
+						entriesByCF[cfName] = make([]types.Entry, 0)
+					}
+					batchTxCount = 0
+				}
+			}
+
+			if len(entriesByCF[cf.Names[0]]) > 0 {
+				if _, err := txStore.WriteBatch(entriesByCF); err != nil {
+					select {
+					case errChan <- fmt.Errorf("worker %d failed to write final batch: %w", workerID, err):
+					default:
+					}
+					cancel()
+					return
+				}
+
+				finalLedgers := int64(workerEnd-workerStart+1) - ledgersCompleted.Load()
+				if finalLedgers > 0 {
+					ledgersCompleted.Add(finalLedgers)
+				}
+				txHashesFound.Add(batchTxCount)
+			}
+		}(ranges[i].id, ranges[i].start, ranges[i].end, backends[i].backend)
+	}
+
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+
+		onePercent := totalLedgers / 100
+		if onePercent == 0 {
+			onePercent = 1
 		}
+		lastProgressPercent := int64(0)
 
-		ledgersCompleted.Add(1)
-		txHashesFound.Add(int64(txCount))
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
 
-		// Progress logging every 1%
-		currentCompleted := ledgersCompleted.Load()
-		if currentCompleted > 0 {
-			currentPercent := currentCompleted / onePercent
-			if currentPercent > lastProgressPercent {
-				elapsed := time.Since(startTime)
-				rate := float64(currentCompleted) / elapsed.Seconds()
-				remainingLedgers := totalLedgers - currentCompleted
-				etaSeconds := time.Duration(int64(float64(remainingLedgers)/rate)) * time.Second
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				currentCompleted := ledgersCompleted.Load()
+				if currentCompleted > 0 {
+					currentPercent := currentCompleted / onePercent
+					if currentPercent > lastProgressPercent {
+						elapsed := time.Since(startTime)
+						rate := float64(currentCompleted) / elapsed.Seconds()
+						remainingLedgers := totalLedgers - currentCompleted
+						etaSeconds := time.Duration(int64(float64(remainingLedgers)/rate)) * time.Second
 
-				avgGetLedger := time.Duration(int64(recentGetLedgerTime) / recentGetLedgerCount)
-				avgWriteBatch := time.Duration(int64(recentWriteBatchTime) / recentWriteBatchCount)
+						logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %.0f/s | ETA: %s | TxHashes: %s",
+							helpers.FormatNumber(currentCompleted),
+							totalLedgers,
+							currentPercent,
+							rate,
+							helpers.FormatDuration(etaSeconds),
+							helpers.FormatNumber(txHashesFound.Load()),
+						)
 
-				logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %.0f/s | GetLedger avg: %s | WriteBatch avg: %s | ETA: %s",
-					helpers.FormatNumber(currentCompleted),
-					totalLedgers,
-					currentPercent,
-					rate,
-					formatDurationShort(avgGetLedger),
-					formatDurationShort(avgWriteBatch),
-					helpers.FormatDuration(etaSeconds),
-				)
-
-				// Reset recent tracking for next 1% boundary
-				recentGetLedgerTime = 0
-				recentGetLedgerCount = 0
-				recentWriteBatchTime = 0
-				recentWriteBatchCount = 0
-				lastProgressPercent = currentPercent
+						lastProgressPercent = currentPercent
+					}
+				}
 			}
 		}
+	}()
+
+	wg.Wait()
+	cancel()
+
+	<-progressDone
+
+	select {
+	case err := <-errChan:
+		return err
+	default:
 	}
 
 	totalElapsed := time.Since(startTime)
 	totalTxHashes := txHashesFound.Load()
+	finalLedgersCompleted := ledgersCompleted.Load()
 	txHashRate := float64(totalTxHashes) / totalElapsed.Seconds()
+	ledgerRate := float64(finalLedgersCompleted) / totalElapsed.Seconds()
 
 	logger.Separator()
 	logger.Info("                    INGESTION COMPLETE")
 	logger.Separator()
 	logger.Info("")
 	logger.Info("Statistics:")
-	logger.Info("  Total Ledgers:     %d", totalLedgers)
+	logger.Info("  Total Ledgers:     %s", helpers.FormatNumber(finalLedgersCompleted))
 	logger.Info("  Total TxHashes:    %s", helpers.FormatNumber(totalTxHashes))
 	logger.Info("  Duration:          %s", helpers.FormatDuration(totalElapsed))
-	logger.Info("  GetLedger Total:   %s", helpers.FormatDuration(getLedgerTotalDuration))
-	logger.Info("  WriteBatch Total:  %s", helpers.FormatDuration(writeBatchTotalDuration))
-	logger.Info("  Throughput:        %s/s", helpers.FormatNumber(int64(txHashRate)))
+	logger.Info("  Ledger Rate:       %.0f/s", ledgerRate)
+	logger.Info("  TxHash Rate:       %s/s", helpers.FormatNumber(int64(txHashRate)))
 	logger.Info("  Memory (RSS):      %.2f GB", memMonitor.CurrentRSSGB())
 	logger.Info("")
 
@@ -717,11 +848,11 @@ func main() {
 	logger.Info("RocksDB store created with 16 column families")
 	logger.Info("")
 
-	// Run appropriate ingestion mode
 	var ingestionErr error
 	if useGCS {
 		ctx := context.Background()
 		ingestionErr = runGCSIngestion(ctx, *gcsBucketPath, *gcsBufferSize, *gcsNumWorkers,
+			*gcsParallelBackends, *gcsBatchSize,
 			uint32(*startLedger), uint32(*endLedger), txStore, logger, memMonitor)
 	} else {
 		ingestionErr = runLFSIngestion(*lfsStore, uint32(*startLedger), uint32(*endLedger),
