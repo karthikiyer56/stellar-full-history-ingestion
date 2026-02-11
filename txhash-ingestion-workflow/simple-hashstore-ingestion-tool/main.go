@@ -557,6 +557,12 @@ func runGCSIngestion(
 	ledgersCompleted := atomic.Int64{}
 	txHashesFound := atomic.Int64{}
 
+	// Timing metrics for enhanced logging (rolling averages)
+	totalGetLedgerNanos := atomic.Int64{}
+	getLedgerCallCount := atomic.Int64{}
+	totalWriteBatchNanos := atomic.Int64{}
+	writeBatchCallCount := atomic.Int64{}
+
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -583,7 +589,10 @@ func runGCSIngestion(
 				default:
 				}
 
+				getLedgerStart := time.Now()
 				ledger, err := backend.GetLedger(workerCtx, ledgerSeq)
+				totalGetLedgerNanos.Add(time.Since(getLedgerStart).Nanoseconds())
+				getLedgerCallCount.Add(1)
 				if err != nil {
 					select {
 					case errChan <- fmt.Errorf("worker %d failed to get ledger %d: %w", workerID, ledgerSeq, err):
@@ -624,6 +633,7 @@ func runGCSIngestion(
 				}
 
 				if shouldWriteBatch && len(entriesByCF[cf.Names[0]]) > 0 {
+					writeBatchStart := time.Now()
 					if _, err := txStore.WriteBatch(entriesByCF); err != nil {
 						select {
 						case errChan <- fmt.Errorf("worker %d failed to write batch: %w", workerID, err):
@@ -632,6 +642,8 @@ func runGCSIngestion(
 						cancel()
 						return
 					}
+					totalWriteBatchNanos.Add(time.Since(writeBatchStart).Nanoseconds())
+					writeBatchCallCount.Add(1)
 
 					ledgersCompleted.Add(int64(ledgersProcessed))
 					txHashesFound.Add(batchTxCount)
@@ -645,6 +657,7 @@ func runGCSIngestion(
 			}
 
 			if len(entriesByCF[cf.Names[0]]) > 0 {
+				writeBatchStart := time.Now()
 				if _, err := txStore.WriteBatch(entriesByCF); err != nil {
 					select {
 					case errChan <- fmt.Errorf("worker %d failed to write final batch: %w", workerID, err):
@@ -653,6 +666,8 @@ func runGCSIngestion(
 					cancel()
 					return
 				}
+				totalWriteBatchNanos.Add(time.Since(writeBatchStart).Nanoseconds())
+				writeBatchCallCount.Add(1)
 
 				finalLedgers := int64(workerEnd-workerStart+1) - ledgersCompleted.Load()
 				if finalLedgers > 0 {
@@ -690,16 +705,34 @@ func runGCSIngestion(
 						remainingLedgers := totalLedgers - currentCompleted
 						etaSeconds := time.Duration(int64(float64(remainingLedgers)/rate)) * time.Second
 
-						logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %.0f/s | ETA: %s | TxHashes: %s",
+						// Calculate rolling averages
+						avgGetLedger := time.Duration(0)
+						if count := getLedgerCallCount.Load(); count > 0 {
+							avgGetLedger = time.Duration(totalGetLedgerNanos.Load() / count)
+						}
+						avgWriteBatch := time.Duration(0)
+						if count := writeBatchCallCount.Load(); count > 0 {
+							avgWriteBatch = time.Duration(totalWriteBatchNanos.Load() / count)
+						}
+
+						logger.Info("[PROGRESS] Ledgers: %s/%d (%d%%) | Rate: %.0f/s | GetLedger avg: %s | WriteBatch avg: %s (5k ledger batch) | ETA: %s | TxHashes: %s",
 							helpers.FormatNumber(currentCompleted),
 							totalLedgers,
 							currentPercent,
 							rate,
+							formatDurationShort(avgGetLedger),
+							formatDurationShort(avgWriteBatch),
 							helpers.FormatDuration(etaSeconds),
 							helpers.FormatNumber(txHashesFound.Load()),
 						)
 
 						lastProgressPercent = currentPercent
+
+						// Reset timing counters for next rolling window
+						totalGetLedgerNanos.Store(0)
+						getLedgerCallCount.Store(0)
+						totalWriteBatchNanos.Store(0)
+						writeBatchCallCount.Store(0)
 					}
 				}
 			}
