@@ -171,7 +171,7 @@ func DefaultRocksDBSettings() RocksDBSettings {
 		MaxWriteBufferNumber:        2,
 		MinWriteBufferNumberToMerge: 1,
 		TargetFileSizeMB:            256,
-		MaxBackgroundJobs:           16,
+		MaxBackgroundJobs:           32,
 		BloomFilterBitsPerKey:       12,
 		BlockCacheSizeMB:            DefaultBlockCacheMB,
 		MaxOpenFiles:                -1,

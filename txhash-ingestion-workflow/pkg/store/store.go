@@ -199,15 +199,22 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 	logger.Info("RocksDB store opened successfully in %s:", helpers.FormatDuration(openDuration))
 	logger.Info("  Mode:            %s", map[bool]string{true: "READ-ONLY", false: "READ-WRITE"}[settings.ReadOnly])
 	logger.Info("  Column Families: %d", len(cfHandles)-1) // -1 for default
+	logger.Info("")
+	logger.Info("  ROCKSDB SETTINGS:")
+	logger.Info("    MaxBackgroundJobs:    %d", settings.MaxBackgroundJobs)
+	logger.Info("    MaxOpenFiles:         %d", settings.MaxOpenFiles)
+	logger.Info("    TargetFileSizeMB:     %d", settings.TargetFileSizeMB)
+	logger.Info("    BloomFilterBitsPerKey: %d", settings.BloomFilterBitsPerKey)
+	logger.Info("    BlockCacheSizeMB:     %d", settings.BlockCacheSizeMB)
 	if !settings.ReadOnly {
+		logger.Info("    WriteBufferSizeMB:    %d", settings.WriteBufferSizeMB)
+		logger.Info("    MaxWriteBufferNumber: %d", settings.MaxWriteBufferNumber)
+		logger.Info("    MinWriteBufferNumberToMerge: %d", settings.MinWriteBufferNumberToMerge)
 		memtables := settings.WriteBufferSizeMB * settings.MaxWriteBufferNumber * len(cf.Names)
-		logger.Info("  MemTable RAM:    %d MB", memtables)
-	}
-	logger.Info("  Block Cache:     %d MB", settings.BlockCacheSizeMB)
-	logger.Info("  Bloom Filter:    %d bits/key", settings.BloomFilterBitsPerKey)
-	if !settings.ReadOnly {
-		logger.Info("  WAL:             ENABLED (always)")
-		logger.Info("  Auto-Compaction: DISABLED (manual phase)")
+		logger.Info("    Total MemTable RAM:   %d MB (%d MB × %d buffers × %d CFs)",
+			memtables, settings.WriteBufferSizeMB, settings.MaxWriteBufferNumber, len(cf.Names))
+		logger.Info("    WAL:                  ENABLED (always)")
+		logger.Info("    Auto-Compaction:      DISABLED (manual phase)")
 	}
 
 	// Log detailed store stats (SST files, WAL size, etc.)
@@ -629,11 +636,20 @@ func (s *RocksDBTxHashStore) logStoreStats(openDuration time.Duration) {
 	s.logger.Info("    Immutable MemTable Entries: %s", numEntriesImmMemTables)
 	s.logger.Info("    Live Versions:            %s", walFilesNum)
 
-	// Aggregate SST stats across all CFs
+	// Aggregate SST stats across all CFs and collect per-CF data
 	var totalSSTFiles, totalSSTSize, totalKeys int64
 	var totalL0Files int64
 
-	for _, cfName := range cf.Names {
+	// Per-CF statistics for detailed breakdown
+	type cfSSTStats struct {
+		name  string
+		size  int64
+		files int64
+		keys  int64
+	}
+	cfStats := make([]cfSSTStats, len(cf.Names))
+
+	for i, cfName := range cf.Names {
 		cfHandle := s.getCFHandleByName(cfName)
 
 		// SST files
@@ -641,21 +657,30 @@ func (s *RocksDBTxHashStore) logStoreStats(openDuration time.Duration) {
 		numSSTFiles := s.db.GetPropertyCF("rocksdb.num-files-at-level0", cfHandle)
 		estimatedKeys := s.db.GetPropertyCF("rocksdb.estimate-num-keys", cfHandle)
 
-		var size, files, keys int64
+		var size, l0Files, keys int64
 		fmt.Sscanf(sstFilesSize, "%d", &size)
-		fmt.Sscanf(numSSTFiles, "%d", &files)
+		fmt.Sscanf(numSSTFiles, "%d", &l0Files)
 		fmt.Sscanf(estimatedKeys, "%d", &keys)
 
 		totalSSTSize += size
-		totalL0Files += files
+		totalL0Files += l0Files
 		totalKeys += keys
 
-		// Count files at all levels
+		// Count files at all levels for this CF
+		var cfFileCount int64
 		for level := 0; level <= 6; level++ {
 			numAtLevel := s.db.GetPropertyCF(fmt.Sprintf("rocksdb.num-files-at-level%d", level), cfHandle)
 			var n int64
 			fmt.Sscanf(numAtLevel, "%d", &n)
+			cfFileCount += n
 			totalSSTFiles += n
+		}
+
+		cfStats[i] = cfSSTStats{
+			name:  cfName,
+			size:  size,
+			files: cfFileCount,
+			keys:  keys,
 		}
 	}
 
@@ -680,19 +705,23 @@ func (s *RocksDBTxHashStore) logStoreStats(openDuration time.Duration) {
 		s.logger.Info("          Check the MemTable entries above for recovered data")
 	}
 
-	// Log per-CF breakdown for debugging if there are many keys
+	// Log per-CF breakdown with SST sizes if there are any keys
 	if totalKeys > 0 {
 		s.logger.Info("")
-		s.logger.Info("  PER-CF ESTIMATED KEYS:")
-		for _, cfName := range cf.Names {
-			cfHandle := s.getCFHandleByName(cfName)
-			estimatedKeys := s.db.GetPropertyCF("rocksdb.estimate-num-keys", cfHandle)
-			var keys int64
-			fmt.Sscanf(estimatedKeys, "%d", &keys)
-			if keys > 0 {
-				s.logger.Info("    CF [%s]: %s", cfName, helpers.FormatNumber(keys))
+		s.logger.Info("  PER-CF SST BREAKDOWN:")
+		s.logger.Info("    %-4s %15s %12s %10s", "CF", "Est. Keys", "SST Size", "Files")
+		s.logger.Info("    %-4s %15s %12s %10s", "----", "---------------", "------------", "----------")
+		for _, stat := range cfStats {
+			if stat.keys > 0 || stat.size > 0 {
+				s.logger.Info("    %-4s %15s %12s %10d",
+					stat.name,
+					helpers.FormatNumber(stat.keys),
+					helpers.FormatBytes(stat.size),
+					stat.files)
 			}
 		}
+		s.logger.Info("    %-4s %15s %12s %10s", "----", "---------------", "------------", "----------")
+		s.logger.Info("    %-4s %15s %12s %10d", "TOT", helpers.FormatNumber(totalKeys), helpers.FormatBytes(totalSSTSize), totalSSTFiles)
 	}
 
 	s.logger.Info("")
