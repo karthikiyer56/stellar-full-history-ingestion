@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//	./simple-captive-core \
+//	./simple-captive-core-runner \
 //	  --stellar-core-binary /path/to/stellar-core \
 //	  --stellar-core-toml-config /path/to/stellar-core.toml \
 //	  --start-ledger 50000000 \
