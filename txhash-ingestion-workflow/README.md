@@ -1282,14 +1282,14 @@ Benchmarks query performance against a compacted RocksDB store. Useful for testi
 #### Building
 
 ```bash
-cd query-benchmark
+cd rocksdb-txhashstore-query-tool
 go build .
 ```
 
 #### Usage
 
 ```bash
-./query-benchmark \
+./rocksdb-txhashstore-query-tool \
   --rocksdb-path /path/to/rocksdb \
   --query-file /path/to/queries.txt \
   --output /path/to/results.csv \
@@ -1334,7 +1334,7 @@ Builds RecSplit minimal perfect hash indexes from a compacted RocksDB store. Thi
 #### Building
 
 ```bash
-cd build-recsplit
+cd rocksdb-txhashstore-build-recsplit-tool
 go build .
 ```
 
@@ -1342,7 +1342,7 @@ go build .
 
 ```bash
 # Default mode: Single combined txhash.idx file
-./build-recsplit \
+./rocksdb-txhashstore-build-recsplit-tool \
   --rocksdb-path /path/to/rocksdb \
   --output-dir /path/to/indexes \
   --log /path/to/build.log \
@@ -1350,7 +1350,7 @@ go build .
   --block-cache-mb 8192
 
 # Multi-index mode: 16 separate cf-X.idx files (built in parallel)
-./build-recsplit \
+./rocksdb-txhashstore-build-recsplit-tool \
   --rocksdb-path /path/to/rocksdb \
   --output-dir /path/to/indexes \
   --log /path/to/build.log \
@@ -1359,7 +1359,7 @@ go build .
   --block-cache-mb 8192
 
 # With compaction and verification
-./build-recsplit \
+./rocksdb-txhashstore-build-recsplit-tool \
   --rocksdb-path /path/to/rocksdb \
   --output-dir /path/to/indexes \
   --log /path/to/build.log \

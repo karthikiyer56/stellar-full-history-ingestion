@@ -167,7 +167,7 @@ build-workflow:
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
-	go build -o bin/ingestion-workflow ./cmd/ingestion-workflow
+	go build -o bin/ingestion-workflow ./ingestion-workflow
 	@echo "✅ Binary created at: bin/ingestion-workflow"
 
 # Run all workflow tests with RocksDB
@@ -177,7 +177,7 @@ test-workflow:
 	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
 	$(ROCKSDB_LIB_PATH) \
-	go test -v ./cmd/ingestion-workflow/...
+	go test -v ./ingestion-workflow/...
 
 # Run store tests only
 test-stores:
@@ -186,4 +186,4 @@ test-stores:
 	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
 	$(ROCKSDB_LIB_PATH) \
-	go test -v ./cmd/ingestion-workflow/internal/workflow/stores/...
+	go test -v ./ingestion-workflow/internal/workflow/stores/...
