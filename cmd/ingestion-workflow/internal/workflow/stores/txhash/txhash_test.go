@@ -1,12 +1,12 @@
 package txhash
 
 import (
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/stores/txhash/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/types"
 	"testing"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/txhash/cf"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 func TestTxHashStorePath(t *testing.T) {

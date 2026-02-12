@@ -3,6 +3,8 @@ package transition
 import (
 	"context"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/stores/txhash/cf"
 	"path/filepath"
 	"sync"
 	"time"
@@ -10,8 +12,6 @@ import (
 	erigonlog "github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/recsplit"
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/txhash/cf"
 )
 
 // =============================================================================

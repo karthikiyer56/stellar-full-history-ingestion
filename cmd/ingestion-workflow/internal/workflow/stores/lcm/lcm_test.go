@@ -1,11 +1,11 @@
 package lcm
 
 import (
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/types"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

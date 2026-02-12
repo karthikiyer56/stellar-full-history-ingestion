@@ -27,11 +27,10 @@ package logging
 
 import (
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/interfaces"
 	"os"
 	"sync"
 	"time"
-
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
 )
 
 // =============================================================================

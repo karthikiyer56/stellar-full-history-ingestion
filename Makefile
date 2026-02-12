@@ -177,7 +177,7 @@ test-workflow:
 	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
 	$(ROCKSDB_LIB_PATH) \
-	go test -v ./internal/workflow/...
+	go test -v ./cmd/ingestion-workflow/...
 
 # Run store tests only
 test-stores:
@@ -186,4 +186,4 @@ test-stores:
 	CGO_CFLAGS="$(ROCKSDB_CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(ROCKSDB_CGO_LDFLAGS)" \
 	$(ROCKSDB_LIB_PATH) \
-	go test -v ./internal/workflow/stores/...
+	go test -v ./cmd/ingestion-workflow/internal/workflow/stores/...

@@ -29,18 +29,17 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/backend"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/config"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/stores/lcm"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/stores/txhash"
+	transition2 "github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/transition"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/types"
 	"path/filepath"
 	"sync"
 
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
-
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/backend"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/config"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/lcm"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/txhash"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/transition"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 // =============================================================================
@@ -189,15 +188,15 @@ func (bc *backfillCoordinator) processRange(ctx context.Context, rangeID uint32)
 
 	rangeLogger := bc.logger.WithScope(fmt.Sprintf("RANGE-%04d", rangeID))
 	lfsBasePath := filepath.Join(bc.config.Service.DataDir, bc.config.ImmutableStores.LedgersBase)
-	lfsWriter, err := transition.NewLFSWriter(lfsBasePath, rangeLogger)
+	lfsWriter, err := transition2.NewLFSWriter(lfsBasePath, rangeLogger)
 	if err != nil {
 		return fmt.Errorf("failed to create LFS writer: %w", err)
 	}
 	defer lfsWriter.Close()
 
-	recsplitBuilder := transition.NewRecSplitBuilder(bc.config.Service.DataDir, rangeLogger)
+	recsplitBuilder := transition2.NewRecSplitBuilder(bc.config.Service.DataDir, rangeLogger)
 
-	transitionCoordinator := transition.NewTransitionCoordinator(
+	transitionCoordinator := transition2.NewTransitionCoordinator(
 		bc.metaStore,
 		lcmStore,
 		txStore,

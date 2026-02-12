@@ -52,15 +52,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/config"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/logging"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/orchestrator"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/stores/meta"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/types"
 	"log"
 	"os"
 	"path/filepath"
-
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/config"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/logging"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/orchestrator"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/stores/meta"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 const (

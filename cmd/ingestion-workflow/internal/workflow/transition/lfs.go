@@ -29,10 +29,10 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/interfaces"
 	"os"
 	"path/filepath"
 
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/interfaces"
 	"github.com/klauspost/compress/zstd"
 )
 

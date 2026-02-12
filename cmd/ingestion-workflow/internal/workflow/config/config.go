@@ -2,10 +2,10 @@ package config
 
 import (
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/types"
 	"os"
 
 	"github.com/BurntSushi/toml"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/types"
 )
 
 // Constants for configuration defaults and calculations.

@@ -3,9 +3,9 @@ package backend
 import (
 	"context"
 	"fmt"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/cmd/ingestion-workflow/internal/workflow/config"
 	"time"
 
-	"github.com/karthikiyer56/stellar-full-history-ingestion/internal/workflow/config"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	"github.com/stellar/go-stellar-sdk/support/datastore"
 )
