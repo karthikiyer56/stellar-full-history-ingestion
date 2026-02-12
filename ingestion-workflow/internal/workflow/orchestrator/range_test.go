@@ -3,17 +3,17 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/config"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/interfaces"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/logging"
-	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/stores/txhash/cf"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/karthikiyer56/stellar-full-history-ingestion/helpers"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/config"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/interfaces"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/logging"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/stores/txhash/cf"
+	"github.com/karthikiyer56/stellar-full-history-ingestion/ingestion-workflow/internal/workflow/testutil"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
-	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
@@ -22,8 +22,7 @@ func TestRangeOrchestrator_RunFreshIngestion(t *testing.T) {
 
 	backend := &mockBackend{ledgers: make(map[uint32]xdr.LedgerCloseMeta)}
 	for seq := uint32(1); seq <= 3; seq++ {
-		lcm, _ := makeTestLedgerCloseMeta(seq, network.TestNetworkPassphrase)
-		backend.ledgers[seq] = lcm
+		backend.ledgers[seq] = testutil.CreateTestLCM(seq)
 	}
 
 	meta := newMockMetaStore()
@@ -43,8 +42,8 @@ func TestRangeOrchestrator_RunFreshIngestion(t *testing.T) {
 	if len(lcmStore.entries) != 3 {
 		t.Fatalf("expected 3 LCM entries, got %d", len(lcmStore.entries))
 	}
-	if len(txStore.entries) != 3 {
-		t.Fatalf("expected 3 txhash entries, got %d", len(txStore.entries))
+	if len(txStore.entries) != 0 {
+		t.Fatalf("expected 0 txhash entries (test LCM has no transactions), got %d", len(txStore.entries))
 	}
 
 	if !reflect.DeepEqual(meta.commitCalls, []uint32{2, 3}) {
@@ -76,8 +75,7 @@ func TestRangeOrchestrator_RunResumeFromCheckpoint(t *testing.T) {
 
 	backend := &mockBackend{ledgers: make(map[uint32]xdr.LedgerCloseMeta)}
 	for seq := uint32(1); seq <= 4; seq++ {
-		lcm, _ := makeTestLedgerCloseMeta(seq, network.TestNetworkPassphrase)
-		backend.ledgers[seq] = lcm
+		backend.ledgers[seq] = testutil.CreateTestLCM(seq)
 	}
 
 	meta := newMockMetaStore()
@@ -111,8 +109,8 @@ func TestRangeOrchestrator_RunResumeFromCheckpoint(t *testing.T) {
 	if len(lcmStore.entries) != 2 {
 		t.Fatalf("expected 2 LCM entries, got %d", len(lcmStore.entries))
 	}
-	if len(txStore.entries) != 2 {
-		t.Fatalf("expected 2 txhash entries, got %d", len(txStore.entries))
+	if len(txStore.entries) != 0 {
+		t.Fatalf("expected 0 txhash entries (test LCM has no transactions), got %d", len(txStore.entries))
 	}
 }
 
@@ -130,53 +128,6 @@ func testConfig(start, end uint32, checkpointInterval int, bucketPath, mode stri
 			},
 		},
 	}
-}
-
-func makeTestLedgerCloseMeta(seq uint32, passphrase string) (xdr.LedgerCloseMeta, [32]byte) {
-	txEnv := xdr.TransactionEnvelope{
-		Type: xdr.EnvelopeTypeEnvelopeTypeTx,
-		V1: &xdr.TransactionV1Envelope{
-			Tx: xdr.Transaction{
-				Ext:           xdr.TransactionExt{V: 0},
-				SourceAccount: xdr.MustMuxedAddress("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
-				Operations:    []xdr.Operation{},
-				Fee:           xdr.Uint32(seq),
-				SeqNum:        xdr.SequenceNumber(seq),
-			},
-			Signatures: []xdr.DecoratedSignature{},
-		},
-	}
-
-	txHash, _ := network.HashTransactionInEnvelope(txEnv, passphrase)
-	txMeta := xdr.TransactionResultMeta{
-		Result:            xdr.TransactionResultPair{TransactionHash: xdr.Hash(txHash)},
-		TxApplyProcessing: xdr.TransactionMeta{V: 3, V3: &xdr.TransactionMetaV3{}},
-	}
-
-	ledgerHeader := xdr.LedgerHeaderHistoryEntry{
-		Header: xdr.LedgerHeader{LedgerSeq: xdr.Uint32(seq)},
-	}
-
-	lcm := xdr.LedgerCloseMeta{V: 1,
-		V1: &xdr.LedgerCloseMetaV1{
-			LedgerHeader: ledgerHeader,
-			TxProcessing: []xdr.TransactionResultMeta{txMeta},
-			TxSet: xdr.GeneralizedTransactionSet{V: 1,
-				V1TxSet: &xdr.TransactionSetV1{
-					Phases: []xdr.TransactionPhase{{
-						V: 0,
-						V0Components: &[]xdr.TxSetComponent{{
-							TxsMaybeDiscountedFee: &xdr.TxSetComponentTxsMaybeDiscountedFee{
-								Txs: []xdr.TransactionEnvelope{txEnv},
-							},
-						}},
-					}},
-				},
-			},
-		},
-	}
-
-	return lcm, txHash
 }
 
 type mockBackend struct {
@@ -400,14 +351,14 @@ func newMockTxHashStore() *mockTxHashStore {
 
 func (m *mockTxHashStore) Open() (time.Duration, error) { return 0, nil }
 
-func (m *mockTxHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) error {
+func (m *mockTxHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entry) (map[string]time.Duration, error) {
 	for _, entries := range entriesByCF {
 		for _, entry := range entries {
 			m.entries[string(entry.Key)] = helpers.BytesToUint32(entry.Value)
 		}
 	}
 	m.batches++
-	return nil
+	return map[string]time.Duration{}, nil
 }
 
 func (m *mockTxHashStore) Get(txHash []byte) (uint32, bool, error) {
