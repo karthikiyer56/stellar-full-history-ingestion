@@ -774,23 +774,32 @@ func runGCSIngestion(
 }
 
 func main() {
+	// === Mode Selection (mutually exclusive) ===
 	useLFS := flag.Bool("use-lfs", false, "Use LFS (Local File System) as data source")
 	useGCS := flag.Bool("use-gcs", false, "Use GCS (Google Cloud Storage) as data source")
-	lfsStore := flag.String("lfs-store", "", "Path to LFS ledger store (required with --use-lfs)")
-	gcsBucketPath := flag.String("gcs-bucket-path", DefaultGCSBucketPath, "GCS bucket path")
+
+	// === Required for all modes ===
 	startLedger := flag.Uint64("start-ledger", 0, "First ledger to ingest (required)")
 	endLedger := flag.Uint64("end-ledger", 0, "Last ledger to ingest (required)")
 	outputDir := flag.String("output-dir", "", "Base output directory (required)")
 	logFile := flag.String("log-file", "", "Path to log file (required)")
 	errorFile := flag.String("error-file", "", "Path to error file (required)")
-	numWorkers := flag.Int("workers", NumWorkers, "Number of workers (default 16)")
-	numReaders := flag.Int("readers", NumReaders, "Number of LFS readers (default 4)")
-	gcsBufferSize := flag.Int("gcs-buffer-size", DefaultGCSBufferSize, "GCS BufferedStorageBackend buffer size")
-	gcsNumWorkers := flag.Int("gcs-workers", DefaultGCSNumWorkers, "GCS BufferedStorageBackend num workers")
-	gcsParallelBackends := flag.Int("gcs-parallel-backends", 10, "GCS parallel backends (min 1)")
-	gcsBatchSize := flag.Int("gcs-batch-size", 5000, "GCS batch size in ledgers")
-	flushOnly := flag.Bool("flush-only", false, "Flush existing RocksDB store and exit (no ingestion)")
-	rocksdbPath := flag.String("rocksdb-path", "", "Path to existing RocksDB store (required for --flush-only)")
+
+	// === LFS mode options ===
+	lfsStore := flag.String("lfs-store", "", "[LFS] Path to LFS ledger store (required with --use-lfs)")
+	numWorkers := flag.Int("workers", NumWorkers, "[LFS] Number of workers for decompress/unmarshal/extract (default 16)")
+	numReaders := flag.Int("readers", NumReaders, "[LFS] Number of parallel LFS I/O readers (default 4)")
+
+	// === GCS mode options ===
+	gcsBucketPath := flag.String("gcs-bucket-path", DefaultGCSBucketPath, "[GCS] Bucket path (default: sdf-ledger-close-meta/v1/ledgers/pubnet)")
+	gcsBufferSize := flag.Int("gcs-buffer-size", DefaultGCSBufferSize, "[GCS] BufferedStorageBackend buffer size (default 10000)")
+	gcsNumWorkers := flag.Int("gcs-workers", DefaultGCSNumWorkers, "[GCS] BufferedStorageBackend num workers (default 200)")
+	gcsParallelBackends := flag.Int("gcs-parallel-backends", 10, "[GCS] Number of parallel backends, each handles a ledger sub-range (default 10)")
+	gcsBatchSize := flag.Int("gcs-batch-size", 5000, "[GCS] Ledgers per RocksDB WriteBatch (default 5000)")
+
+	// === Flush-only mode (special mode, skips ingestion) ===
+	flushOnly := flag.Bool("flush-only", false, "[Special] Flush existing RocksDB store and exit (no ingestion)")
+	rocksdbPath := flag.String("rocksdb-path", "", "[Special] Path to existing RocksDB store (required for --flush-only)")
 
 	flag.Parse()
 
@@ -914,6 +923,9 @@ func main() {
 	logger.Separator()
 	logger.Info("")
 	logger.Info("Configuration:")
+	logger.Info("  Start Ledger:    %d", *startLedger)
+	logger.Info("  End Ledger:      %d", *endLedger)
+	logger.Info("  Output Dir:      %s", *outputDir)
 	if *useGCS {
 		logger.Info("  Mode:            GCS (Google Cloud Storage)")
 		logger.Info("  Bucket Path:     %s", *gcsBucketPath)
@@ -926,11 +938,9 @@ func main() {
 		logger.Info("  LFS Store:       %s", *lfsStore)
 		logger.Info("  Workers:         %d (decompress/unmarshal/extract)", *numWorkers)
 		logger.Info("  Readers:         %d (LFS I/O)", *numReaders)
+		logger.Info("  Batch Size:      %d ledgers", BatchSize)
 	}
-	logger.Info("  Start Ledger:    %d", *startLedger)
-	logger.Info("  End Ledger:      %d", *endLedger)
-	logger.Info("  Output Dir:      %s", *outputDir)
-	logger.Info("  Batch Size:      %d ledgers", BatchSize)
+
 	logger.Info("")
 
 	memMonitor := memory.NewMemoryMonitor(logger, memory.DefaultRAMWarningThresholdGB)
