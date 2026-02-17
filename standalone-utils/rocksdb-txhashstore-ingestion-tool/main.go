@@ -30,15 +30,17 @@ import (
 
 // Architecture constants
 const (
-	BatchSize            = 5000
-	NumWorkers           = 16
-	NumReaders           = 4
-	WorkChanBuffer       = 200
-	EntryChanBuffer      = 100
-	ProgressInterval     = 60 * time.Second
-	DefaultGCSBufferSize = 10000
-	DefaultGCSNumWorkers = 200
-	DefaultGCSBucketPath = "sdf-ledger-close-meta/v1/ledgers/pubnet"
+	BatchSize                  = 5000
+	NumLfsWorkers              = 16
+	NumLfsReaders              = 4
+	WorkChanBuffer             = 200
+	EntryChanBuffer            = 100
+	ProgressInterval           = 60 * time.Second
+	DefaultGCSBufferSize       = 1000
+	DefaultGCSNumWorkers       = 20
+	DefaultGCSBucketPath       = "sdf-ledger-close-meta/v1/ledgers/pubnet"
+	DefaultGCSParallelBackends = 10
+	DefaultGCSBatchSize        = 10000
 )
 
 // LedgerWork represents compressed ledger data ready for processing
@@ -59,20 +61,6 @@ func copyBytes(b []byte) []byte {
 	c := make([]byte, len(b))
 	copy(c, b)
 	return c
-}
-
-// formatDurationShort formats duration with short units
-func formatDurationShort(d time.Duration) string {
-	if d < time.Microsecond {
-		return fmt.Sprintf("%dns", d.Nanoseconds())
-	} else if d < time.Millisecond {
-		return fmt.Sprintf("%.0fµs", float64(d.Nanoseconds())/1000.0)
-	} else if d < time.Second {
-		return fmt.Sprintf("%.1fms", float64(d.Nanoseconds())/1e6)
-	} else if d < time.Minute {
-		return fmt.Sprintf("%.2fs", d.Seconds())
-	}
-	return helpers.FormatDuration(d)
 }
 
 // extractTxHashesFromLCM extracts transaction hashes from a LedgerCloseMeta
@@ -402,7 +390,7 @@ func runLFSIngestion(
 					totalLedgers,
 					currentPercent,
 					rate,
-					formatDurationShort(avgWriteBatch),
+					helpers.FormatDuration(avgWriteBatch),
 					helpers.FormatDuration(etaSeconds),
 				)
 
@@ -689,7 +677,7 @@ func runGCSIngestion(
 	go func() {
 		defer close(progressDone)
 
-		ticker := time.NewTicker(60 * time.Second)
+		ticker := time.NewTicker(ProgressInterval)
 		defer ticker.Stop()
 
 		for {
@@ -723,8 +711,8 @@ func runGCSIngestion(
 						totalLedgers,
 						currentPercent,
 						helpers.FormatFloat(rate, 2),
-						formatDurationShort(avgGetLedger),
-						formatDurationShort(avgWriteBatch),
+						helpers.FormatDuration(avgGetLedger),
+						helpers.FormatDuration(avgWriteBatch),
 						batchSize,
 						helpers.FormatDuration(etaSeconds),
 						helpers.FormatNumber(txHashesFound.Load()),
@@ -787,15 +775,18 @@ func main() {
 
 	// === LFS mode options ===
 	lfsStore := flag.String("lfs-store", "", "[LFS] Path to LFS ledger store (required with --use-lfs)")
-	numWorkers := flag.Int("workers", NumWorkers, "[LFS] Number of workers for decompress/unmarshal/extract (default 16)")
-	numReaders := flag.Int("readers", NumReaders, "[LFS] Number of parallel LFS I/O readers (default 4)")
+	numLfsWorkers := flag.Int("lfs-workers", NumLfsWorkers, fmt.Sprintf("[LFS] Number of workers for decompress/unmarshal/extract (default %d)", NumLfsWorkers))
+	numLfsReaders := flag.Int("lfs-readers", NumLfsReaders, fmt.Sprintf("[LFS] Number of parallel LFS I/O readers (default %d)", NumLfsReaders))
 
 	// === GCS mode options ===
-	gcsBucketPath := flag.String("gcs-bucket-path", DefaultGCSBucketPath, "[GCS] Bucket path (default: sdf-ledger-close-meta/v1/ledgers/pubnet)")
-	gcsBufferSize := flag.Int("gcs-buffer-size", DefaultGCSBufferSize, "[GCS] BufferedStorageBackend buffer size (default 10000)")
-	gcsNumWorkers := flag.Int("gcs-workers", DefaultGCSNumWorkers, "[GCS] BufferedStorageBackend num workers (default 200)")
-	gcsParallelBackends := flag.Int("gcs-parallel-backends", 10, "[GCS] Number of parallel backends, each handles a ledger sub-range (default 10)")
-	gcsBatchSize := flag.Int("gcs-batch-size", 5000, "[GCS] Ledgers per RocksDB WriteBatch (default 5000)")
+	gcsBucketPath := flag.String("gcs-bucket-path", DefaultGCSBucketPath, fmt.Sprintf("[GCS] Bucket path (default: %s)", DefaultGCSBucketPath))
+	gcsBufferSize := flag.Int("gcs-buffer-size", DefaultGCSBufferSize, fmt.Sprintf("[GCS] BufferedStorageBackend buffer size (default %d)", DefaultGCSBufferSize))
+	gcsNumWorkers := flag.Int("gcs-workers", DefaultGCSNumWorkers, fmt.Sprintf("[GCS] BufferedStorageBackend num workers (default %d)", DefaultGCSNumWorkers))
+	gcsParallelBackends := flag.Int("gcs-parallel-backends", DefaultGCSParallelBackends, fmt.Sprintf("[GCS] Number of parallel backends, each handles a ledger sub-range (default %d)", DefaultGCSParallelBackends))
+	gcsBatchSize := flag.Int("gcs-batch-size", DefaultGCSBatchSize, fmt.Sprintf("[GCS] Ledgers per RocksDB WriteBatch (default %d)", DefaultGCSBatchSize))
+
+	// === RocksDB options ===
+	disableWAL := flag.Bool("disable-wal", false, "[RocksDB] Disable Write-Ahead Log for writes (faster ingestion, less crash safety)")
 
 	// === Flush-only mode (special mode, skips ingestion) ===
 	flushOnly := flag.Bool("flush-only", false, "[Special] Flush existing RocksDB store and exit (no ingestion)")
@@ -936,8 +927,8 @@ func main() {
 	} else {
 		logger.Info("  Mode:            LFS (Local File System)")
 		logger.Info("  LFS Store:       %s", *lfsStore)
-		logger.Info("  Workers:         %d (decompress/unmarshal/extract)", *numWorkers)
-		logger.Info("  Readers:         %d (LFS I/O)", *numReaders)
+		logger.Info("  Workers:         %d (decompress/unmarshal/extract)", *numLfsWorkers)
+		logger.Info("  Readers:         %d (LFS I/O)", *numLfsReaders)
 		logger.Info("  Batch Size:      %d ledgers", BatchSize)
 	}
 
@@ -948,6 +939,7 @@ func main() {
 
 	settings := types.DefaultRocksDBSettings()
 	settings.ReadOnly = false
+	settings.DisableWAL = *disableWAL
 
 	txStore, err := store.OpenRocksDBTxHashStore(rockdbPath, &settings, logger)
 	if err != nil {
@@ -967,7 +959,7 @@ func main() {
 			uint32(*startLedger), uint32(*endLedger), txStore, logger, memMonitor)
 	} else {
 		ingestionErr = runLFSIngestion(*lfsStore, uint32(*startLedger), uint32(*endLedger),
-			*numWorkers, *numReaders, txStore, logger, memMonitor)
+			*numLfsWorkers, *numLfsReaders, txStore, logger, memMonitor)
 	}
 
 	if ingestionErr != nil {

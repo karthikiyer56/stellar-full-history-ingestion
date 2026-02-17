@@ -159,6 +159,7 @@ func (s *RocksDbTxHashStore) WriteBatch(entriesByCF map[string][]interfaces.Entr
 	writeStart := time.Now()
 	wo := grocksdb.NewDefaultWriteOptions()
 	wo.SetSync(false)
+	wo.DisableWAL(s.settings.DisableWAL)
 	defer wo.Destroy()
 
 	if err := s.DB.Write(wo, batch); err != nil {

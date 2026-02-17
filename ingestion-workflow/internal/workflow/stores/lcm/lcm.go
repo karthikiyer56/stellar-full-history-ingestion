@@ -16,6 +16,7 @@ import (
 // It stores serialized LCM (Ledger Close Meta) data indexed by ledger sequence number.
 type RocksDbLedgerStore struct {
 	rocksdb.BaseStore
+	settings *types.LedgerRocksDBSettings
 }
 
 // NewRocksDbLedgerStore creates a new RocksDB ledger store for the given range.
@@ -56,6 +57,7 @@ func NewRocksDbLedgerStore(dataDir string, rangeID uint32, settings *types.Ledge
 			BlockCache: blockCache,
 			Path:       path,
 		},
+		settings: settings,
 	}, nil
 }
 
@@ -84,7 +86,12 @@ func (s *RocksDbLedgerStore) WriteBatch(entries map[uint32][]byte) error {
 		batch.Put(key, lcmBytes)
 	}
 
-	return s.DB.Write(s.WriteOpts, batch)
+	wo := grocksdb.NewDefaultWriteOptions()
+	wo.SetSync(false)
+	wo.DisableWAL(s.settings.DisableWAL)
+	defer wo.Destroy()
+
+	return s.DB.Write(wo, batch)
 }
 
 func (s *RocksDbLedgerStore) Get(ledgerSeq uint32) ([]byte, error) {

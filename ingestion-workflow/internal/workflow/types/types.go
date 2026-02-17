@@ -35,6 +35,10 @@ type LedgerRocksDBSettings struct {
 	// BlockCacheMB is the size of the RocksDB block cache in MB.
 	// Used for read operations to cache frequently accessed blocks.
 	BlockCacheMB int
+
+	// DisableWAL disables the Write-Ahead Log for writes.
+	// Faster ingestion but less crash safety.
+	DisableWAL bool
 }
 
 // TxHashRocksDBSettings contains RocksDB tuning parameters for the transaction hash store.
@@ -55,6 +59,10 @@ type TxHashRocksDBSettings struct {
 	// BlockCacheMB is the size of the RocksDB block cache in MB.
 	// Shared across all column families.
 	BlockCacheMB int
+
+	// DisableWAL disables the Write-Ahead Log for writes.
+	// Faster ingestion but less crash safety.
+	DisableWAL bool
 }
 
 // MetaRocksDBSettings contains RocksDB tuning parameters for the meta store.

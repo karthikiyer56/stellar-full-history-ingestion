@@ -162,6 +162,12 @@ type RocksDBSettings struct {
 	// In read-only mode, write operations (WriteBatch, FlushAll, CompactAll, CompactCF) will panic.
 	// Use this mode for tools that only need to read data (e.g., RecSplit building, verification).
 	ReadOnly bool
+
+	// DisableWAL disables the Write-Ahead Log for write operations.
+	// WARNING: Setting this to true improves write throughput but sacrifices durability.
+	// If the process crashes, any data written since the last flush/compaction will be lost.
+	// Only use this when you can afford to re-ingest data on crash (e.g., bulk ingestion with checkpoints).
+	DisableWAL bool
 }
 
 // DefaultRocksDBSettings returns the default RocksDB settings.

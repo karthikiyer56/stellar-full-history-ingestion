@@ -65,6 +65,9 @@ type RocksDBTxHashStore struct {
 
 	// readOnly indicates if the store was opened in read-only mode
 	readOnly bool
+
+	// settings holds the RocksDB settings for this store
+	settings *types.RocksDBSettings
 }
 
 // OpenRocksDBTxHashStore opens or creates a RocksDB store at the specified path.
@@ -193,6 +196,7 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 		cfIndexMap: cfIndexMap,
 		logger:     logger,
 		readOnly:   settings.ReadOnly,
+		settings:   settings,
 	}
 
 	// Log Configuration
@@ -293,6 +297,7 @@ func (s *RocksDBTxHashStore) WriteBatch(entriesByCF map[string][]types.Entry) (m
 	writeStart := time.Now()
 	wo := grocksdb.NewDefaultWriteOptions()
 	wo.SetSync(false)
+	wo.DisableWAL(s.settings.DisableWAL)
 	defer wo.Destroy()
 
 	if err := s.db.Write(wo, batch); err != nil {
