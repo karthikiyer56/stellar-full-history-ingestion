@@ -128,6 +128,13 @@ target_file_size_mb = 512
 # Default: 512
 block_cache_mb = 512
 
+# disable_wal: Disable Write-Ahead Log for writes
+# Significantly faster ingestion (~2-3x) but reduced crash safety.
+# If the process crashes, you may need to re-ingest from the last checkpoint.
+# Recommended for initial bulk ingestion; disable for incremental updates.
+# Optional. Default: false
+disable_wal = false
+
 
 # =============================================================================
 # ROCKSDB CONFIGURATION - TRANSACTION HASH STORE
@@ -160,6 +167,13 @@ target_file_size_mb = 256
 # Shared across all column families.
 # Default: 256
 block_cache_mb = 256
+
+# disable_wal: Disable Write-Ahead Log for writes
+# Significantly faster ingestion (~2-3x) but reduced crash safety.
+# If the process crashes, you may need to re-ingest from the last checkpoint.
+# Recommended for initial bulk ingestion; disable for incremental updates.
+# Optional. Default: false
+disable_wal = false
 
 
 # =============================================================================

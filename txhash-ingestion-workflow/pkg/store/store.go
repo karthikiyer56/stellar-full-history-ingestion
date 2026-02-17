@@ -217,7 +217,7 @@ func OpenRocksDBTxHashStore(path string, settings *types.RocksDBSettings, logger
 		memtables := settings.WriteBufferSizeMB * settings.MaxWriteBufferNumber * len(cf.Names)
 		logger.Info("    Total MemTable RAM:   %d MB (%d MB × %d buffers × %d CFs)",
 			memtables, settings.WriteBufferSizeMB, settings.MaxWriteBufferNumber, len(cf.Names))
-		logger.Info("    WAL:                  ENABLED (always)")
+		logger.Info("    WAL:                  %s", map[bool]string{true: "DISABLED", false: "ENABLED"}[settings.DisableWAL])
 		logger.Info("    Auto-Compaction:      DISABLED (manual phase)")
 	}
 
