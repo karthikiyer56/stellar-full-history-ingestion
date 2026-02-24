@@ -96,10 +96,11 @@ At most one pair of active stores exists at a time. Both are replaced when the r
 - Built once per range, after all 1000 chunk raw txhash flat files are written
 - Build time: ~4 hours per range
 
-**Raw TxHash Flat Files** (intermediate, backfill and backfill-transition only):
+**Raw TxHash Flat Files** (intermediate, backfill only — never created during streaming):
 - Path: `immutable/txhash/XXXX/raw/YYYYYY.bin`
 - Format: `[txhash[32] || ledgerSeq[4]]` repeated, 36 bytes per entry
-- Written per chunk; consumed by RecSplit builder at range completion
+- Written per chunk during backfill ingestion; consumed by RecSplit builder at range completion; **deleted immediately after all 16 RecSplit CFs are built and verified**
+- A range in state `COMPLETE` has no `raw/` directory
 
 ### Meta Store
 

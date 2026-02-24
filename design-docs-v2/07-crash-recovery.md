@@ -25,7 +25,7 @@ Crash recovery semantics differ between backfill and streaming modes. The meta s
 2. **Chunk flags are never deleted** — once set to `"1"`, they are permanent.
 3. **Streaming checkpoint written after WriteBatch** — `streaming:last_committed_ledger` is updated only after the RocksDB WriteBatch (with WAL) succeeds.
 4. **Active store never deleted until verification passes** — streaming transition: active store deletion is the last step, after all LFS chunks, RecSplit CFs, and spot-check verification complete.
-5. **Partial chunk files are always safe to overwrite** — if `lfs_done` or `txhash_done` is absent, the corresponding file may be partially written. The writer truncates and rewrites from scratch.
+5. **Partial chunk files are always safe to overwrite** — if either `lfs_done` or `txhash_done` is absent (or not `"1"`), both files are deleted and rewritten from scratch. There is no partial-rewrite path. The only way to skip a chunk is if **both** flags are `"1"`.
 6. **Gaps are expected at crash time** — because all 20 BSB instances within a range run in parallel, completed chunks are NOT guaranteed to form a contiguous prefix. On resume, the process scans all 1,000 chunk flag pairs and redoes any chunk where either flag is missing, regardless of position.
 7. **Meta store WAL is never disabled** — the meta store RocksDB instance always has WAL enabled. All writes to the meta store (chunk flags, range state, RecSplit CF done flags, streaming checkpoint) are durable only after the WAL entry is fsynced. A flag is not considered set until the WAL entry for that write has been persisted to disk. Disabling WAL for the meta store would break the flag-after-fsync invariant and make all chunk-level and range-level recovery untrustworthy.
 
@@ -71,12 +71,15 @@ Meta store at crash:
   range:0000:chunk:000000:txhash_done = absent  ← crash before txhash write
 
 On restart:
-  Chunk 0: lfs_done="1" but txhash_done absent → write txhash only
-    - Re-fetch ledgers 2–10,001 to extract transactions
+  Chunk 0: lfs_done="1" but txhash_done absent → full rewrite of both
+    - Delete/truncate the existing LFS file (000000.data + 000000.index)
+    - Re-fetch ledgers 2–10,001 from BSB
+    - Write LFS chunk, fsync, set lfs_done="1"
     - Write txhash flat file, fsync, set txhash_done="1"
-    - LFS file is NOT rewritten (lfs_done="1" is permanent)
 
-Note: lfs_done and txhash_done are independent flags. Only missing work is redone.
+Note: if either lfs_done OR txhash_done is absent (or not "1"), both files are
+rewritten from scratch. There is no partial-rewrite path — only skip (both flags
+set) or full rewrite (any flag absent).
 ```
 
 #### Scenario B3: Crash Mid-RecSplit Build
@@ -158,8 +161,7 @@ On restart:
   Step 1: Read range:0000:state = "INGESTING" → resume ingestion
   Step 2: Scan all 1000 chunk flag pairs independently:
             lfs_done="1" AND txhash_done="1" → SKIP
-            lfs_done="1" AND txhash_done absent → re-fetch, write txhash only
-            lfs_done absent → delete partial file if present, full rewrite
+            any other combination              → full rewrite of both files
 
   Step 3: Re-instantiate all 20 BSB instances.
           Each BSB instance checks its own chunk slice and skips complete chunks.
@@ -175,7 +177,7 @@ On restart:
     Chunks 100–149: full write (BSB 2, starts fresh)
     Chunks 150–199: skip (BSB 3 complete)
     Chunks 200–224: skip
-    Chunk 225:    txhash-only rewrite (lfs_done="1" is preserved)
+    Chunk 225:    full rewrite — lfs_done="1" but txhash_done absent → redo both
     Chunks 226–249: full write
     ...and so on
 
@@ -190,18 +192,16 @@ Multiple BSB instances at different sub-chunk crash points — some have only lf
 ```
 Meta store at crash (representative chunks):
   Chunk 0:    lfs_done="1", txhash_done="1"   → SKIP
-  Chunk 1:    lfs_done="1", txhash_done=absent → re-fetch for txhash only
+  Chunk 1:    lfs_done="1", txhash_done=absent → full rewrite of both
   Chunk 50:   lfs_done=absent, txhash_done=absent → full rewrite
   Chunk 100:  lfs_done="1", txhash_done="1"   → SKIP
   Chunk 101:  lfs_done=absent, txhash_done=absent → full rewrite (partial LFS deleted)
-  Chunk 150:  lfs_done="1", txhash_done=absent → re-fetch for txhash only
+  Chunk 150:  lfs_done="1", txhash_done=absent → full rewrite of both
   Chunk 200:  absent                           → full write (never started)
 
 Per-chunk recovery rule (applied uniformly to all 1000 chunks):
-  both set          → SKIP
-  lfs only set      → re-fetch, write txhash flat file, set txhash_done
-  txhash only set   → re-fetch, write LFS chunk, set lfs_done  (edge case: very unlikely)
-  neither set       → delete any partial files, full rewrite
+  both flags = "1"    → SKIP
+  any other state     → delete any partial files, full rewrite of both LFS and txhash
 
 No special ordering is assumed. Each chunk is resolved independently.
 ```
@@ -271,8 +271,11 @@ On restart:
   Step 2: Resume range 0 RecSplit (goroutine A):
     Scan CF done flags: CFs 0, 1 → skip; CFs 2–15 → rebuild
     Read all 1000 raw flat files for range 0 (all on disk, intact)
-    Build CFs 2–15 sequentially, set done flags
-    After CF 15:
+    Build CFs 2–15 in parallel (16 goroutines, one per CF);
+      goroutines for CFs 0 and 1 exit immediately (done flags set);
+      goroutines for CFs 2–15 rebuild concurrently from raw flat files;
+      set each CF's done flag after its goroutine fsyncs
+    After all 16 goroutines complete:
       Set range:0000:recsplit:state = "COMPLETE"
       Set range:0000:state = "COMPLETE"
       Delete immutable/txhash/0000/raw/*.bin
@@ -281,7 +284,7 @@ On restart:
     Re-instantiate 20 BSB instances for range 1
     Scan all 1000 chunk flag pairs (chunks 1000–1999):
       Chunks 1000–1019: skip (both flags set)
-      Chunk  1020:      txhash-only rewrite
+      Chunk  1020:      full rewrite (lfs_done="1" but txhash_done absent → redo both)
       Chunks 1021–1049: full write (BSB 0 resumes from chunk 1021)
       Chunks 1050–1099: full write (BSB 1 starts from scratch)
       Chunks 1100–1147: skip
@@ -303,8 +306,9 @@ Key observations:
   2. Within range 1, all 20 BSB instances resume in parallel.
      Each checks its own chunk slice and skips already-done chunks.
      Non-contiguous gaps are handled by the flat per-chunk scan.
-  3. Raw txhash flat files for range 0 survived intact — safe RecSplit input.
-  4. Chunk 1020's partial txhash file is overwritten (txhash_done absent = rewrite).
+   3. Raw txhash flat files for range 0 survived intact — safe RecSplit input.
+   4. Chunk 1020: lfs_done="1" but txhash_done absent → full rewrite of both files.
+
    5. BSB instance 3 (chunks 1150–1199: fully complete) does zero work on resume.
 ```
 
@@ -429,13 +433,9 @@ for chunkID in range(rangeFirstChunk, rangeFirstChunk + 1000):
     tx   = metaStore.get("range:{N:04d}:chunk:{chunkID:06d}:txhash_done")
 
     if lfs == "1" AND tx == "1":
-        skipSet.add(chunkID)        // both done — skip entirely
-    elif lfs == "1" AND tx != "1":
-        txOnlySet.add(chunkID)      // LFS done — redo txhash only
-    elif lfs != "1" AND tx == "1":
-        lfsOnlySet.add(chunkID)     // txhash done — redo LFS only (edge case)
+        skipSet.add(chunkID)   // both done — skip entirely
     else:
-        redoSet.add(chunkID)        // neither done — full rewrite
+        redoSet.add(chunkID)   // any flag absent → full rewrite of both files
 ```
 
 **Sets produced**:
@@ -443,9 +443,7 @@ for chunkID in range(rangeFirstChunk, rangeFirstChunk + 1000):
 | Set | Meaning |
 |-----|---------|
 | `skipSet` | Chunk fully complete; BSB instance skips it entirely |
-| `txOnlySet` | LFS file on disk and verified; only txhash flat file to (re)write |
-| `lfsOnlySet` | txhash flat file on disk and verified; only LFS to (re)write (rare) |
-| `redoSet` | Full rewrite: delete any partial files, fetch ledgers, write both |
+| `redoSet` | Full rewrite: delete any partial files, fetch ledgers, write both LFS and txhash |
 
 ---
 
@@ -468,10 +466,8 @@ for K in 0..num_instances-1:
     sliceStart = rangeFirstChunk + K × chunksPerInstance
     sliceEnd   = sliceStart + chunksPerInstance - 1
 
-    bsbSkip[K]   = skipSet    ∩ [sliceStart, sliceEnd]
-    bsbTxOnly[K] = txOnlySet  ∩ [sliceStart, sliceEnd]
-    bsbLfsOnly[K] = lfsOnlySet ∩ [sliceStart, sliceEnd]
-    bsbRedo[K]   = redoSet    ∩ [sliceStart, sliceEnd]
+    bsbSkip[K] = skipSet ∩ [sliceStart, sliceEnd]
+    bsbRedo[K] = redoSet ∩ [sliceStart, sliceEnd]
 ```
 
 Each BSB instance processes its slice independently and concurrently with all others.
@@ -488,8 +484,6 @@ Each BSB instance processes its slice independently and concurrently with all ot
 |-----------|------|-------------|
 | `startLedger` | `uint32` | First ledger the BSB instance must be able to serve |
 | `endLedger` | `uint32` | Last ledger the BSB instance must be able to serve (inclusive) |
-| `numWorkers` | `int` | Parallel GCS download workers per BSB instance (default: 20) |
-| `bufferSize` | `int` | Prefetch window in ledgers (default: 1,000) |
 
 #### Case A — Fresh Start (no prior progress)
 
@@ -514,14 +508,14 @@ BSB instance 19 → chunks 950–999 → ledgers 9,500,002–10,000,001
 
 prepareRange calls (all 20 issued concurrently at startup):
 
-  BSB 0:  prepareRange(startLedger=2,          endLedger=500,001,    numWorkers=20, bufferSize=1000)
-  BSB 1:  prepareRange(startLedger=500,002,    endLedger=1,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 2:  prepareRange(startLedger=1,000,002,  endLedger=1,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 3:  prepareRange(startLedger=1,500,002,  endLedger=2,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 4:  prepareRange(startLedger=2,000,002,  endLedger=2,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 5:  prepareRange(startLedger=2,500,002,  endLedger=3,000,001,  numWorkers=20, bufferSize=1000)
+  BSB 0:  prepareRange(startLedger=2,          endLedger=500,001)
+  BSB 1:  prepareRange(startLedger=500,002,    endLedger=1,000,001)
+  BSB 2:  prepareRange(startLedger=1,000,002,  endLedger=1,500,001)
+  BSB 3:  prepareRange(startLedger=1,500,002,  endLedger=2,000,001)
+  BSB 4:  prepareRange(startLedger=2,000,002,  endLedger=2,500,001)
+  BSB 5:  prepareRange(startLedger=2,500,002,  endLedger=3,000,001)
   ...
-  BSB 19: prepareRange(startLedger=9,500,002,  endLedger=10,000,001, numWorkers=20, bufferSize=1000)
+  BSB 19: prepareRange(startLedger=9,500,002,  endLedger=10,000,001)
 
 Pattern:
   BSB K → startLedger = (K × 500,000) + 2
@@ -539,7 +533,7 @@ After a crash, the scan (Step 2) produces non-empty skip/redo sets. The BSB fetc
 The key difference from a fresh start: `startLedger` advances past completed chunks at the front of the slice, and `endLedger` retreats before completed chunks at the tail. The BSB is not asked to prepare for ledgers it will never be asked to serve.
 
 ```
-workChunks = bsbTxOnly[K] ∪ bsbLfsOnly[K] ∪ bsbRedo[K]
+workChunks = bsbRedo[K]
 
 if workChunks is empty:
     // All chunks in this slice are in skipSet — BSB instance does nothing
@@ -560,13 +554,11 @@ endLedger   = chunkLastLedger(lastWorkChunk)
 BSB instance 4 owns: chunks 200–249, ledgers 2,000,002–2,500,001
 
 Fresh start would have been:
-  prepareRange(startLedger=2,000,002, endLedger=2,500,001, numWorkers=20, bufferSize=1000)
+  prepareRange(startLedger=2,000,002, endLedger=2,500,001)
 
 After crash, scan result for BSB 4's slice:
   skipSet    ∩ [200,249] = {200,201,...,224}   ← 25 chunks fully done
-  txOnlySet  ∩ [200,249] = {225}               ← lfs_done="1", txhash absent
-  lfsOnlySet ∩ [200,249] = {}
-  redoSet    ∩ [200,249] = {226,227,...,249}   ← 24 chunks need full rewrite
+  redoSet    ∩ [200,249] = {225,226,...,249}   ← chunk 225: lfs_done="1" but txhash absent → full rewrite; chunks 226–249: full rewrite
 
 workChunks = {225, 226, ..., 249}
 firstWorkChunk = 225
@@ -576,7 +568,7 @@ Resume prepareRange:
   startLedger = chunkFirstLedger(225) = (225 × 10,000) + 2 = 2,250,002
   endLedger   = chunkLastLedger(249)  = (250 × 10,000) + 1 = 2,500,001
 
-  prepareRange(startLedger=2,250,002, endLedger=2,500,001, numWorkers=20, bufferSize=1000)
+  prepareRange(startLedger=2,250,002, endLedger=2,500,001)
 
 Comparison:
   Fresh start window:  ledgers 2,000,002 → 2,500,001  (500,000 ledgers)
@@ -612,7 +604,7 @@ Resume prepareRange (identical to fresh start):
   startLedger = chunkFirstLedger(100) = (100 × 10,000) + 2 = 1,000,002
   endLedger   = chunkLastLedger(149)  = (150 × 10,000) + 1 = 1,500,001
 
-  prepareRange(1,000,002, 1,500,001, 20, 1000)
+  prepareRange(1,000,002, 1,500,001)
 
 No difference from fresh start — this BSB instance made no progress before the crash.
 ```
@@ -636,26 +628,26 @@ When `parallel_ranges=2`, two orchestrators run simultaneously. Orchestrator 0 o
 Pattern: BSB K → startLedger = (K × 500,000) + 2
                  endLedger   = ((K+1) × 500,000) + 1
 
-  BSB  0: prepareRange(startLedger=2,          endLedger=500,001,    numWorkers=20, bufferSize=1000)
-  BSB  1: prepareRange(startLedger=500,002,    endLedger=1,000,001,  numWorkers=20, bufferSize=1000)
-  BSB  2: prepareRange(startLedger=1,000,002,  endLedger=1,500,001,  numWorkers=20, bufferSize=1000)
-  BSB  3: prepareRange(startLedger=1,500,002,  endLedger=2,000,001,  numWorkers=20, bufferSize=1000)
-  BSB  4: prepareRange(startLedger=2,000,002,  endLedger=2,500,001,  numWorkers=20, bufferSize=1000)
-  BSB  5: prepareRange(startLedger=2,500,002,  endLedger=3,000,001,  numWorkers=20, bufferSize=1000)
-  BSB  6: prepareRange(startLedger=3,000,002,  endLedger=3,500,001,  numWorkers=20, bufferSize=1000)
-  BSB  7: prepareRange(startLedger=3,500,002,  endLedger=4,000,001,  numWorkers=20, bufferSize=1000)
-  BSB  8: prepareRange(startLedger=4,000,002,  endLedger=4,500,001,  numWorkers=20, bufferSize=1000)
-  BSB  9: prepareRange(startLedger=4,500,002,  endLedger=5,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 10: prepareRange(startLedger=5,000,002,  endLedger=5,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 11: prepareRange(startLedger=5,500,002,  endLedger=6,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 12: prepareRange(startLedger=6,000,002,  endLedger=6,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 13: prepareRange(startLedger=6,500,002,  endLedger=7,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 14: prepareRange(startLedger=7,000,002,  endLedger=7,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 15: prepareRange(startLedger=7,500,002,  endLedger=8,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 16: prepareRange(startLedger=8,000,002,  endLedger=8,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 17: prepareRange(startLedger=8,500,002,  endLedger=9,000,001,  numWorkers=20, bufferSize=1000)
-  BSB 18: prepareRange(startLedger=9,000,002,  endLedger=9,500,001,  numWorkers=20, bufferSize=1000)
-  BSB 19: prepareRange(startLedger=9,500,002,  endLedger=10,000,001, numWorkers=20, bufferSize=1000)
+  BSB  0: prepareRange(startLedger=2,          endLedger=500,001)
+  BSB  1: prepareRange(startLedger=500,002,    endLedger=1,000,001)
+  BSB  2: prepareRange(startLedger=1,000,002,  endLedger=1,500,001)
+  BSB  3: prepareRange(startLedger=1,500,002,  endLedger=2,000,001)
+  BSB  4: prepareRange(startLedger=2,000,002,  endLedger=2,500,001)
+  BSB  5: prepareRange(startLedger=2,500,002,  endLedger=3,000,001)
+  BSB  6: prepareRange(startLedger=3,000,002,  endLedger=3,500,001)
+  BSB  7: prepareRange(startLedger=3,500,002,  endLedger=4,000,001)
+  BSB  8: prepareRange(startLedger=4,000,002,  endLedger=4,500,001)
+  BSB  9: prepareRange(startLedger=4,500,002,  endLedger=5,000,001)
+  BSB 10: prepareRange(startLedger=5,000,002,  endLedger=5,500,001)
+  BSB 11: prepareRange(startLedger=5,500,002,  endLedger=6,000,001)
+  BSB 12: prepareRange(startLedger=6,000,002,  endLedger=6,500,001)
+  BSB 13: prepareRange(startLedger=6,500,002,  endLedger=7,000,001)
+  BSB 14: prepareRange(startLedger=7,000,002,  endLedger=7,500,001)
+  BSB 15: prepareRange(startLedger=7,500,002,  endLedger=8,000,001)
+  BSB 16: prepareRange(startLedger=8,000,002,  endLedger=8,500,001)
+  BSB 17: prepareRange(startLedger=8,500,002,  endLedger=9,000,001)
+  BSB 18: prepareRange(startLedger=9,000,002,  endLedger=9,500,001)
+  BSB 19: prepareRange(startLedger=9,500,002,  endLedger=10,000,001)
 ```
 
 **Orchestrator 1 — Range 1 (BSB instances K=0..19)**:
@@ -665,26 +657,26 @@ Range 1 first ledger = 10,000,002
 Pattern: BSB K → startLedger = 10,000,002 + (K × 500,000)
                  endLedger   = 10,000,002 + ((K+1) × 500,000) - 1
 
-  BSB  0: prepareRange(startLedger=10,000,002, endLedger=10,500,001, numWorkers=20, bufferSize=1000)
-  BSB  1: prepareRange(startLedger=10,500,002, endLedger=11,000,001, numWorkers=20, bufferSize=1000)
-  BSB  2: prepareRange(startLedger=11,000,002, endLedger=11,500,001, numWorkers=20, bufferSize=1000)
-  BSB  3: prepareRange(startLedger=11,500,002, endLedger=12,000,001, numWorkers=20, bufferSize=1000)
-  BSB  4: prepareRange(startLedger=12,000,002, endLedger=12,500,001, numWorkers=20, bufferSize=1000)
-  BSB  5: prepareRange(startLedger=12,500,002, endLedger=13,000,001, numWorkers=20, bufferSize=1000)
-  BSB  6: prepareRange(startLedger=13,000,002, endLedger=13,500,001, numWorkers=20, bufferSize=1000)
-  BSB  7: prepareRange(startLedger=13,500,002, endLedger=14,000,001, numWorkers=20, bufferSize=1000)
-  BSB  8: prepareRange(startLedger=14,000,002, endLedger=14,500,001, numWorkers=20, bufferSize=1000)
-  BSB  9: prepareRange(startLedger=14,500,002, endLedger=15,000,001, numWorkers=20, bufferSize=1000)
-  BSB 10: prepareRange(startLedger=15,000,002, endLedger=15,500,001, numWorkers=20, bufferSize=1000)
-  BSB 11: prepareRange(startLedger=15,500,002, endLedger=16,000,001, numWorkers=20, bufferSize=1000)
-  BSB 12: prepareRange(startLedger=16,000,002, endLedger=16,500,001, numWorkers=20, bufferSize=1000)
-  BSB 13: prepareRange(startLedger=16,500,002, endLedger=17,000,001, numWorkers=20, bufferSize=1000)
-  BSB 14: prepareRange(startLedger=17,000,002, endLedger=17,500,001, numWorkers=20, bufferSize=1000)
-  BSB 15: prepareRange(startLedger=17,500,002, endLedger=18,000,001, numWorkers=20, bufferSize=1000)
-  BSB 16: prepareRange(startLedger=18,000,002, endLedger=18,500,001, numWorkers=20, bufferSize=1000)
-  BSB 17: prepareRange(startLedger=18,500,002, endLedger=19,000,001, numWorkers=20, bufferSize=1000)
-  BSB 18: prepareRange(startLedger=19,000,002, endLedger=19,500,001, numWorkers=20, bufferSize=1000)
-  BSB 19: prepareRange(startLedger=19,500,002, endLedger=20,000,001, numWorkers=20, bufferSize=1000)
+  BSB  0: prepareRange(startLedger=10,000,002, endLedger=10,500,001)
+  BSB  1: prepareRange(startLedger=10,500,002, endLedger=11,000,001)
+  BSB  2: prepareRange(startLedger=11,000,002, endLedger=11,500,001)
+  BSB  3: prepareRange(startLedger=11,500,002, endLedger=12,000,001)
+  BSB  4: prepareRange(startLedger=12,000,002, endLedger=12,500,001)
+  BSB  5: prepareRange(startLedger=12,500,002, endLedger=13,000,001)
+  BSB  6: prepareRange(startLedger=13,000,002, endLedger=13,500,001)
+  BSB  7: prepareRange(startLedger=13,500,002, endLedger=14,000,001)
+  BSB  8: prepareRange(startLedger=14,000,002, endLedger=14,500,001)
+  BSB  9: prepareRange(startLedger=14,500,002, endLedger=15,000,001)
+  BSB 10: prepareRange(startLedger=15,000,002, endLedger=15,500,001)
+  BSB 11: prepareRange(startLedger=15,500,002, endLedger=16,000,001)
+  BSB 12: prepareRange(startLedger=16,000,002, endLedger=16,500,001)
+  BSB 13: prepareRange(startLedger=16,500,002, endLedger=17,000,001)
+  BSB 14: prepareRange(startLedger=17,000,002, endLedger=17,500,001)
+  BSB 15: prepareRange(startLedger=17,500,002, endLedger=18,000,001)
+  BSB 16: prepareRange(startLedger=18,000,002, endLedger=18,500,001)
+  BSB 17: prepareRange(startLedger=18,500,002, endLedger=19,000,001)
+  BSB 18: prepareRange(startLedger=19,000,002, endLedger=19,500,001)
+  BSB 19: prepareRange(startLedger=19,500,002, endLedger=20,000,001)
 ```
 
 All 40 BSB instances (20 per orchestrator) run concurrently. Orchestrators share no state and do not block each other. Each writes to its own range's directory (range:0000 vs range:0001) and its own range-scoped meta store keys.
@@ -706,7 +698,7 @@ Range 0 chunk flags (selected):
   BSB 0 (chunks 0–49):    30 done — {0,...,29} in skipSet; chunk 30 in redoSet
   BSB 3 (chunks 150–199): all 50 done — {150,...,199} in skipSet
   BSB 7 (chunks 350–399): 10 done — {350,...,359} in skipSet; {360,...,399} in redoSet
-  BSB 11 (chunks 550–599): lfs_done="1" on chunk 550 only — {550} in txOnlySet; {551,...,599} in redoSet
+  BSB 11 (chunks 550–599): lfs_done="1" on chunk 550 only — {550} in redoSet (lfs done, txhash absent → full rewrite); {551,...,599} in redoSet
   BSB 19 (chunks 950–999): 0 done — {950,...,999} in redoSet
   (all other BSBs: varies)
 
@@ -726,7 +718,7 @@ BSB 0 (chunks 0–49):
   firstWorkChunk=30, lastWorkChunk=49
   startLedger = (30 × 10,000) + 2 = 300,002
   endLedger   = (50 × 10,000) + 1 = 500,001
-  → prepareRange(300,002, 500,001, 20, 1000)
+  → prepareRange(300,002, 500,001)
     (vs. fresh: 2 → 500,001; saves 298,000 ledger prefetch)
 
 BSB 3 (chunks 150–199):
@@ -738,22 +730,21 @@ BSB 7 (chunks 350–399):
   firstWorkChunk=360, lastWorkChunk=399
   startLedger = (360 × 10,000) + 2 = 3,600,002
   endLedger   = (400 × 10,000) + 1 = 4,000,001
-  → prepareRange(3,600,002, 4,000,001, 20, 1000)
+  → prepareRange(3,600,002, 4,000,001)
     (vs. fresh: 3,500,002 → 4,000,001; saves 100,000 ledger prefetch)
 
 BSB 11 (chunks 550–599):
-  workChunks = {550,...,599}  ← 550 is txOnlySet, 551–599 are redoSet
+  workChunks = {550,...,599}  ← 550 is redoSet (lfs done, txhash absent → full rewrite), 551–599 also redoSet
   firstWorkChunk=550, lastWorkChunk=599
   startLedger = (550 × 10,000) + 2 = 5,500,002
   endLedger   = (600 × 10,000) + 1 = 6,000,001
-  → prepareRange(5,500,002, 6,000,001, 20, 1000)
+  → prepareRange(5,500,002, 6,000,001)
     (identical to fresh — first chunk has work; no savings at start)
-  Note: BSB 11 begins with chunk 550 in txOnlySet → re-fetch for txhash only,
-        LFS file 000550.data is preserved.
+  Note: BSB 11 begins with chunk 550 → full rewrite of both LFS and txhash files.
 
 BSB 19 (chunks 950–999):
   workChunks = {950,...,999}  ← all in redoSet (never started)
-  → prepareRange(9,500,002, 10,000,001, 20, 1000)
+  → prepareRange(9,500,002, 10,000,001)
     (identical to fresh — no prior progress)
 ```
 
@@ -765,7 +756,7 @@ BSB 0 (chunks 1000–1049):
   firstWorkChunk=1000, lastWorkChunk=1049
   startLedger = (1000 × 10,000) + 2 = 10,000,002
   endLedger   = (1050 × 10,000) + 1 = 10,500,001
-  → prepareRange(10,000,002, 10,500,001, 20, 1000)
+  → prepareRange(10,000,002, 10,500,001)
     (identical to fresh — no prior progress for Range 1 BSB 0)
 
 BSB 5 (chunks 1250–1299):
@@ -777,7 +768,7 @@ BSB 12 (chunks 1600–1649):
   firstWorkChunk=1640, lastWorkChunk=1649
   startLedger = (1640 × 10,000) + 2 = 16,400,002
   endLedger   = (1650 × 10,000) + 1 = 16,500,001
-  → prepareRange(16,400,002, 16,500,001, 20, 1000)
+  → prepareRange(16,400,002, 16,500,001)
     (vs. fresh: 16,000,002 → 16,500,001; saves 400,000 ledger prefetch)
 
 BSB 19 (chunks 1950–1999):
@@ -785,7 +776,7 @@ BSB 19 (chunks 1950–1999):
   firstWorkChunk=1955, lastWorkChunk=1999
   startLedger = (1955 × 10,000) + 2 = 19,550,002
   endLedger   = (2000 × 10,000) + 1 = 20,000,001
-  → prepareRange(19,550,002, 20,000,001, 20, 1000)
+  → prepareRange(19,550,002, 20,000,001)
     (vs. fresh: 19,500,002 → 20,000,001; saves 50,000 ledger prefetch)
 ```
 
@@ -809,14 +800,8 @@ flowchart TD
 
     ITER["Next chunk in BSB slice"] --> CHK{in skipSet?}:::decision
     CHK -->|yes| SKIP["Skip — no fetch, no write"]:::skip
-    CHK -->|no| CHK2{in txOnlySet?}:::decision
-    CHK2 -->|yes| TXONLY["Fetch ledgers for this chunk<br/>Extract txhash entries<br/>Write + fsync YYYYYY.bin<br/>Set txhash_done=1"]:::action
-    CHK2 -->|no| CHK3{in lfsOnlySet?}:::decision
-    CHK3 -->|yes| LFSONLY["Fetch ledgers for this chunk<br/>Compress + write LFS chunk<br/>fsync YYYYYY.data + YYYYYY.index<br/>Set lfs_done=1"]:::action
-    CHK3 -->|no| REDO["Delete partial files if present<br/>Fetch ledgers for this chunk<br/>Write LFS chunk → fsync → set lfs_done=1<br/>Write txhash flat file → fsync → set txhash_done=1"]:::action
+    CHK -->|no| REDO["Delete partial files if present<br/>Fetch ledgers for this chunk<br/>Write LFS chunk → fsync → set lfs_done=1<br/>Write txhash flat file → fsync → set txhash_done=1"]:::action
     SKIP --> NEXT{more chunks?}:::decision
-    TXONLY --> NEXT
-    LFSONLY --> NEXT
     REDO --> NEXT
     NEXT -->|yes| ITER
     NEXT -->|no| DONE(["BSB instance complete"])
@@ -840,14 +825,11 @@ skipSet:
   {200,...,224}     ← BSB 4: 25 done
   {950,...,974}     ← BSB 19: 25 done
 
-txOnlySet:
-  {225}             ← BSB 4: lfs done, txhash absent
-  (chunk 52 for BSB 1 had lfs_done absent → goes to redoSet, not txOnlySet)
-
 redoSet:
   {10,...,49}       ← BSB 0: 40 chunks to redo
   {52,...,99}       ← BSB 1: 48 chunks to redo (chunk 52 partial lfs → full redo)
   {100,...,149}     ← BSB 2: never started
+  {225}             ← BSB 4: lfs_done="1" but txhash absent → full rewrite of both
   {226,...,249}     ← BSB 4: 24 chunks to redo
   {250,...,299}     ← BSB 5: never started
   ... (BSB instances 6–18: per their state)
@@ -862,43 +844,43 @@ BSB 0 (slice 0–49):
   firstWorkChunk=10, lastWorkChunk=49
   startLedger = (10 × 10,000) + 2 = 100,002
   endLedger   = (50 × 10,000) + 1 = 500,001
-  → prepareRange(100,002, 500,001, 20, 1000)
+  → prepareRange(100,002, 500,001)
 
 BSB 1 (slice 50–99):
   workChunks = {52,...,99}   ← chunks 50,51 in skipSet
   firstWorkChunk=52, lastWorkChunk=99
   startLedger = (52 × 10,000) + 2 = 520,002
   endLedger   = (100 × 10,000) + 1 = 1,000,001
-  → prepareRange(520,002, 1,000,001, 20, 1000)
+  → prepareRange(520,002, 1,000,001)
 
 BSB 2 (slice 100–149):
   workChunks = {100,...,149}  ← all chunks to redo (never started)
   firstWorkChunk=100, lastWorkChunk=149
   startLedger = (100 × 10,000) + 2 = 1,000,002
   endLedger   = (150 × 10,000) + 1 = 1,500,001
-  → prepareRange(1,000,002, 1,500,001, 20, 1000)
+  → prepareRange(1,000,002, 1,500,001)
 
 BSB 3 (slice 150–199):
   workChunks = {} ← all 50 chunks in skipSet
   → no prepareRange call; BSB 3 exits immediately
 
 BSB 4 (slice 200–249):
-  workChunks = {225,...,249}  ← 225 in txOnlySet, 226–249 in redoSet
+  workChunks = {225,...,249}  ← 225 in redoSet (lfs done, txhash absent → full rewrite), 226–249 in redoSet
   firstWorkChunk=225, lastWorkChunk=249
   startLedger = (225 × 10,000) + 2 = 2,250,002
   endLedger   = (250 × 10,000) + 1 = 2,500,001
-  → prepareRange(2,250,002, 2,500,001, 20, 1000)
+  → prepareRange(2,250,002, 2,500,001)
 
 BSB 5 (slice 250–299):
   workChunks = {250,...,299}  ← all chunks to redo (never started)
-  → prepareRange(2,500,002, 3,000,001, 20, 1000)
+  → prepareRange(2,500,002, 3,000,001)
 
 BSB 19 (slice 950–999):
   workChunks = {975,...,999}
   firstWorkChunk=975, lastWorkChunk=999
   startLedger = (975 × 10,000) + 2 = 9,750,002
   endLedger   = (1000 × 10,000) + 1 = 10,000,001
-  → prepareRange(9,750,002, 10,000,001, 20, 1000)
+  → prepareRange(9,750,002, 10,000,001)
 ```
 
 #### What each BSB instance does on its first chunk
@@ -912,9 +894,11 @@ BSB 0, first chunk = 10 (in redoSet):
   → write txhash 000010.bin → fsync
   → set range:0000:chunk:000010:txhash_done = "1"
 
-BSB 4, first chunk = 225 (in txOnlySet):
-  → LFS file 000225.data already present and valid (lfs_done="1")
-  → fetch ledgers 2,250,002–2,260,001 from GCS (for txhash only)
+BSB 4, first chunk = 225 (in redoSet — lfs_done="1" but txhash_done absent):
+  → delete/truncate existing LFS file 000225.data + 000225.index
+  → fetch ledgers 2,250,002–2,260,001 from GCS
+  → write LFS chunk 000225.data + 000225.index → fsync
+  → set range:0000:chunk:000225:lfs_done = "1"
   → write txhash 000225.bin → fsync
   → set range:0000:chunk:000225:txhash_done = "1"
   → next: chunk 226 (in redoSet) → full rewrite
@@ -939,7 +923,7 @@ All 20 BSB instances run concurrently after the scan. Each operates independentl
 | BSB 1 | 2 | 48 | ~480,000 |
 | BSB 2 | 0 | 50 | 500,000 |
 | BSB 3 | 50 | 0 | **0** |
-| BSB 4 | 25 + 1 (txOnly) | 24 + 1 | ~250,000 |
+| BSB 4 | 25 | 25 (all full rewrite, incl. chunk 225) | ~250,000 |
 | BSB 5–18 | varies | varies | varies |
 | BSB 19 | 25 | 25 | 250,000 |
 
@@ -1029,6 +1013,280 @@ On restart:
 
 ---
 
+## Other Failure Scenarios and Recovery
+
+The named scenarios above (B1–B7, S1–S5) cover the most common crash points. The sub-sections below enumerate the remaining failure windows that can occur within a single chunk's four-step completion sequence, at the INGESTING→RECSPLIT_BUILDING state boundary, within a single RecSplit CF build, and at the RECSPLIT_BUILDING→COMPLETE boundary.
+
+> **Reminder — the four steps that complete a chunk (from `03-backfill-workflow.md`, Two-Level Write Lifecycle)**:
+>
+> 1. `fsync()` the LFS file (`YYYYYY.data` + `YYYYYY.index`) — durably write LFS data to disk
+> 2. `lfs_done=1` written to meta store (WAL-backed)
+> 3. `fsync()` the txhash flat file (`YYYYYY.bin`) — durably write txhash data to disk
+> 4. `txhash_done=1` written to meta store (WAL-backed)
+>
+> A crash can occur in the gap between any two consecutive steps. The existing scenarios cover gaps 1↔2 (Scenario B1) and 2↔3 (Scenario B2). The gaps below are the remaining ones.
+
+---
+
+### OF1: Crash After txhash fsync, Before `txhash_done` Written
+
+**Where in the sequence**: between step 3 and step 4 — the txhash flat file is fully on disk, but the meta store flag was not written before the crash.
+
+**What it means**: Both the LFS file and the txhash flat file are complete and durable on disk. However, because `txhash_done` was never written to the meta store, the chunk is indistinguishable from scenario B2 (lfs_done set, txhash absent). The recovery rule is the same: if either flag is absent, redo **both** files from scratch. The meta store flag is the only authoritative record — the file's presence or completeness on disk is never consulted.
+
+```
+What happened on disk (before crash):
+  YYYYYY.data  ← fully written and fsynced (LFS chunk, complete)
+  YYYYYY.bin   ← fully written and fsynced (txhash flat file, complete)
+
+Meta store at crash:
+  range:0000:chunk:000012:lfs_done    = "1"   ← set after LFS fsync
+  range:0000:chunk:000012:txhash_done = absent ← crash between txhash fsync and flag write
+
+Recovery:
+  On startup, the chunk scan reads:
+    lfs_done="1", txhash_done=absent → chunk 12 is in redoSet (either flag absent → full rewrite)
+
+  Recovery action:
+    - Delete/truncate existing LFS file YYYYYY.data + YYYYYY.index
+    - Re-fetch ledgers for chunk 12 from GCS (or BSB, on resume)
+    - Write LFS chunk from scratch → fsync → set lfs_done="1"
+    - Write txhash flat file YYYYYY.bin from scratch → fsync → set txhash_done="1"
+
+  Result: chunk 12 is complete. Both files are rewritten deterministically from
+  the ledger data. The re-written files are byte-for-byte identical to what was
+  already on disk. One GCS re-fetch of 10,000 ledgers; negligible cost.
+```
+
+**Why this is safe**: Overwriting complete files with identical content is idempotent. The fsync-before-flag invariant means the flag is the ground truth, not the file. Even though both files were already correct on disk, the absent flag mandates a full rewrite — this is by design. Checking file completeness on disk would require reading and hashing the file, which is expensive and complex; trusting only the flag is simpler and equally correct.
+
+---
+
+### OF2: Crash After All 1,000 Chunks Complete, Before INGESTING→RECSPLIT_BUILDING State Transition
+
+**Where in the sequence**: all 1,000 chunk flag pairs (lfs_done="1" and txhash_done="1") are set for every chunk in the range, but the process crashed before it could write `range:N:state = "RECSPLIT_BUILDING"` to the meta store.
+
+**What it means**: All ingestion work is done. The raw txhash flat files for all 1,000 chunks exist on disk. But the range state key still says `"INGESTING"`. On restart, the system sees `INGESTING` and runs the full chunk scan — only to find all 1,000 chunks in the `skipSet`. It then detects that the range is fully complete and transitions to `RECSPLIT_BUILDING`.
+
+```
+What happened on disk (before crash):
+  immutable/ledgers/chunks/0000/000000.data … 000999.data  ← all 1000 present
+  immutable/txhash/0000/raw/000000.bin … 000999.bin        ← all 1000 present
+
+Meta store at crash:
+  range:0000:state                    = "INGESTING"   ← not yet updated
+  range:0000:chunk:000000:lfs_done    = "1"  ┐
+  range:0000:chunk:000000:txhash_done = "1"  │
+  ...                                        │ All 1000 chunks: both flags = "1"
+  range:0000:chunk:000999:lfs_done    = "1"  │
+  range:0000:chunk:000999:txhash_done = "1"  ┘
+
+Recovery:
+  Step 1: Read range:0000:state = "INGESTING" → enter chunk scan path
+  Step 2: Scan all 1000 chunk flag pairs:
+            Every chunk has lfs_done="1" AND txhash_done="1" → all 1000 in skipSet
+            redoSet = {}
+  Step 3: skipSet covers all 1000 chunks → no BSB instances needed; no GCS traffic
+  Step 4: Detect that ingestion is complete (workChunks = {} across all BSB instances)
+  Step 5: Write range:0000:state = "RECSPLIT_BUILDING" → begin RecSplit build
+
+Result: zero ledgers re-fetched; zero files rewritten.
+Cost: 1000 meta store Get calls (~10ms) + one meta store Put.
+```
+
+**Why this scenario matters**: This crash window is narrow (it is a single meta store Put after the last BSB instance reports done), but it is architecturally possible. The recovery path through it is completely safe — the chunk scan is always run regardless, and a fully-populated skipSet is a valid outcome.
+
+---
+
+### OF3: Crash Mid-CF Write (Partway Through a Single RecSplit CF)
+
+**Where in the sequence**: RecSplit is building CF `XX`. The process has written some but not all of the index entries into `cf-XX.idx` when the crash occurs. The `recsplit:cf:XX:done` flag was never set (it is set only after fsync of the complete CF file).
+
+**What it means**: The existing scenario B3 shows a crash *between* two CFs (e.g., CF 1 complete, CF 2 absent). This scenario is the crash *within* a single CF — the CF file is partially written on disk.
+
+```
+Meta store at crash:
+  range:0000:state               = "RECSPLIT_BUILDING"
+  range:0000:recsplit:state      = "BUILDING"
+  range:0000:recsplit:cf:00:done = "1"
+  range:0000:recsplit:cf:01:done = "1"
+  range:0000:recsplit:cf:02:done = absent  ← crash DURING CF 2 write
+                                            (the file cf-02.idx is partially written)
+
+Disk state:
+  immutable/txhash/0000/index/cf-0.idx  ← complete
+  immutable/txhash/0000/index/cf-1.idx  ← complete
+  immutable/txhash/0000/index/cf-2.idx  ← PARTIAL — written partway through CF build
+
+Recovery (identical to B3):
+  Step 1: range:0000:state = "RECSPLIT_BUILDING" → resume RecSplit
+  Step 2: Scan CF done flags:
+            CF 0: done="1" → skip (use existing cf-0.idx)
+            CF 1: done="1" → skip (use existing cf-1.idx)
+            CF 2: done=absent → DELETE partial cf-2.idx, rebuild from scratch
+            CFs 3–15: absent → build from scratch
+  Step 3: Read all 1000 raw txhash flat files for range 0 (all still on disk)
+  Step 4: Rebuild CFs 2–15 from the raw flat files, fsync each, set done flag
+
+Note: the partial cf-2.idx is always deleted before rebuild. The done flag being absent
+is the signal — the file's partial state on disk does not need to be inspected.
+Cost: 14 CFs rebuilt. Same cost as if the crash occurred exactly between CF 1 and CF 2.
+```
+
+**Why this scenario matters**: The recovery is identical to B3, but the partial file on disk is a key detail. If the system tried to reuse a partially-written CF file, query results would be silently wrong (RecSplit false positive rate would skyrocket or queries would panic). The done flag being absent is the sole signal that the file must be discarded — the file is never trusted without its flag.
+
+---
+
+### OF4: Crash After `recsplit:state=COMPLETE`, Before `range:N:state=COMPLETE`
+
+**Where in the sequence**: All 16 CF done flags are set, and the RecSplit-level state key (`range:0000:recsplit:state`) has been written to `"COMPLETE"`, but the range-level state key (`range:0000:state`) still says `"RECSPLIT_BUILDING"` when the crash occurs.
+
+**What it means**: The existing scenario B4 covers the inverse — all 16 CF flags set but `recsplit:state` still says `"BUILDING"`. This scenario covers the two-key write window after `recsplit:state` is updated but before `range:state` catches up.
+
+```
+Meta store at crash:
+  range:0000:state               = "RECSPLIT_BUILDING"  ← not yet updated
+  range:0000:recsplit:state      = "COMPLETE"            ← written first
+  range:0000:recsplit:cf:00:done = "1"  ┐
+  range:0000:recsplit:cf:01:done = "1"  │
+  ...                                   │ All 16 CFs done
+  range:0000:recsplit:cf:0f:done = "1"  ┘
+
+Disk state:
+  immutable/txhash/0000/index/cf-0.idx … cf-f.idx  ← all 16 complete
+  immutable/txhash/0000/raw/000000.bin … 000999.bin ← still present (not yet deleted)
+
+Recovery:
+  Step 1: range:0000:state = "RECSPLIT_BUILDING" → enter RecSplit resume path
+  Step 2: Read recsplit:state = "COMPLETE"
+            → all CFs already done; no CF scan needed
+  Step 3: Write range:0000:state = "COMPLETE"
+  Step 4: Delete immutable/txhash/0000/raw/*.bin (the raw flat files are now redundant)
+
+Result: zero CF rebuilds. One meta store Put + raw file deletion.
+The recsplit:state="COMPLETE" flag is the reliable signal that all CFs are built.
+```
+
+**Why this scenario matters**: Without explicitly handling `recsplit:state="COMPLETE"` + `range:state="RECSPLIT_BUILDING"`, a naive implementation might rescan all 16 CF flags and "discover" they are all done (which works, as in B4). But checking `recsplit:state` first is the correct shortcut — it means "all CFs are done, skip the per-CF scan entirely."
+
+---
+
+### OF5: Crash After RocksDB WriteBatch Commits, Before Streaming Checkpoint Written
+
+**Where in the sequence** (streaming ACTIVE mode only): A batch of ledgers has been committed to both the active ledger store and active txhash store via a RocksDB `WriteBatch`. The batch is durable (WAL). But the process crashed before it could write `streaming:last_committed_ledger = N` to the meta store.
+
+**What it means**: The active RocksDB stores have ledger data beyond what the checkpoint reflects. On restart, `last_committed_ledger` points behind the actual store contents.
+
+```
+What happened on disk (before crash):
+  active/rocksdb/0001-ledger-store/: contains ledgers up to 14,999,005
+  active/rocksdb/0001-txhash-store/: contains txhashes for ledgers up to 14,999,005
+
+Meta store at crash:
+  streaming:last_committed_ledger = 14,999,001  ← not updated (crash before write)
+
+Recovery:
+  Step 1: Read streaming:last_committed_ledger = 14,999,001
+  Step 2: Resume from ledger 14,999,002 (last_committed_ledger + 1)
+  Step 3: Re-ingest ledgers 14,999,002–14,999,005
+
+  RocksDB WriteBatch writes are idempotent:
+    Re-ingesting ledger 14,999,002 writes the same key-value pairs that are already
+    in the active store. RocksDB simply overwrites with the same data.
+    No duplicates, no corruption.
+
+  Step 4: After re-ingesting ledger 14,999,005:
+    WriteBatch commits again (idempotent)
+    streaming:last_committed_ledger = 14,999,005
+
+Result: up to a small number of ledgers (one batch worth) are re-ingested
+and re-written. This is safe because writes are deterministic — the same
+ledger always produces the same key-value entries.
+```
+
+**Why this scenario matters**: The invariant from Core Invariant #3 — "Streaming checkpoint written after WriteBatch" — is described but no crash scenario demonstrates what happens when the invariant's write order is violated by a crash. The answer is safe re-ingestion from the checkpoint. The checkpoint lagging behind the store is intentional and safe; the checkpoint running ahead of the store is what would be catastrophic (and is prevented by write ordering).
+
+---
+
+### OF6: Crash Between `range:N:state=TRANSITIONING` Written and Transition Goroutine Starting Any Work
+
+**Where in the sequence** (streaming TRANSITIONING only): The streaming range boundary was detected. The range state key was written to `"TRANSITIONING"`. The process crashed before the transition goroutine wrote a single `lfs_done` flag or started any RecSplit work.
+
+**What it means**: The state says `TRANSITIONING` but the disk is completely empty of LFS chunk files and RecSplit index files for this range. Zero transition work was done.
+
+```
+Meta store at crash:
+  range:0001:state                    = "TRANSITIONING"  ← written
+  range:0001:chunk:001000:lfs_done    = absent            ← no chunks written yet
+  range:0001:chunk:001001:lfs_done    = absent
+  ... (all 1000 lfs_done flags: absent)
+  range:0001:recsplit:state           = absent
+  streaming:last_committed_ledger     = 19,999,995
+
+Disk state:
+  active/rocksdb/0001-ledger-store/  ← still intact (not deleted)
+  active/rocksdb/0001-txhash-store/  ← still intact (not deleted)
+  immutable/ledgers/chunks/0001/     ← empty (no LFS chunks written yet)
+  immutable/txhash/0001/index/       ← empty (no CF files written yet)
+
+Recovery:
+  Step 1: range:0001:state = "TRANSITIONING" → spawn transition goroutine
+  Step 2: Transition goroutine scans lfs_done flags:
+            All 1000 flags absent → all 1000 chunks must be written from active store
+            skipSet = {}, workSet = {000..999} (all 1000 chunks)
+  Step 3: Phase 1 — flush all 1000 chunks from active ledger store to LFS
+            (same path as a fresh transition start)
+  Step 4: Phase 2 — build all 16 RecSplit CFs from active txhash store
+  Step 5: Verify, delete active stores, set range:0001:state = "COMPLETE"
+
+Concurrently:
+  Streaming resumes from last_committed_ledger + 1 = 19,999,996
+  using the active store for range:0001 (still intact throughout the transition)
+```
+
+**Why this scenario matters**: The crash window between writing `TRANSITIONING` and doing any transition work is real — a single meta store Put followed immediately by a crash is possible. The recovery path handles this correctly because it starts from scratch (all flags absent), but this needs to be stated explicitly so the reader understands that a completely empty transition is safe to resume.
+
+---
+
+### OF7: Crash After `recsplit:state=COMPLETE`, Before `range:N:state=COMPLETE` (Streaming Transition)
+
+**Where in the sequence** (streaming TRANSITIONING only): This is the streaming-mode analog of OF4. All 16 RecSplit CF files are built and flagged done. `recsplit:state` for the range was written to `"COMPLETE"`. But `range:N:state` still says `"TRANSITIONING"` when the crash occurs.
+
+```
+Meta store at crash:
+  range:0001:state               = "TRANSITIONING"  ← not yet updated
+  range:0001:recsplit:state      = "COMPLETE"        ← written
+  range:0001:recsplit:cf:00:done = "1"  ┐
+  ...                                   │ All 16 CFs done
+  range:0001:recsplit:cf:0f:done = "1"  ┘
+  (all 1000 lfs_done flags = "1")
+
+Disk state:
+  immutable/ledgers/chunks/0001/: all 1000 LFS chunk files present
+  immutable/txhash/0001/index/cf-0.idx … cf-f.idx: all 16 present, complete
+  active/rocksdb/0001-ledger-store/: still on disk (not yet deleted)
+  active/rocksdb/0001-txhash-store/: still on disk (not yet deleted)
+
+Recovery:
+  Step 1: range:0001:state = "TRANSITIONING" → spawn transition goroutine
+  Step 2: Goroutine reads recsplit:state = "COMPLETE"
+            → Phase 1 and Phase 2 are both done; skip directly to verification
+  Step 3: Re-run spot-check verification on immutable stores
+  Step 4: Delete active ledger store and active txhash store
+  Step 5: Set range:0001:state = "COMPLETE"
+
+Query routing during recovery:
+  While the transition goroutine is running steps 2–4 (re-verification + store delete),
+  the active stores are still on disk. Queries for range 1 continue to be served from
+  the active stores. Store deletion (step 4) is atomic at the filesystem level;
+  queries in-flight at that instant are not affected because the active store handles
+  are closed only after all queries complete (graceful drain).
+```
+
+**Why this scenario matters**: Without handling `recsplit:state="COMPLETE"` + `range:state="TRANSITIONING"`, a naive recovery might re-run Phase 1 and Phase 2 from scratch, which is unnecessary and expensive (hours of work). Checking `recsplit:state` first short-circuits to verification immediately.
+
+---
+
 ## Recovery Decision Tree
 
 ```mermaid
@@ -1040,7 +1298,7 @@ flowchart TD
     FOREACH --> RS{range:N:state?}:::decision
     RS -->|COMPLETE| SKIP["Skip — range fully done"]
     RS -->|absent| SKIP2["Skip — range not started yet"]
-    RS -->|INGESTING| BACKFILL_RESUME["Backfill: scan ALL 1000 chunk flag pairs<br/>per chunk: both flags = skip<br/>otherwise = redo (gaps are expected, not exceptional)"]:::action
+    RS -->|INGESTING| BACKFILL_RESUME["Backfill: scan ALL 1000 chunk flag pairs<br/>per chunk: both flags = skip<br/>any flag absent = full rewrite of both files<br/>(gaps are expected, not exceptional)"]:::action
     RS -->|RECSPLIT_BUILDING| RECSPLIT_RESUME["Backfill: scan CF done flags<br/>resume from first incomplete CF"]:::action
     RS -->|ACTIVE| STREAMING_RESUME["Streaming: resume from<br/>last_committed_ledger + 1"]:::action
     RS -->|TRANSITIONING| TRANS_RESUME["Streaming: spawn transition goroutine<br/>scan lfs_done + CF done flags<br/>Phase 1: flush remaining chunks from ledger store<br/>Phase 2: rebuild incomplete RecSplit CFs from txhash store<br/>resume streaming from last_committed_ledger + 1"]:::action

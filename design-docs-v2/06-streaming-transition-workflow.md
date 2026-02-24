@@ -71,7 +71,7 @@ flowchart TD
 
 ## Phase 1: LFS Chunk Writes
 
-Each chunk (10K ledgers) is read from the active RocksDB `ledger_seq_to_lcm` CF and written to an LFS chunk file. The data in RocksDB is already zstd-compressed; it is written as-is into the LFS chunk format (with an offset index for random access).
+Each chunk (10K ledgers) is read from the active ledger store (default CF, sequential scan by `uint32BE(ledgerSeq)` key) and written to an LFS chunk file. The data in RocksDB is already zstd-compressed; it is written as-is into the LFS chunk format (with an offset index for random access).
 
 **LFS chunk file format**:
 - `.data` file: contiguous compressed LCM records (variable-length)
@@ -83,9 +83,9 @@ Each chunk (10K ledgers) is read from the active RocksDB `ledger_seq_to_lcm` CF 
 
 ## Phase 2: RecSplit Build from Active Store
 
-Unlike backfill (which reads raw flat files), the streaming transition reads directly from the active RocksDB `tx_hash_to_ledger_seq` CF. For each of the 16 nibbles:
+Unlike backfill (which reads raw flat files), the streaming transition reads directly from the active txhash store. For each of the 16 nibbles:
 
-1. Iterate all keys in `tx_hash_to_ledger_seq` CF where `key[0] >> 4 == nibble`
+1. Iterate all keys in the txhash store CF for nibble X (where `key[0] >> 4 == nibble`)
 2. Build RecSplit minimal perfect hash over the matching `(txhash, ledgerSeq)` pairs
 3. Write `immutable/txhash/{rangeID:04d}/index/cf-{nibble}.idx`
 4. fsync
@@ -118,11 +118,11 @@ At transition trigger (ledger 10,000,001, range 0):
   streaming:last_committed_ledger      →  10,000,001
   range:0001:state                     →  "ACTIVE"
 
-Phase 1 progresses (chunk writes):
+Phase 1 progresses (chunk writes, range 0 = global chunks 000000–000999):
   range:0000:chunk:000000:lfs_done     →  "1"
   range:0000:chunk:000001:lfs_done     →  "1"
   ...
-  range:0000:chunk:000999:lfs_done     →  "1"
+  range:0000:chunk:000999:lfs_done     →  "1"   ← last chunk of range 0 (global ID 000999)
 
 Phase 2 starts:
   range:0000:recsplit:state            →  "BUILDING"
@@ -135,6 +135,27 @@ Per-CF progress:
 Verification passes, active store deleted:
   range:0000:recsplit:state            →  "COMPLETE"
   range:0000:state                     →  "COMPLETE"
+```
+
+For contrast, range 5 (global chunks 005000–005999):
+```
+At transition trigger (ledger 50,000,001, range 5):
+  range:0005:state                     →  "TRANSITIONING"
+  streaming:last_committed_ledger      →  50,000,001
+  range:0006:state                     →  "ACTIVE"
+
+Phase 1 chunk writes (global IDs 005000–005999):
+  range:0005:chunk:005000:lfs_done     →  "1"   ← first chunk of range 5 (global ID 005000)
+  ...
+  range:0005:chunk:005999:lfs_done     →  "1"   ← last chunk of range 5 (global ID 005999)
+
+Phase 2 RecSplit:
+  range:0005:recsplit:state            →  "BUILDING"
+  range:0005:recsplit:cf:00:done       →  "1"
+  ...
+  range:0005:recsplit:cf:0f:done       →  "1"
+  range:0005:recsplit:state            →  "COMPLETE"
+  range:0005:state                     →  "COMPLETE"
 ```
 
 ---

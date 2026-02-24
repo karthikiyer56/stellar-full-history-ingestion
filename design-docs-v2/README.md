@@ -23,31 +23,27 @@
 
 ```mermaid
 flowchart TB
-    classDef mode fill:#f0f4ff,stroke:#3366cc,stroke-width:2px
-    classDef store fill:#eef8ee,stroke:#228b22,stroke-width:1.5px
-    classDef meta fill:#fff7e6,stroke:#cc8800,stroke-width:1.5px
-
     subgraph BACKFILL["BACKFILL MODE — offline, no queries, process exits when done"]
-        BSB["BufferedStorageBackend (BSB)<br/>Up to 2 orchestrators × 20 BSB instances (concurrent)"]:::store
-        LFS_B["LFS Chunks<br/>immutable/ledgers/chunks/"]:::store
-        TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/<br/>36B/entry: hash[32] + seq[4]"]:::store
-        RECSPLIT_B["RecSplit Index<br/>immutable/txhash/XXXX/index/<br/>(async, ~4h per range)"]:::store
+        BSB["BufferedStorageBackend (BSB)<br/>Up to 2 orchestrators × 20 BSB instances (concurrent)"]
+        LFS_B["LFS Chunks<br/>immutable/ledgers/chunks/"]
+        TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/<br/>36B/entry: hash[32] + seq[4]"]
+        RECSPLIT_B["RecSplit Index<br/>immutable/txhash/XXXX/index/<br/>(async, ~4h per range)"]
         BSB --> LFS_B
         BSB --> TXRAW
         TXRAW -->|"1000 chunks done"| RECSPLIT_B
-    end:::mode
+    end
 
     subgraph STREAMING["STREAMING MODE — live, serves queries, long-running daemon"]
-        CORE["CaptiveStellarCore<br/>1 ledger/batch"]:::store
-        ACTIVE["Active RocksDB Store<br/>active/rocksdb/XXXX-ledger-store/"]:::store
-        TRANS["Streaming Transition Workflow<br/>(background goroutine)"]:::store
-        IMM["Immutable Stores<br/>LFS + RecSplit"]:::store
+        CORE["CaptiveStellarCore<br/>1 ledger/batch"]
+        ACTIVE["Active RocksDB Store<br/>active/rocksdb/XXXX-ledger-store/"]
+        TRANS["Streaming Transition Workflow<br/>(background goroutine)"]
+        IMM["Immutable Stores<br/>LFS + RecSplit"]
         CORE --> ACTIVE
         ACTIVE -->|"range boundary"| TRANS
         TRANS --> IMM
-    end:::mode
+    end
 
-    META["META STORE (RocksDB)<br/>meta/rocksdb/<br/>Both modes — WAL required"]:::meta
+    META["META STORE (RocksDB)<br/>meta/rocksdb/<br/>Both modes — WAL required"]
 
     BACKFILL -.-> META
     STREAMING -.-> META
@@ -71,6 +67,7 @@ flowchart TB
 | 10 | [10-configuration.md](./10-configuration.md) | TOML reference, validation rules, example configs |
 | 11 | [11-checkpointing-and-transitions.md](./11-checkpointing-and-transitions.md) | All boundary math, formulas, and transition trigger invariants |
 | 12 | [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) | Storage estimates, memory budgets, hardware requirements, structural constants |
+| 13 | [13-recommended-operator-approach.md](./13-recommended-operator-approach.md) | Step-by-step operator runbook: backfill → streaming, crash recovery, multi-disk layout |
 | — | [FAQ.md](./FAQ.md) | Consolidated Q&A index |
 
 ---
@@ -134,6 +131,8 @@ See [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) for all structural co
 ---
 
 ## Operator Runbook (Summary)
+
+See [13-recommended-operator-approach.md](./13-recommended-operator-approach.md) for the full step-by-step guide including prerequisites, crash recovery procedures, multi-disk layout, and a deployment checklist.
 
 ### First-time setup: ingest history then stream
 

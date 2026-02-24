@@ -64,29 +64,40 @@ Two keys per chunk. Written independently after each respective file fsync. Ther
 **`lfs_done` in streaming mode**: a background goroutine flushes completed 10K-ledger chunks from the ledger store to LFS chunk files at each chunk boundary while the range is ACTIVE. The flag is set after fsync. By the time the range transitions to TRANSITIONING, most `lfs_done` flags are already set.
 
 **Constraints**:
-- Absent means either not started or incomplete — treated identically on resume (full rewrite).
-- `lfs_done` and `txhash_done` are written independently; a chunk with only `lfs_done="1"` has only its LFS write skipped on resume.
+- Absent means either not started or incomplete — treated identically on resume (full rewrite of both files).
+- `lfs_done` and `txhash_done` are written independently; however, a chunk is only skippable on resume when **both** flags are `"1"`. If either flag is absent, both files are rewritten from scratch.
 - Flags are **never deleted or reset** once set to `"1"`.
 - For chunk skip on resume (backfill), **both** flags must be `"1"`. For streaming, only `lfs_done` is written; a streaming chunk is LFS-complete when `lfs_done="1"`.
 
-**Examples** (Range 0 = chunks 0–999, Range 1 = chunks 1000–1999, backfill):
+**Examples** (Range 0 = chunks 000000–000999, Range 1 = chunks 001000–001999, Range 5 = chunks 005000–005999, backfill):
 ```
 range:0000:chunk:000000:lfs_done     →  "1"
 range:0000:chunk:000000:txhash_done  →  "1"
 range:0000:chunk:000001:lfs_done     →  "1"
 range:0000:chunk:000001:txhash_done  →  absent    ← partial; txhash write not yet done
-range:0001:chunk:001000:lfs_done     →  "1"
+range:0000:chunk:000999:lfs_done     →  "1"       ← last chunk of range 0 (global ID 999)
+range:0000:chunk:000999:txhash_done  →  "1"
+range:0001:chunk:001000:lfs_done     →  "1"       ← first chunk of range 1 (global ID 1000)
 range:0001:chunk:001000:txhash_done  →  "1"
 range:0001:chunk:001500:lfs_done     →  absent    ← not yet reached
 range:0001:chunk:001500:txhash_done  →  absent
+range:0005:chunk:005000:lfs_done     →  "1"       ← first chunk of range 5 (global ID 5000)
+range:0005:chunk:005000:txhash_done  →  "1"
+range:0005:chunk:005500:lfs_done     →  "1"       ← mid-range chunk of range 5 (global ID 5500)
+range:0005:chunk:005500:txhash_done  →  absent    ← partial; txhash write not yet done
+range:0005:chunk:005999:lfs_done     →  absent    ← last chunk of range 5 (global ID 5999), not yet reached
+range:0005:chunk:005999:txhash_done  →  absent
 ```
 
-**Examples** (Range 0 streaming, ACTIVE phase — background LFS flush):
+**Examples** (Streaming ACTIVE phase — background LFS flush; note: no txhash_done keys for streaming ranges):
 ```
-range:0000:chunk:000000:lfs_done  →  "1"   ← flushed at chunk boundary while ACTIVE
-range:0000:chunk:000001:lfs_done  →  "1"
-range:0000:chunk:000234:lfs_done  →  "1"   ← accumulates over time
+range:0000:chunk:000000:lfs_done  →  "1"   ← first chunk of range 0, flushed at chunk boundary
+range:0000:chunk:000234:lfs_done  →  "1"   ← mid-range, accumulates over time
 range:0000:chunk:000235:lfs_done  →  absent ← not yet flushed (ledger still < chunk boundary)
+range:0000:chunk:000999:lfs_done  →  absent ← last chunk of range 0, not yet flushed
+range:0005:chunk:005000:lfs_done  →  "1"   ← first chunk of range 5 (global ID 5000)
+range:0005:chunk:005234:lfs_done  →  "1"   ← mid-range 5, accumulates over time
+range:0005:chunk:005999:lfs_done  →  absent ← last chunk of range 5 (global ID 5999), not yet flushed
   (no txhash_done keys exist for streaming ranges)
 ```
 
@@ -130,7 +141,7 @@ range:{N:04d}:recsplit:cf:0f:done
 - On resume with `recsplit:state = BUILDING`, scan all 16 CF flags: built CFs are skipped; unbuilt CFs are rebuilt from raw txhash flat files.
 - If all 16 CF flags are `"1"` but `recsplit:state` is still `BUILDING` (crash between last CF write and state update), the recovery logic detects the fully-set flags and completes the state transition without rebuilding.
 
-**Examples**:
+**Examples** (range 0 mid-build, range 5 complete):
 ```
 range:0000:recsplit:state        →  "BUILDING"
 range:0000:recsplit:cf:00:done   →  "1"
@@ -140,6 +151,12 @@ range:0000:recsplit:cf:03:done   →  absent  ← crash before CF 3 started
 range:0000:recsplit:cf:04:done   →  absent
 ...
 range:0000:recsplit:cf:0f:done   →  absent
+
+range:0005:recsplit:state        →  "COMPLETE"   ← range 5 fully done
+range:0005:recsplit:cf:00:done   →  "1"
+range:0005:recsplit:cf:01:done   →  "1"
+...
+range:0005:recsplit:cf:0f:done   →  "1"
 ```
 
 ---
@@ -193,7 +210,7 @@ For a streaming range at steady state (ACTIVE):
 |-------|-------------|------------|
 | `INGESTING` | Ledger data being written to LFS chunks + raw txhash files | `RECSPLIT_BUILDING` (when all 1000 chunks complete) |
 | `RECSPLIT_BUILDING` | RecSplit index being built from raw txhash flat files | `COMPLETE` |
-| `COMPLETE` | All LFS chunks, raw txhash files, and RecSplit index written and verified | Terminal |
+| `COMPLETE` | All LFS chunks written, RecSplit index built and verified, raw txhash flat files deleted | Terminal |
 
 **Streaming-only states** (range goes through active RocksDB):
 
@@ -317,7 +334,7 @@ RecSplit CF 0 completes:
 ... (CFs 1–14 complete) ...
 
 RecSplit CF 15 completes:
-  range:0000:recsplit:cf:15:done  →  "1"
+  range:0000:recsplit:cf:0f:done  →  "1"
 
 All 16 CFs done:
   range:0000:recsplit:state  →  "COMPLETE"
@@ -363,7 +380,7 @@ On restart (scan ALL 1000 chunk flag pairs):
   - Chunks 150–199: both flags "1" → skip (non-contiguous island — this is normal)
   - Chunks 200–349: absent → write fresh
   - Chunk 350: both flags "1" → skip
-  - Chunk 351: lfs_done "1" but txhash_done absent → skip LFS write, redo txhash only
+  - Chunk 351: lfs_done "1" but txhash_done absent → full rewrite of both LFS and txhash files
   - Chunks 352–999: absent → write fresh
 ```
 

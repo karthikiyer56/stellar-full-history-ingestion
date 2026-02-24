@@ -4,6 +4,8 @@
 
 The backfill transition workflow builds the RecSplit minimal perfect hash index for a range after all 1,000 chunk sub-workflows (both `lfs_done` and `txhash_done`) are complete. It is triggered by the range orchestrator, runs synchronously in the orchestrator goroutine, and takes approximately 4 hours per range.
 
+All 16 CF index files are built **in parallel** — 16 goroutines run concurrently, one per CF. Each goroutine reads all 1,000 raw txhash flat files for the range, filters by its nibble, builds its RecSplit index, fsyncs, and sets its done flag. The orchestrator waits for all 16 goroutines to complete before setting state to COMPLETE.
+
 While RecSplit builds for range N, the orchestrator slot is freed and the next range (N+1) begins ingesting immediately. RecSplit for range N and ingestion of range N+1 run concurrently.
 
 This workflow has **no analog in the streaming transition**. There is no active RocksDB store to tear down — the input is the raw txhash flat files written during chunk ingestion.
@@ -31,15 +33,15 @@ flowchart TD
 
     START(["All 1000 chunks complete for range N"]) --> SET_STATE["Set range:N:state = RECSPLIT_BUILDING<br/>Set range:N:recsplit:state = BUILDING"]:::meta
     SET_STATE --> SCAN_CFS["Scan per-CF done flags<br/>(range:N:recsplit:cf:XX:done)"]:::action
-    SCAN_CFS --> CF_LOOP["For each CF 0..15"]
-    CF_LOOP --> CF_DONE{cf:XX:done = 1?}:::decision
-    CF_DONE -->|yes| NEXT_CF["Skip CF (already built)"]
+    SCAN_CFS --> SPAWN["Spawn 16 goroutines (one per CF 0..15)<br/>Goroutines run concurrently"]:::action
+    SPAWN --> CF_DONE{cf:XX:done = 1?<br/>(per goroutine)}:::decision
+    CF_DONE -->|yes| NEXT_CF["Goroutine exits — CF already built"]
     CF_DONE -->|no| BUILD_CF["Build RecSplit index for CF N, nibble X:<br/>1. Scan all 1000 raw txhash flat files for range N<br/>2. Filter entries where txhash[0] >> 4 == X (high nibble)<br/>3. Build minimal perfect hash over filtered hashes<br/>4. Write: immutable/txhash/{N:04d}/index/cf-{X}.idx<br/>5. fsync"]:::action
     BUILD_CF --> SET_CF_DONE["Set range:N:recsplit:cf:{X:02d}:done = 1"]:::meta
     SET_CF_DONE --> NEXT_CF
-    NEXT_CF --> MORE_CFS{more CFs?}:::decision
-    MORE_CFS -->|yes| CF_LOOP
-    MORE_CFS -->|no| SET_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]:::meta
+    NEXT_CF --> ALL_DONE{"All 16 goroutines<br/>complete?"}:::decision
+    ALL_DONE -->|no| NEXT_CF
+    ALL_DONE -->|yes| SET_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]:::meta
     SET_COMPLETE --> CLEANUP["Delete raw txhash flat files for range N<br/>immutable/txhash/{N:04d}/raw/*.bin"]:::action
     CLEANUP --> DONE(["Range N backfill complete"])
 ```
@@ -59,7 +61,7 @@ Format: `[txhash[32] || ledgerSeq[4]]` repeated, 36 bytes per entry. File is NOT
 
 ### Sharding by First Hex Nibble
 
-The 1B+ transactions for a 10M-ledger range are sharded across 16 column family files based on the first hex nibble (high nibble of the first byte) of the transaction hash:
+The ~3B transactions for a 10M-ledger range are sharded across 16 column family files based on the first hex nibble (high nibble of the first byte) of the transaction hash:
 
 ```
 nibble = txhash[0] >> 4   // values 0x0..0xF → CFs 0..15
@@ -68,6 +70,8 @@ nibble = txhash[0] >> 4   // values 0x0..0xF → CFs 0..15
 Each CF index file (`cf-{0..f}.idx`) is a self-contained RecSplit minimal perfect hash for the transactions in that CF.
 
 ### Build Algorithm per CF
+
+16 goroutines run concurrently (one per nibble 0x0..0xF). Each goroutine independently executes:
 
 ```
 for each of 1000 raw chunk files:
@@ -128,15 +132,15 @@ Transition starts:
   range:0000:state                     →  "RECSPLIT_BUILDING"
   range:0000:recsplit:state            →  "BUILDING"
 
-CF 0 built:
+CF 0 built (goroutine 0 completes):
   range:0000:recsplit:cf:00:done       →  "1"
 
-... (CFs 1–14) ...
+... (CFs 1–14, all goroutines run concurrently) ...
 
-CF 15 built:
-  range:0000:recsplit:cf:15:done       →  "1"
+CF 15 built (goroutine 15 completes; all 16 done):
+  range:0000:recsplit:cf:0f:done       →  "1"
 
-All CFs done:
+All 16 goroutines complete:
   range:0000:recsplit:state            →  "COMPLETE"
   range:0000:state                     →  "COMPLETE"
 
@@ -152,10 +156,12 @@ If the process crashes while building RecSplit for range N:
 
 1. On restart: read `range:N:state` — if `RECSPLIT_BUILDING`, resume
 2. Read `range:N:recsplit:state` — if `BUILDING`, scan per-CF done flags
-3. For each CF where `done != "1"`: rebuild the CF index from scratch
-4. For each CF where `done == "1"`: skip
+3. Spawn 16 goroutines (one per CF, running in parallel):
+   - For each CF where `done == "1"`: goroutine exits immediately (CF already built)
+   - For each CF where `done != "1"`: goroutine rebuilds the CF index from scratch
+4. After all 16 goroutines complete, set `recsplit:state = COMPLETE` and `range:N:state = COMPLETE`
 
-Per-CF granularity means at most 1/16th of the work is lost on crash.
+Per-CF granularity means at most 15/16th of the work is lost on crash. The goroutines for completed CFs exit immediately and do not re-read any raw files.
 
 Raw txhash flat files are **not deleted** until all 16 CFs are built. They remain as the RecSplit build input on resume.
 

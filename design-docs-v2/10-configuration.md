@@ -172,22 +172,26 @@ Ingest ledgers 2–30,000,001 (ranges 0, 1, 2) from GCS:
 
 ```toml
 [service]
-data_dir = "/data/stellar-rpc"
+data_dir = "/data/stellar-rpc"   # required
+# http_port = 8080               # optional — defaults to 8080
 
 [backfill]
-start_ledger    = 2
-end_ledger      = 30000001
-parallel_ranges = 2
-flush_interval  = 100
+start_ledger    = 2              # required — must be a valid range start (2, 10000002, …)
+end_ledger      = 30000001       # required — must be a valid range end (10000001, 20000001, …)
+# parallel_ranges = 2            # optional — defaults to 2
+# flush_interval  = 100          # optional — defaults to 100
 
 [backfill.bsb]
-bucket_path   = "gs://stellar-ledgers/mainnet"
-num_instances = 20
-buffer_size   = 1000
-num_workers   = 20
+bucket_path   = "gs://stellar-ledgers/mainnet"  # required
+# num_instances = 20             # optional — defaults to 20; valid values: 10 or 20
+# buffer_size   = 1000           # optional — defaults to 1000
+# num_workers   = 20             # optional — defaults to 20
 
 [rocksdb]
-block_cache_mb = 4096
+# All fields optional; shown here with non-default values for backfill (lower cache is fine)
+block_cache_mb = 4096            # optional — defaults to 8192; 4096 is sufficient for backfill
+# write_buffer_mb         = 64   # optional — defaults to 64
+# max_write_buffer_number = 2    # optional — defaults to 2
 ```
 
 **Run**: `ingestion-workflow --config config.toml --mode backfill`
@@ -198,17 +202,18 @@ block_cache_mb = 4096
 
 ```toml
 [service]
-data_dir = "/data/stellar-rpc"
+data_dir = "/data/stellar-rpc"   # required
+# http_port = 8080               # optional — defaults to 8080
 
 [backfill]
-start_ledger    = 30000002
-end_ledger      = 50000001
-parallel_ranges = 1
-flush_interval  = 100
+start_ledger    = 30000002       # required
+end_ledger      = 50000001       # required
+parallel_ranges = 1              # optional — defaults to 2; use 1 here: each captive_core instance needs ~8GB RAM
+# flush_interval = 100           # optional — defaults to 100
 
 [backfill.captive_core]
-binary_path = "/usr/local/bin/stellar-core"
-config_path = "/etc/stellar/captive-core.cfg"
+binary_path = "/usr/local/bin/stellar-core"   # required
+config_path = "/etc/stellar/captive-core.cfg" # required
 ```
 
 **Note**: `parallel_ranges = 1` recommended to avoid running two CaptiveStellarCore instances.
@@ -220,16 +225,23 @@ BSB parallelism (`num_instances`) does not apply when using `captive_core`.
 
 ```toml
 [service]
-data_dir  = "/data/stellar-rpc"
-http_port = 8080
+data_dir  = "/data/stellar-rpc"  # required
+# http_port = 8080               # optional — defaults to 8080
+
+# [streaming]
+# start_ledger = <auto>          # optional — defaults to streaming:last_committed_ledger + 1
+#                                #   (or first ledger after last COMPLETE range if no checkpoint exists)
+#                                #   Override only if you need to force a specific resume point.
 
 [streaming.captive_core]
-binary_path = "/usr/local/bin/stellar-core"
-config_path = "/etc/stellar/captive-core.cfg"
+binary_path = "/usr/local/bin/stellar-core"   # required
+config_path = "/etc/stellar/captive-core.cfg" # required
 
 [rocksdb]
-block_cache_mb = 8192
-write_buffer_mb = 64
+# All fields optional; shown here with streaming-appropriate values
+block_cache_mb          = 8192   # optional — defaults to 8192; keep high for streaming query performance
+# write_buffer_mb         = 64   # optional — defaults to 64
+# max_write_buffer_number = 2    # optional — defaults to 2
 ```
 
 **Run**: `ingestion-workflow --config config.toml --mode streaming`
@@ -238,23 +250,29 @@ write_buffer_mb = 64
 
 ### Example 4: Multi-Disk Layout
 
+Spread stores across separate SSD volumes for maximum I/O parallelism. All stores benefit from SSD — meta store requires fast random I/O, active stores require fast write throughput, and immutable stores see large sequential writes during backfill and frequent reads during query serving.
+
 ```toml
 [service]
-data_dir = "/data/stellar-rpc"
+data_dir = "/data/stellar-rpc"   # required; used as base for any unset sub-paths below
 
 [meta_store]
-path = "/nvme0/stellar-rpc/meta/rocksdb"
+# optional — defaults to {data_dir}/meta/rocksdb
+path = "/ssd0/stellar-rpc/meta/rocksdb"
 
 [active_stores]
-base_path = "/nvme1/stellar-rpc/active/rocksdb"
+# optional — defaults to {data_dir}/active/rocksdb
+# used in streaming mode only; ignored during backfill
+base_path = "/ssd1/stellar-rpc/active/rocksdb"
 
 [immutable_stores]
-ledgers_base = "/hdd0/stellar-rpc/immutable/ledgers"
-txhash_base  = "/hdd1/stellar-rpc/immutable/txhash"
+# both optional — default to {data_dir}/immutable/ledgers and {data_dir}/immutable/txhash
+ledgers_base = "/ssd2/stellar-rpc/immutable/ledgers"
+txhash_base  = "/ssd3/stellar-rpc/immutable/txhash"
 
 [streaming.captive_core]
-binary_path = "/usr/local/bin/stellar-core"
-config_path = "/etc/stellar/captive-core.cfg"
+binary_path = "/usr/local/bin/stellar-core"   # required
+config_path = "/etc/stellar/captive-core.cfg" # required
 ```
 
 ---

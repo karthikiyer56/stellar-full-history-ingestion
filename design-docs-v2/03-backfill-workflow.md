@@ -33,7 +33,7 @@ flowchart TD
         direction TB
         INIT["Set range:N:state = INGESTING in meta store"]:::state
         INIT --> SCAN["Scan all 1000 chunk flag pairs<br/>build skip-set: chunks where lfs_done=1 AND txhash_done=1"]:::action
-        SCAN --> BSB_INIT["Instantiate 20 BSB instances in parallel<br/>BSB instance K → chunks (K×50)..(K×50)+49"]:::action
+        SCAN --> BSB_INIT["Instantiate 20 BSB instances in parallel<br/>BSB instance K → chunks (rangeFirstChunk + K×50)..(rangeFirstChunk + K×50+49)<br/>where rangeFirstChunk = rangeID × 1000"]:::action
         BSB_INIT --> BSB_PARALLEL["All 20 BSB instances run concurrently<br/>(each independently fetches + writes its 50-chunk slice)"]:::action
         BSB_PARALLEL --> CHUNK_LOOP["Each BSB instance: for each chunk in its slice"]:::action
         CHUNK_LOOP --> WRITE_CHUNK["Write chunk sub-workflow<br/>(skip if both flags set; see below)"]:::action
@@ -206,7 +206,7 @@ flowchart TD
 
 ## File Output Per Range
 
-After a range completes (both ingestion and RecSplit):
+After a range completes (both ingestion and RecSplit), the durable output on disk is:
 
 ```
 immutable/
@@ -217,14 +217,14 @@ immutable/
 │           └── {YYYYYY}.index   ← offset table for random access
 └── txhash/
     └── {rangeID:04d}/
-        ├── raw/
-        │   └── {YYYYYY}.bin     ← txhash flat files (36B/entry, one per chunk)
-        └── index/
+        └── index/               ← raw/ is DELETED once all 16 CFs are built
             ├── cf-0.idx         ← RecSplit CF 0 (txhashes starting with '0')
             ├── cf-1.idx
-            └── ...
+            ├── ...
             └── cf-f.idx         ← RecSplit CF 15 (txhashes starting with 'f')
 ```
+
+During ingestion (state `INGESTING`), `immutable/txhash/{rangeID:04d}/raw/{YYYYYY}.bin` files also exist (one per completed chunk). These are the RecSplit build input. They are deleted immediately after all 16 CFs are built and verified — `raw/` is absent for any range in state `COMPLETE`.
 
 ---
 

@@ -30,48 +30,68 @@ The service organizes all data under a single configurable `data_dir`. Backfill 
 │           ├── *.log
 │           └── OPTIONS-*
 │
-└── immutable/
+    └── immutable/
     ├── ledgers/
     │   └── chunks/
     │       ├── 0000/                    ← chunkID/1000 directory (range 0: chunks 0–999)
-    │       │   ├── 000000.data          ← chunk 0:  ledgers 2–10,001
+    │       │   ├── 000000.data          ← chunk 0:   ledgers 2–10,001
     │       │   ├── 000000.index
-    │       │   ├── 000001.data          ← chunk 1:  ledgers 10,002–20,001
+    │       │   ├── 000001.data          ← chunk 1:   ledgers 10,002–20,001
     │       │   ├── 000001.index
     │       │   ├── ...
+    │       │   ├── 000998.data          ← chunk 998: ledgers 9,980,002–9,990,001
+    │       │   ├── 000998.index
     │       │   ├── 000999.data          ← chunk 999: ledgers 9,990,002–10,000,001
     │       │   └── 000999.index
     │       ├── 0001/                    ← range 1: chunks 1000–1999
-    │       │   ├── 001000.data
+    │       │   ├── 001000.data          ← chunk 1000: ledgers 10,000,002–10,010,001
     │       │   ├── 001000.index
-    │       │   └── ...
-    │       └── {XXXX}/                  ← one directory per 1000 chunks
+    │       │   ├── 001001.data          ← chunk 1001: ledgers 10,010,002–10,020,001
+    │       │   ├── 001001.index
+    │       │   ├── ...
+    │       │   ├── 001998.data          ← chunk 1998: ledgers 19,980,002–19,990,001
+    │       │   ├── 001998.index
+    │       │   ├── 001999.data          ← chunk 1999: ledgers 19,990,002–20,000,001
+    │       │   └── 001999.index
+    │       ├── ...
+    │       └── 0005/                    ← range 5: chunks 5000–5999
+    │           ├── 005000.data          ← chunk 5000: ledgers 50,000,002–50,010,001
+    │           ├── 005000.index
+    │           ├── 005001.data          ← chunk 5001: ledgers 50,010,002–50,020,001
+    │           ├── 005001.index
+    │           ├── ...
+    │           ├── 005998.data          ← chunk 5998: ledgers 59,980,002–59,990,001
+    │           ├── 005998.index
+    │           ├── 005999.data          ← chunk 5999: ledgers 59,990,002–60,000,001
+    │           └── 005999.index
     │
     └── txhash/
-        ├── 0000/                        ← range 0 txhash data
-        │   ├── raw/
-        │   │   ├── 000000.bin           ← chunk 0 raw txhash flat file (36B/entry)
-        │   │   ├── 000001.bin
-        │   │   ├── ...
-        │   │   └── 000999.bin           ← chunk 999 raw txhash flat file
+        ├── 0000/                        ← range 0 txhash data (COMPLETE: raw/ deleted, only index/ remains)
         │   └── index/
         │       ├── cf-0.idx             ← RecSplit CF 0 (txhashes starting with nibble 0)
         │       ├── cf-1.idx
         │       ├── ...
         │       ├── cf-e.idx
         │       └── cf-f.idx             ← RecSplit CF 15
-        ├── 0001/
-        │   ├── raw/
-        │   │   └── ...
-        │   └── index/
-        │       └── ...
-        └── {rangeID:04d}/
+        ├── 0001/                        ← range 1 txhash data (INGESTING: raw/ present; index/ absent until RecSplit runs)
+        │   └── raw/                     ← BACKFILL ONLY; deleted once all 16 RecSplit CFs are built and verified
+        │       ├── 001000.bin           ← chunk 1000 raw txhash flat file (36B/entry)
+        │       ├── 001001.bin
+        │       ├── ...
+        │       ├── 001998.bin
+        │       └── 001999.bin
+        ├── ...
+        └── 0005/                        ← range 5 txhash data (COMPLETE: raw/ deleted, only index/ remains)
+            └── index/
+                ├── cf-0.idx
+                ├── ...
+                └── cf-f.idx
 ```
 
 **Notes**:
 - `active/` is created only when streaming mode starts its first range. Both stores are deleted after streaming transition completes.
-- `immutable/txhash/{rangeID:04d}/raw/` files are created during backfill ingestion and deleted after all 16 RecSplit CFs for that range are built and verified.
-- In streaming mode, raw txhash flat files are **not** created; RecSplit is built directly from the active txhash store (reading each of its 16 CFs by nibble).
+- `immutable/txhash/{rangeID:04d}/raw/` exists **only during backfill ingestion** (state `INGESTING` or `RECSPLIT_BUILDING`). It is deleted immediately after all 16 RecSplit CFs for that range are built and verified. A COMPLETE range has no `raw/` directory — only `index/`.
+- **Streaming mode never creates `raw/`**. RecSplit is built directly from the active txhash store (reading each of its 16 CFs by nibble); no flat files are written to disk.
 
 ---
 
@@ -120,6 +140,8 @@ func chunkIndexPath(dataDir string, chunkID uint32) string {
 
 ## Raw TxHash Flat File Path Convention
 
+> **Backfill mode only.** Raw txhash flat files are never created during streaming ingestion. They exist only while a range is in state `INGESTING` or `RECSPLIT_BUILDING` and are deleted immediately after all 16 RecSplit CFs for that range are built and verified. A range in state `COMPLETE` has no `raw/` directory.
+
 ```
 immutable/txhash/{rangeID:04d}/raw/{chunkID:06d}.bin
 ```
@@ -130,7 +152,7 @@ immutable/txhash/{rangeID:04d}/raw/{chunkID:06d}.bin
 [txhash: 32 bytes][ledgerSeq: 4 bytes big-endian uint32]
 ```
 
-Files are append-only during ingestion (flushed every ~100 ledgers), fsynced at chunk completion, and deleted once all 16 RecSplit CFs for the range are built.
+Files are append-only during ingestion (flushed every ~100 ledgers), fsynced at chunk completion, and deleted once all 16 RecSplit CFs for the range are built and verified.
 
 ### Path Formulas
 
@@ -149,6 +171,9 @@ func rawTxHashPath(dataDir string, rangeID, chunkID uint32) string {
 | 0 | 0 | `immutable/txhash/0000/raw/000000.bin` |
 | 0 | 999 | `immutable/txhash/0000/raw/000999.bin` |
 | 1 | 1000 | `immutable/txhash/0001/raw/001000.bin` |
+| 1 | 1999 | `immutable/txhash/0001/raw/001999.bin` |
+| 5 | 5000 | `immutable/txhash/0005/raw/005000.bin` |
+| 5 | 5999 | `immutable/txhash/0005/raw/005999.bin` |
 
 ---
 
@@ -223,8 +248,8 @@ immutable/txhash/      → [immutable_stores].txhash_base   (default: {data_dir}
 
 | Volume | Store | Rationale |
 |--------|-------|-----------|
-| NVMe SSD | `meta/rocksdb/` + `active/rocksdb/` | Low-latency write path |
-| HDD/object storage | `immutable/ledgers/` + `immutable/txhash/` | Large, read-mostly |
+| SSD | `meta/rocksdb/` + `active/rocksdb/` | Low-latency write path; meta store requires fast random I/O |
+| SSD | `immutable/ledgers/` + `immutable/txhash/` | Large sequential writes during backfill; query reads at range boundaries |
 
 ---
 

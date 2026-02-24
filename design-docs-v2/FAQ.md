@@ -22,7 +22,7 @@
 | Is there a `global:mode` key in meta store? | No — mode is determined by `--mode` startup flag | [02](./02-meta-store-design.md#design-decisions) |
 | Can I query during backfill? | No — only `getHealth` and `getStatus` are available | [03](./03-backfill-workflow.md#design-principles) |
 | Can I query during streaming transition? | Yes — active RocksDB remains accessible until transition completes | [06](./06-streaming-transition-workflow.md) |
-| How much RAM does backfill use? | ~400MB ingestion RAM for 2 orchestrators × 20 BSB instances (plus RocksDB cache) | [10](./10-configuration.md#memory-budget-backfill) |
+| How much RAM does backfill use? | ~400MB ingestion RAM for 2 orchestrators × 20 BSB instances (plus RocksDB cache) | [12](./12-metrics-and-sizing.md#memory-budget--backfill-bsb-mode) |
 | Why flush every ~100 ledgers? | Caps per-chunk RAM to <300KB regardless of throughput | [03](./03-backfill-workflow.md#memory-budget) |
 | Are range boundaries inclusive? | Yes — both ends inclusive; no gaps, no overlaps | [11](./11-checkpointing-and-transitions.md#range-boundary-formulas) |
 
@@ -112,7 +112,7 @@ Yes. The active RocksDB store for the transitioning range remains open for query
 
 ### Q: Does streaming mode write raw txhash flat files?
 
-No. Streaming mode builds RecSplit directly from the active RocksDB `tx_hash_to_ledger_seq` column family during the streaming transition workflow. Raw txhash flat files are a backfill-only artifact. See [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md).
+No. Streaming mode builds RecSplit directly from the active txhash store (16 CFs, one per hex nibble) during the streaming transition workflow. Raw txhash flat files are a backfill-only artifact. See [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md).
 
 ---
 
