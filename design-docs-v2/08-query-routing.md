@@ -411,8 +411,7 @@ flowchart LR
     T0(["Range N last ledger committed"])
     P["PromoteToTransitioning(N)\nAddActiveStore(N+1)"]
 
-    subgraph CONCURRENT["Concurrent from this point"]
-        direction TB
+    subgraph CONCURRENT
         TG["Transition goroutine (range N):\nPhase 1: LFS chunk writes\nPhase 2: RecSplit build\nVerify → AddImmutableStores(N)\nRemoveTransitioningStores(N)"]
         IG["Ingestion loop (range N+1):\nCaptiveStellarCore → active stores\nCheckpoint every ledger"]
     end

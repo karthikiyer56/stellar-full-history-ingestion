@@ -15,8 +15,7 @@ These two modes have **separate transition workflows** and **separate crash reco
 
 ```mermaid
 flowchart TB
-    subgraph BACKFILL["BACKFILL MODE (offline, no queries)"]
-        direction TB
+    subgraph BACKFILL
         BSB["BufferedStorageBackend (BSB)<br/>Up to 2 parallel range orchestrators<br/>Each orchestrator: 20 BSB instances (concurrent)"]
         LFS_BF["LFS Chunk Files<br/>immutable/ledgers/chunks/<br/>(written directly, no RocksDB)"]
         TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/<br/>(36 bytes/entry: hash[32]+seq[4])"]
@@ -26,8 +25,7 @@ flowchart TB
         TXRAW -->|"all 1000 chunks done → trigger"| RECSPLIT
     end
 
-    subgraph STREAMING["STREAMING MODE (live, serves queries)"]
-        direction TB
+    subgraph STREAMING
         CORE["CaptiveStellarCore<br/>batch size = 1 ledger"]
         ACTIVE["Active Store (RocksDB)<br/>Current range, mutable"]
         IMMUTABLE["Immutable Stores<br/>LFS + RecSplit<br/>Completed ranges"]
@@ -35,12 +33,11 @@ flowchart TB
         ACTIVE -->|"range complete → transition workflow"| IMMUTABLE
     end
 
-    subgraph META["META STORE (RocksDB, both modes)"]
-        direction LR
+    subgraph META
         MK["Per-range state, chunk completion flags,<br/>RecSplit build state, checkpoint ledgers"]
     end
 
-    subgraph QUERY["QUERY LAYER (streaming mode only)"]
+    subgraph QUERY
         HTTP["HTTP Server<br/>getTransactionByHash / getLedgerBySequence"]
         ROUTER["Query Router"]
         ACTIVE_Q["Active Stores<br/>(RocksDB)"]

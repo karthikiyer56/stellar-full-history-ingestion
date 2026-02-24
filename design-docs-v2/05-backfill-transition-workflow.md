@@ -31,8 +31,7 @@ flowchart TD
     SET_STATE --> SCAN_CFS["Scan per-CF done flags<br/>(range:N:recsplit:cf:XX:done)"]
     SCAN_CFS --> SPAWN["Spawn 16 goroutines (one per CF 0..15)<br/>All 16 run concurrently — each independently:"]
 
-    subgraph GOROUTINE["Each goroutine (CF nibble X, runs in parallel with other 15)"]
-        direction TB
+    subgraph GOROUTINE
         CF_CHECK{cf:X:done = 1?}
         CF_SKIP["Goroutine exits — CF already built"]
         CF_BUILD["Build RecSplit index for CF X:<br/>1. Scan all 1000 raw txhash flat files for range N<br/>2. Filter entries where txhash[0] >> 4 == X<br/>3. Build minimal perfect hash over filtered hashes<br/>4. Write: immutable/txhash/{N:04d}/index/cf-{X}.idx<br/>5. fsync"]
@@ -103,7 +102,7 @@ See [08-query-routing.md](./08-query-routing.md) for false-positive handling.
 ```mermaid
 flowchart LR
     T0(["t=0: Range 0 ingestion complete"]) --> A
-    subgraph parallel["Concurrent execution"]
+    subgraph parallel
         A["RecSplit build: Range 0<br/>(~4 hours)"]
         B["Range 1 ingestion begins<br/>(BSB parallelism)"]
     end

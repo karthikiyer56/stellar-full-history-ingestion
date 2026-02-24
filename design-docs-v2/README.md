@@ -23,32 +23,30 @@
 
 ```mermaid
 flowchart LR
-    subgraph BACKFILL["BACKFILL MODE (offline, no queries, process exits when done)"]
-        direction TB
-        BSB["BufferedStorageBackend (BSB)<br/>Up to 2 orchestrators × 20 BSB instances<br/>each instance runs concurrently"]
+    subgraph BACKFILL
+        BSB["BufferedStorageBackend (BSB)<br/>Up to 2 orchestrators x 20 BSB instances<br/>each instance runs concurrently"]
         LFS_B["LFS Chunk Files<br/>immutable/ledgers/chunks/XXXX/YYYYYY.data<br/>10K ledgers per chunk, zstd compressed"]
-        TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/YYYYYY.bin<br/>36 bytes/entry: txhash[32] + ledgerSeq[4]"]
-        RECSPLIT_B["RecSplit Index Files<br/>immutable/txhash/XXXX/index/cf-{0..f}.idx<br/>built async after all 1000 chunks done (~4h)"]
+        TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/YYYYYY.bin<br/>36 bytes per entry"]
+        RECSPLIT_B["RecSplit Index Files<br/>immutable/txhash/XXXX/index/cf-X.idx<br/>built async after all 1000 chunks done"]
         BSB --> LFS_B
         BSB --> TXRAW
-        TXRAW -->|"all 1000 chunks complete"| RECSPLIT_B
+        TXRAW -->|all 1000 chunks complete| RECSPLIT_B
     end
 
-    subgraph STREAMING["STREAMING MODE (live ingestion, serves all query endpoints, long-running daemon)"]
-        direction TB
+    subgraph STREAMING
         CORE["CaptiveStellarCore<br/>1 ledger per batch"]
-        ACTIVE["Active RocksDB Stores (per range)<br/><active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/<br/><active_stores_base_dir>/txhash-store-range-{rangeID:04d}/"]
-        TRANS["Streaming Transition Workflow<br/>background goroutine — runs while next range ingests<br/>Phase 1: LFS chunks  Phase 2: RecSplit build"]
-        IMM["Immutable Stores<br/>LFS chunks + RecSplit indexes<br/>served by QueryRouter for completed ranges"]
+        ACTIVE["Active RocksDB Stores<br/>ledger-store-chunk + txhash-store-range"]
+        TRANS["Streaming Transition<br/>background goroutine<br/>Phase 1: LFS chunks, Phase 2: RecSplit"]
+        IMM["Immutable Stores<br/>LFS chunks + RecSplit indexes"]
         CORE --> ACTIVE
-        ACTIVE -->|"range boundary hit"| TRANS
+        ACTIVE -->|range boundary hit| TRANS
         TRANS --> IMM
     end
 
-    META["META STORE (RocksDB)<br/>meta/rocksdb/<br/>Per-range state, chunk flags,<br/>RecSplit build state, checkpoint ledgers<br/>WAL required — never disable"]
+    META["META STORE<br/>RocksDB, both modes<br/>per-range state, chunk flags,<br/>RecSplit build state, checkpoint ledgers"]
 
-    BACKFILL -.->|"reads/writes state"| META
-    STREAMING -.->|"reads/writes state"| META
+    BACKFILL -.->|reads/writes state| META
+    STREAMING -.->|reads/writes state| META
 ```
 
 ---

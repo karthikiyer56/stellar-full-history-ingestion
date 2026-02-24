@@ -25,8 +25,7 @@ flowchart TD
     VALIDATE --> RANGES["Enumerate ranges to ingest<br/>(e.g., ranges 0, 1, 2 for ledgers 2–30,000,001)"]
     RANGES --> DISPATCH["Dispatch up to 2 range orchestrators in parallel"]
 
-    subgraph ORCHESTRATOR["Range Orchestrator (per range)"]
-        direction TB
+    subgraph ORCHESTRATOR
         INIT["Set range:N:state = INGESTING in meta store"]
         INIT --> SCAN["Scan all 1000 chunk flag pairs<br/>build skip-set: chunks where lfs_done=1 AND txhash_done=1"]
         SCAN --> BSB_INIT["Instantiate 20 BSB instances in parallel<br/>BSB instance K → chunks (rangeFirstChunk + K×50)..(rangeFirstChunk + K×50+49)<br/>where rangeFirstChunk = rangeID × 1000"]
@@ -122,8 +121,7 @@ BufferedStorageBackend (BSB) is the GCS-backed ledger source used during backfil
 
 ```mermaid
 flowchart LR
-    subgraph P1["Orchestrator: Range 0"]
-        direction TB
+    subgraph P1
         B1["BSB 0 (chunks 0–49, ledgers 2–500,001)"]
         B2["BSB 1 (chunks 50–99, ledgers 500,002–1,000,001)"]
         BD["BSB 2–18 (...)"]
@@ -132,8 +130,7 @@ flowchart LR
         B1 & B2 & BD & B20 -->|"all run concurrently"| RS0
     end
 
-    subgraph P2["Orchestrator: Range 1"]
-        direction TB
+    subgraph P2
         C1["BSB 0 (chunks 1000–1049)"]
         C2["BSB 1–18 (...)"]
         C20["BSB 19 (chunks 1950–1999)"]
