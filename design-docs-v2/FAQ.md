@@ -22,7 +22,7 @@
 | Is there a `global:mode` key in meta store? | No — mode is determined by `--mode` startup flag | [02](./02-meta-store-design.md#design-decisions) |
 | Can I query during backfill? | No — only `getHealth` and `getStatus` are available | [03](./03-backfill-workflow.md#design-principles) |
 | Can I query during streaming transition? | Yes — active RocksDB remains accessible until transition completes | [06](./06-streaming-transition-workflow.md) |
-| How much RAM does backfill use? | ~400MB ingestion RAM for 2 orchestrators × 20 BSB instances (plus RocksDB cache) | [12](./12-metrics-and-sizing.md#memory-budget--backfill-bsb-mode) |
+| How much RAM does backfill use? | TBD — not yet profiled end-to-end; see memory budget section | [12](./12-metrics-and-sizing.md#memory-budget--backfill-bsb-mode) |
 | Why flush every ~100 ledgers? | Caps per-chunk RAM to <300KB regardless of throughput | [03](./03-backfill-workflow.md#memory-budget) |
 | Are range boundaries inclusive? | Yes — both ends inclusive; no gaps, no overlaps | [11](./11-checkpointing-and-transitions.md#range-boundary-formulas) |
 
@@ -38,11 +38,11 @@ Backfill's crash recovery granularity is the chunk (10K ledgers), not the ledger
 
 ### Q: What is a BSB instance?
 
-A BSB (BufferedStorageBackend) instance is one concurrent worker assigned a contiguous ledger sub-range within a 10M-ledger range. With `num_instances = 20` (default), each instance spans 500K ledgers (50 chunks). With `num_instances = 10`, each spans 1M ledgers (100 chunks). All instances within a range run **in parallel** — this is BSB parallelism. BSB instance boundaries always align to chunk boundaries (multiples of 10K). See [03-backfill-workflow.md — BSB Configuration](./03-backfill-workflow.md#bsb-configuration).
+A BSB (BufferedStorageBackend) instance is one concurrent worker assigned a contiguous ledger sub-range within a 10M-ledger range. With `num_bsb_instances_per_range = 20` (default), each instance spans 500K ledgers (50 chunks). With `num_bsb_instances_per_range = 10`, each spans 1M ledgers (100 chunks). All instances within a range run **in parallel** — this is BSB parallelism. BSB instance boundaries always align to chunk boundaries (multiples of 10K). See [03-backfill-workflow.md — BSB Configuration](./03-backfill-workflow.md#bsb-configuration).
 
 ---
 
-### Q: What are the valid values for `num_instances`?
+### Q: What are the valid values for `num_bsb_instances_per_range`?
 
 Only `10` or `20`. Both produce BSB instance sizes that are exact multiples of the 10K chunk size:
 - `20` → 500K ledgers per BSB instance (50 chunks/instance)
@@ -189,7 +189,7 @@ See [02-meta-store-design.md](./02-meta-store-design.md).
 
 ### Q: Is there a `transitioning/` directory?
 
-No. The v2 design eliminates it. The RocksDB active store stays in `active/rocksdb/{rangeID:04d}-ledger-store/` throughout the transition — it is deleted in-place once the transition goroutine completes. Transition state is `range:{N}:state = "TRANSITIONING"` in the meta store. See [02-meta-store-design.md — Design Decisions](./02-meta-store-design.md#design-decisions) and [09-directory-structure.md](./09-directory-structure.md).
+No. The v2 design eliminates it. The RocksDB active store stays at `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` throughout the transition — it is deleted in-place once the transition goroutine completes. Transition state is `range:{N}:state = "TRANSITIONING"` in the meta store. See [02-meta-store-design.md — Design Decisions](./02-meta-store-design.md#design-decisions) and [09-directory-structure.md](./09-directory-structure.md).
 
 ---
 
@@ -201,7 +201,7 @@ No. The v2 design eliminates it. The RocksDB active store stays in `active/rocks
 
 ### Q: What TOML key controls BSB instance count?
 
-`[backfill.bsb].num_instances`. Valid values: `10` or `20`. Default: `20`. `[backfill.bsb]` and `[backfill.captive_core]` are mutually exclusive — exactly one must be present. See [10-configuration.md](./10-configuration.md#backfillbsb).
+`[backfill.bsb].num_bsb_instances_per_range`. Valid values: `10` or `20`. Default: `20`. `[backfill.bsb]` and `[backfill.captive_core]` are mutually exclusive — exactly one must be present. See [10-configuration.md](./10-configuration.md#backfillbsb).
 
 ---
 

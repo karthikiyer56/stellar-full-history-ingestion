@@ -2,94 +2,106 @@
 
 ## Overview
 
-The service organizes all data under a single configurable `data_dir`. Backfill mode writes directly to `immutable/` and never creates `active/` stores. Streaming mode uses `active/` for the live range and `immutable/` for completed ranges. Meta store is always present under `meta/`. No `transitioning/` directory exists — transition state is tracked entirely in the meta store.
+The service organizes all data under a single configurable `data_dir`. Backfill mode writes directly to `immutable/` and never creates active stores. Streaming mode uses `<active_stores_base_dir>/` for the live range stores and `immutable/` for completed ranges. Meta store is always present under `meta/`. No `transitioning/` directory exists — transition state is tracked entirely in the meta store.
 
 ---
 
 ## Full File Tree
 
+The tree below shows a **streaming snapshot at the range 5→6 boundary**: range 5 is `TRANSITIONING` (both its stores remain open for queries while the background goroutine converts them to immutable), and range 6 is the newly `ACTIVE` range. Ranges 0–4 are `COMPLETE` and shown only by their immutable artifacts.
+
 ```
 {data_dir}/
+│
 ├── meta/
-│   └── rocksdb/                         ← Single meta store RocksDB instance
+│   └── rocksdb/                              ← Single meta store RocksDB instance
 │       ├── MANIFEST-*
 │       ├── *.sst
-│       ├── *.log                        ← WAL (required — never disable)
+│       ├── *.log                             ← WAL (required — never disable)
 │       └── OPTIONS-*
 │
-├── active/                              ← STREAMING MODE ONLY; absent during backfill
-│   └── rocksdb/
-│       ├── {rangeID:04d}-ledger-store/  ← Ledger store: default CF only; key=uint32BE(ledgerSeq), value=zstd(LCM)
-│       │   ├── MANIFEST-*
-│       │   ├── *.sst
-│       │   ├── *.log
-│       │   └── OPTIONS-*
-│       └── {rangeID:04d}-txhash-store/  ← TxHash store: 16 CFs (one per nibble 0–f); key=txhash[32], value=uint32BE(ledgerSeq)
-│           ├── MANIFEST-*
-│           ├── *.sst
-│           ├── *.log
-│           └── OPTIONS-*
+├── active/                                   ← [active_stores].base_path (default: {data_dir}/active)
+│   │                                           STREAMING MODE ONLY
+│   │
+│   │   ── TRANSITIONING: range 5 stores (open read-only; being converted to immutable) ──
+│   ├── ledger-store-chunk-005999/            ← Last ledger store of range 5 (chunk 5999,
+│   │   ├── MANIFEST-*                          ledgers 59,990,002–60,000,001); stays open
+│   │   ├── *.sst                               until transition goroutine completes
+│   │   ├── *.log
+│   │   └── OPTIONS-*
+│   ├── txhash-store-range-0005/              ← TxHash store for range 5 (10M-ledger range);
+│   │   ├── MANIFEST-*                          stays open until transition goroutine completes
+│   │   ├── *.sst
+│   │   ├── *.log
+│   │   └── OPTIONS-*
+│   │
+│   │   ── ACTIVE: range 6 stores (being written to right now) ──
+│   ├── ledger-store-chunk-006000/            ← First ledger store of range 6 (chunk 6000,
+│   │   ├── MANIFEST-*                          ledgers 60,000,002–60,010,001)
+│   │   ├── *.sst
+│   │   ├── *.log
+│   │   └── OPTIONS-*
+│   └── txhash-store-range-0006/              ← TxHash store for range 6; 16 CFs (nibble 0–f)
+│       ├── MANIFEST-*
+│       ├── *.sst
+│       ├── *.log
+│       └── OPTIONS-*
 │
-    └── immutable/
+└── immutable/
     ├── ledgers/
     │   └── chunks/
-    │       ├── 0000/                    ← chunkID/1000 directory (range 0: chunks 0–999)
-    │       │   ├── 000000.data          ← chunk 0:   ledgers 2–10,001
+    │       ├── 0000/                         ← range 0: chunks 0–999
+    │       │   ├── 000000.data               ← chunk 0:    ledgers 2–10,001
     │       │   ├── 000000.index
-    │       │   ├── 000001.data          ← chunk 1:   ledgers 10,002–20,001
-    │       │   ├── 000001.index
     │       │   ├── ...
-    │       │   ├── 000998.data          ← chunk 998: ledgers 9,980,002–9,990,001
-    │       │   ├── 000998.index
-    │       │   ├── 000999.data          ← chunk 999: ledgers 9,990,002–10,000,001
+    │       │   ├── 000999.data               ← chunk 999:  ledgers 9,990,002–10,000,001
     │       │   └── 000999.index
-    │       ├── 0001/                    ← range 1: chunks 1000–1999
-    │       │   ├── 001000.data          ← chunk 1000: ledgers 10,000,002–10,010,001
+    │       ├── 0001/                         ← range 1: chunks 1000–1999
+    │       │   ├── 001000.data               ← chunk 1000: ledgers 10,000,002–10,010,001
     │       │   ├── 001000.index
-    │       │   ├── 001001.data          ← chunk 1001: ledgers 10,010,002–10,020,001
-    │       │   ├── 001001.index
     │       │   ├── ...
-    │       │   ├── 001998.data          ← chunk 1998: ledgers 19,980,002–19,990,001
-    │       │   ├── 001998.index
-    │       │   ├── 001999.data          ← chunk 1999: ledgers 19,990,002–20,000,001
+    │       │   ├── 001999.data               ← chunk 1999: ledgers 19,990,002–20,000,001
     │       │   └── 001999.index
-    │       ├── ...
-    │       └── 0005/                    ← range 5: chunks 5000–5999
-    │           ├── 005000.data          ← chunk 5000: ledgers 50,000,002–50,010,001
+    │       ├── 0002/                         ← range 2: chunks 2000–2999
+    │       │   └── ...
+    │       ├── 0003/                         ← range 3: chunks 3000–3999
+    │       │   └── ...
+    │       ├── 0004/                         ← range 4: chunks 4000–4999
+    │       │   └── ...
+    │       └── 0005/                         ← range 5: chunks 5000–5999 (written by transition goroutine)
+    │           ├── 005000.data               ← chunk 5000: ledgers 50,000,002–50,010,001
     │           ├── 005000.index
-    │           ├── 005001.data          ← chunk 5001: ledgers 50,010,002–50,020,001
-    │           ├── 005001.index
     │           ├── ...
-    │           ├── 005998.data          ← chunk 5998: ledgers 59,980,002–59,990,001
-    │           ├── 005998.index
-    │           ├── 005999.data          ← chunk 5999: ledgers 59,990,002–60,000,001
+    │           ├── 005999.data               ← chunk 5999: ledgers 59,990,002–60,000,001
     │           └── 005999.index
     │
     └── txhash/
-        ├── 0000/                        ← range 0 txhash data (COMPLETE: raw/ deleted, only index/ remains)
+        ├── 0000/                             ← range 0 (COMPLETE: no raw/, only index/)
         │   └── index/
-        │       ├── cf-0.idx             ← RecSplit CF 0 (txhashes starting with nibble 0)
-        │       ├── cf-1.idx
+        │       ├── cf-0.idx
         │       ├── ...
-        │       ├── cf-e.idx
-        │       └── cf-f.idx             ← RecSplit CF 15
-        ├── 0001/                        ← range 1 txhash data (INGESTING: raw/ present; index/ absent until RecSplit runs)
-        │   └── raw/                     ← BACKFILL ONLY; deleted once all 16 RecSplit CFs are built and verified
-        │       ├── 001000.bin           ← chunk 1000 raw txhash flat file (36B/entry)
-        │       ├── 001001.bin
+        │       └── cf-f.idx
+        ├── 0001/                             ← range 1 (COMPLETE)
+        │   └── index/
+        │       ├── cf-0.idx
         │       ├── ...
-        │       ├── 001998.bin
-        │       └── 001999.bin
-        ├── ...
-        └── 0005/                        ← range 5 txhash data (COMPLETE: raw/ deleted, only index/ remains)
+        │       └── cf-f.idx
+        ├── 0002/                             ← range 2 (COMPLETE)
+        │   └── index/ ...
+        ├── 0003/                             ← range 3 (COMPLETE)
+        │   └── index/ ...
+        ├── 0004/                             ← range 4 (COMPLETE)
+        │   └── index/ ...
+        └── 0005/                             ← range 5 (TRANSITIONING → built by goroutine; may be partial)
             └── index/
-                ├── cf-0.idx
+                ├── cf-0.idx                  ← RecSplit CF 0; present once that CF's build completes
                 ├── ...
                 └── cf-f.idx
 ```
 
 **Notes**:
-- `active/` is created only when streaming mode starts its first range. Both stores are deleted after streaming transition completes.
+- `active/` is created when streaming mode starts. At most **4 RocksDB stores** can exist simultaneously at a range boundary: the two TRANSITIONING stores (range N's ledger-store + txhash-store) plus the two ACTIVE stores (range N+1's ledger-store + txhash-store). All 4 stay open for queries until the transition goroutine completes and sets the range to `COMPLETE`.
+- The TRANSITIONING ledger-store-chunk-NNNNN and txhash-store-range-NNNN are deleted in-place once verification passes — they are never moved or renamed.
 - `immutable/txhash/{rangeID:04d}/raw/` exists **only during backfill ingestion** (state `INGESTING` or `RECSPLIT_BUILDING`). It is deleted immediately after all 16 RecSplit CFs for that range are built and verified. A COMPLETE range has no `raw/` directory — only `index/`.
 - **Streaming mode never creates `raw/`**. RecSplit is built directly from the active txhash store (reading each of its 16 CFs by nibble); no flat files are written to disk.
 
@@ -210,13 +222,13 @@ func recSplitPath(dataDir string, rangeID uint32, nibble string) string {
 ## Active Store Path Convention (Streaming Mode Only)
 
 ```
-active/rocksdb/{rangeID:04d}-ledger-store/   ← ledger store (default CF only)
-active/rocksdb/{rangeID:04d}-txhash-store/   ← txhash store (16 CFs, one per nibble 0–f)
+<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/   ← ledger store (default CF only)
+<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/   ← txhash store (16 CFs, one per nibble 0–f)
 ```
 
 **Two separate RocksDB instances per active range:**
-- **Ledger store** (`{rangeID:04d}-ledger-store/`): default CF only. `key = uint32BE(ledgerSeq)`, `value = zstd(LedgerCloseMeta)`. No column families.
-- **TxHash store** (`{rangeID:04d}-txhash-store/`): 16 column families, one per first hex nibble of txhash (`0`–`f`). CF routing: `CF = txhash[0] >> 4`. `key = txhash[32]`, `value = uint32BE(ledgerSeq)`.
+- **Ledger store** (`ledger-store-chunk-{chunkID:06d}/`): default CF only. `key = uint32BE(ledgerSeq)`, `value = zstd(LedgerCloseMeta)`. One instance per 10K-ledger chunk; replaced at every chunk boundary.
+- **TxHash store** (`txhash-store-range-{rangeID:04d}/`): 16 column families, one per first hex character of the txhash (`0`–`f`). CF routing: first hex char of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes). `key = txhash[32]`, `value = uint32BE(ledgerSeq)`. One instance per 10M-ledger range; replaced at every range boundary.
 
 At most one active range exists at a time. During streaming transition, both stores are kept alive for queries until the transition completes and is verified, then both are deleted.
 
@@ -237,18 +249,18 @@ Single RocksDB instance. WAL must never be disabled. Present in both backfill an
 Path overrides via TOML config allow each subtree to live on a different volume:
 
 ```
-meta/rocksdb/          → [meta_store].path               (default: {data_dir}/meta/rocksdb)
-active/rocksdb/        → [active_stores].base_path        (default: {data_dir}/active/rocksdb)
-                         (both ledger-store and txhash-store live under this base)
-immutable/ledgers/     → [immutable_stores].ledgers_base  (default: {data_dir}/immutable/ledgers)
-immutable/txhash/      → [immutable_stores].txhash_base   (default: {data_dir}/immutable/txhash)
+meta/rocksdb/                  → [meta_store].path               (default: {data_dir}/meta/rocksdb)
+<active_stores_base_dir>/      → [active_stores].base_path        (default: {data_dir}/active)
+                                 (ledger-store-chunk-{chunkID:06d}/ and txhash-store-range-{rangeID:04d}/ live under this base)
+immutable/ledgers/             → [immutable_stores].ledgers_base  (default: {data_dir}/immutable/ledgers)
+immutable/txhash/              → [immutable_stores].txhash_base   (default: {data_dir}/immutable/txhash)
 ```
 
 **Typical layout**:
 
 | Volume | Store | Rationale |
 |--------|-------|-----------|
-| SSD | `meta/rocksdb/` + `active/rocksdb/` | Low-latency write path; meta store requires fast random I/O |
+| SSD | `meta/rocksdb/` + `<active_stores_base_dir>/` | Low-latency write path; meta store requires fast random I/O |
 | SSD | `immutable/ledgers/` + `immutable/txhash/` | Large sequential writes during backfill; query reads at range boundaries |
 
 ---

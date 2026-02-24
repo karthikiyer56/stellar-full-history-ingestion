@@ -31,7 +31,7 @@ Used in streaming mode only. Ignored during backfill.
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
-| `base_path` | string | Optional | `{data_dir}/active/rocksdb` | Base directory for active range stores. Individual stores created as `{base_path}/{rangeID:04d}-ledger-store/` |
+| `base_path` | string | Optional | `{data_dir}/active` | Base directory for active range stores. Individual stores created as `{base_path}/ledger-store-chunk-{chunkID:06d}/` and `{base_path}/txhash-store-range-{rangeID:04d}/` |
 
 ---
 
@@ -68,11 +68,11 @@ Cannot be combined with `[backfill.captive_core]`.
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
 | `bucket_path` | string | **Required** | — | GCS or S3 path, e.g. `"gs://stellar-ledgers/mainnet"` |
-| `num_instances` | int | Optional | `20` | BSB instances per range orchestrator. Valid values: `10` or `20`. All instances run in parallel within a range. |
+| `num_bsb_instances_per_range` | int | Optional | `20` | BSB instances per range orchestrator. Valid values: `10` or `20`. All instances run in parallel within a range. |
 | `buffer_size` | int | Optional | `1000` | BSB internal ledger prefetch depth per BSB instance. |
 | `num_workers` | int | Optional | `20` | BSB internal download worker count per BSB instance. |
 
-**`num_instances` constraints**:
+**`num_bsb_instances_per_range` constraints**:
 - `20` (default) → each BSB instance spans 500K ledgers (50 chunks per instance)
 - `10` → each BSB instance spans 1M ledgers (100 chunks per instance)
 - Both values are exact multiples of the 10K chunk size
@@ -92,7 +92,7 @@ Cannot be combined with `[backfill.bsb]`.
 | `config_path` | string | **Required** | — | Path to `captive-core.cfg` |
 
 **Important constraints when using captive_core for backfill**:
-- There is no BSB parallelism — `[backfill.bsb]`'s `num_instances` does not apply
+- There is no BSB parallelism — `[backfill.bsb]`'s `num_bsb_instances_per_range` does not apply
 - Each range orchestrator runs a single CaptiveStellarCore instance sequentially through its ledger range
 - Running multiple CaptiveStellarCore instances (`parallel_ranges > 1`) requires ~8 GB RAM per instance
 - Prefer `[backfill.bsb]` for large-scale backfill; `captive_core` is for environments without GCS access
@@ -183,7 +183,7 @@ end_ledger      = 30000001       # required — must be a valid range end (10000
 
 [backfill.bsb]
 bucket_path   = "gs://stellar-ledgers/mainnet"  # required
-# num_instances = 20             # optional — defaults to 20; valid values: 10 or 20
+# num_bsb_instances_per_range = 20             # optional — defaults to 20; valid values: 10 or 20
 # buffer_size   = 1000           # optional — defaults to 1000
 # num_workers   = 20             # optional — defaults to 20
 
@@ -217,7 +217,7 @@ config_path = "/etc/stellar/captive-core.cfg" # required
 ```
 
 **Note**: `parallel_ranges = 1` recommended to avoid running two CaptiveStellarCore instances.
-BSB parallelism (`num_instances`) does not apply when using `captive_core`.
+BSB parallelism (`num_bsb_instances_per_range`) does not apply when using `captive_core`.
 
 ---
 
@@ -261,9 +261,9 @@ data_dir = "/data/stellar-rpc"   # required; used as base for any unset sub-path
 path = "/ssd0/stellar-rpc/meta/rocksdb"
 
 [active_stores]
-# optional — defaults to {data_dir}/active/rocksdb
+# optional — defaults to {data_dir}/active
 # used in streaming mode only; ignored during backfill
-base_path = "/ssd1/stellar-rpc/active/rocksdb"
+base_path = "/ssd1/stellar-rpc/active"
 
 [immutable_stores]
 # both optional — default to {data_dir}/immutable/ledgers and {data_dir}/immutable/txhash
@@ -279,9 +279,9 @@ config_path = "/etc/stellar/captive-core.cfg" # required
 
 ## Configuration Tips
 
-### Memory Budget, `num_instances` Trade-off, and `flush_interval` Rule
+### Memory Budget, `num_bsb_instances_per_range` Trade-off, and `flush_interval` Rule
 
-See [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) for the full memory budget breakdown across all modes, the `num_instances` trade-off table, and the `flush_interval` rule.
+See [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) for the full memory budget breakdown across all modes, the `num_bsb_instances_per_range` trade-off table, and the `flush_interval` rule.
 
 ### `[backfill.bsb]` vs `[backfill.captive_core]`
 
@@ -289,7 +289,7 @@ See [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) for the full memory b
 |-----------|-----------------|--------------------------|
 | Data source | GCS / S3 bucket | Local stellar-core binary |
 | BSB parallelism | 20 instances in parallel per range | Not applicable — sequential |
-| RAM per orchestrator | ~205MB (20 BSB instances) | ~8GB (one stellar-core process) |
+| RAM per orchestrator | TBD | ~8GB (one stellar-core process) |
 | Recommended for | Large-scale backfill, cloud environments | Air-gapped / no GCS access |
 | `parallel_ranges` safe value | 2 (default) | 1 recommended |
 
@@ -301,4 +301,4 @@ See [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) for the full memory b
 - [03-backfill-workflow.md](./03-backfill-workflow.md) — how backfill config drives the workflow
 - [04-streaming-workflow.md](./04-streaming-workflow.md) — how streaming config is applied
 - [01-architecture-overview.md](./01-architecture-overview.md) — hardware requirements
-- [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) — memory budgets, num_instances trade-off, flush_interval rule, storage estimates
+- [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) — memory budgets, num_bsb_instances_per_range trade-off, flush_interval rule, storage estimates

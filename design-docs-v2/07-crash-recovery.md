@@ -15,7 +15,7 @@ Crash recovery semantics differ between backfill and streaming modes. The meta s
 | **BSB instance** | One `BufferedStorageBackend` assigned to a contiguous slice of 500K ledgers (50 chunks) within a range. Default: 20 BSB instances per range. |
 | **BSB parallelism** | All 20 BSB instances within a range run **concurrently**. Each independently fetches, decompresses, and writes its 50 chunks. This is the source of non-contiguous completion at crash time — different BSB instances make different amounts of progress before a crash. |
 | **Chunk flags** | Two meta store keys per chunk: `lfs_done` and `txhash_done`. Set only after fsync of the respective file. Both must be `"1"` for a chunk to be skipped on resume. |
-| **RecSplit CF** | One of 16 column family index files, sharded by the first hex nibble of txhash. Tracked with `recsplit:cf:{XX}:done` per CF. |
+| **RecSplit CF** | One of 16 column family index files, sharded by the first hex character of the txhash string (`0`–`f`). Tracked with `recsplit:cf:{XX}:done` per CF. |
 
 ---
 
@@ -33,7 +33,7 @@ Crash recovery semantics differ between backfill and streaming modes. The meta s
 
 ## Backfill Crash Scenarios
 
-> All scenarios use `--start-ledger 2 --end-ledger 10,000,001` (range 0) with `bsb_parallelism=20` unless stated otherwise.
+> All scenarios use `--start-ledger 2 --end-ledger 10,000,001` (range 0) with `num_bsb_instances_per_range=20` unless stated otherwise.
 > BSB instance N handles chunks `(N×50)` through `(N×50)+49`.
 
 ---
@@ -216,7 +216,7 @@ The most complex realistic crash. Two orchestrators run concurrently: range 0 fi
 
 ```
 Setup:
-  parallel_ranges=2, bsb_parallelism=20
+  parallel_ranges=2, num_bsb_instances_per_range=20
   Range 0: ingestion complete, RecSplit started (RECSPLIT_BUILDING)
   Range 1: ingestion in progress (INGESTING), BSB instances at various stages
 
@@ -455,14 +455,14 @@ BSB instance `K` (0-indexed) within an orchestrator always owns the same chunk s
 instanceChunkStart(K) = rangeFirstChunk + K × chunksPerInstance
 instanceChunkEnd(K)   = instanceChunkStart(K) + chunksPerInstance - 1
 
-// with num_instances = 20, chunksPerInstance = 50
+// with num_bsb_instances_per_range = 20, chunksPerInstance = 50
 // rangeFirstChunk for range N = N × 1000
 ```
 
 On resume, each BSB instance receives its per-chunk work lists by intersecting the full sets with its own chunk slice:
 
 ```
-for K in 0..num_instances-1:
+for K in 0..num_bsb_instances_per_range-1:
     sliceStart = rangeFirstChunk + K × chunksPerInstance
     sliceEnd   = sliceStart + chunksPerInstance - 1
 
@@ -494,11 +494,11 @@ startLedger = chunkFirstLedger(instanceChunkStart(K))
 endLedger   = chunkLastLedger(instanceChunkEnd(K))
 ```
 
-**Example: fresh ingestion of Range 0 (`num_instances=20`)**
+**Example: fresh ingestion of Range 0 (`num_bsb_instances_per_range=20`)**
 
 ```
 Range 0 — 1,000 chunks, 10,000,000 ledgers (ledgers 2–10,000,001)
-num_instances=20 → chunksPerInstance=50
+num_bsb_instances_per_range=20 → chunksPerInstance=50
 
 BSB instance 0  → chunks 0–49   → ledgers 2–500,001
 BSB instance 1  → chunks 50–99  → ledgers 500,002–1,000,001
@@ -794,14 +794,10 @@ Once the BSB is prepared, each BSB instance iterates its chunk slice in order:
 
 ```mermaid
 flowchart TD
-    classDef skip fill:#f5f5f5,stroke:#999
-    classDef action fill:#eef8ee,stroke:#228b22
-    classDef decision fill:#fff8e8,stroke:#cc8800
-
-    ITER["Next chunk in BSB slice"] --> CHK{in skipSet?}:::decision
-    CHK -->|yes| SKIP["Skip — no fetch, no write"]:::skip
-    CHK -->|no| REDO["Delete partial files if present<br/>Fetch ledgers for this chunk<br/>Write LFS chunk → fsync → set lfs_done=1<br/>Write txhash flat file → fsync → set txhash_done=1"]:::action
-    SKIP --> NEXT{more chunks?}:::decision
+    ITER["Next chunk in BSB slice"] --> CHK{in skipSet?}
+    CHK -->|yes| SKIP["Skip — no fetch, no write"]
+    CHK -->|no| REDO["Delete partial files if present<br/>Fetch ledgers for this chunk<br/>Write LFS chunk → fsync → set lfs_done=1<br/>Write txhash flat file → fsync → set txhash_done=1"]
+    SKIP --> NEXT{more chunks?}
     REDO --> NEXT
     NEXT -->|yes| ITER
     NEXT -->|no| DONE(["BSB instance complete"])
@@ -813,7 +809,7 @@ flowchart TD
 
 This section traces the complete resume path for Scenario B5 (20 BSB instances, non-contiguous gaps) through all 5 steps.
 
-**Setup**: Range 0 (`ledgers 2–10,000,001`), `num_instances=20`. Crash occurred with BSB instances at different progress levels.
+**Setup**: Range 0 (`ledgers 2–10,000,001`), `num_bsb_instances_per_range=20`. Crash occurred with BSB instances at different progress levels.
 
 #### Chunk scan output (from Scenario B5 state)
 
@@ -1179,8 +1175,8 @@ The recsplit:state="COMPLETE" flag is the reliable signal that all CFs are built
 
 ```
 What happened on disk (before crash):
-  active/rocksdb/0001-ledger-store/: contains ledgers up to 14,999,005
-  active/rocksdb/0001-txhash-store/: contains txhashes for ledgers up to 14,999,005
+  <active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/: contains ledgers up to 14,999,005
+  <active_stores_base_dir>/txhash-store-range-0001/: contains txhashes for ledgers up to 14,999,005
 
 Meta store at crash:
   streaming:last_committed_ledger = 14,999,001  ← not updated (crash before write)
@@ -1224,8 +1220,8 @@ Meta store at crash:
   streaming:last_committed_ledger     = 19,999,995
 
 Disk state:
-  active/rocksdb/0001-ledger-store/  ← still intact (not deleted)
-  active/rocksdb/0001-txhash-store/  ← still intact (not deleted)
+  <active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/  ← still intact (not deleted)
+  <active_stores_base_dir>/txhash-store-range-0001/  ← still intact (not deleted)
   immutable/ledgers/chunks/0001/     ← empty (no LFS chunks written yet)
   immutable/txhash/0001/index/       ← empty (no CF files written yet)
 
@@ -1264,8 +1260,8 @@ Meta store at crash:
 Disk state:
   immutable/ledgers/chunks/0001/: all 1000 LFS chunk files present
   immutable/txhash/0001/index/cf-0.idx … cf-f.idx: all 16 present, complete
-  active/rocksdb/0001-ledger-store/: still on disk (not yet deleted)
-  active/rocksdb/0001-txhash-store/: still on disk (not yet deleted)
+  <active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/: still on disk (not yet deleted)
+  <active_stores_base_dir>/txhash-store-range-0001/: still on disk (not yet deleted)
 
 Recovery:
   Step 1: range:0001:state = "TRANSITIONING" → spawn transition goroutine
@@ -1291,18 +1287,15 @@ Query routing during recovery:
 
 ```mermaid
 flowchart TD
-    classDef decision fill:#fff8e8,stroke:#cc8800
-    classDef action fill:#eef8ee,stroke:#228b22
-
     START["On startup: scan meta store for all known ranges"] --> FOREACH["For each known range"]
-    FOREACH --> RS{range:N:state?}:::decision
+    FOREACH --> RS{range:N:state?}
     RS -->|COMPLETE| SKIP["Skip — range fully done"]
     RS -->|absent| SKIP2["Skip — range not started yet"]
-    RS -->|INGESTING| BACKFILL_RESUME["Backfill: scan ALL 1000 chunk flag pairs<br/>per chunk: both flags = skip<br/>any flag absent = full rewrite of both files<br/>(gaps are expected, not exceptional)"]:::action
-    RS -->|RECSPLIT_BUILDING| RECSPLIT_RESUME["Backfill: scan CF done flags<br/>resume from first incomplete CF"]:::action
-    RS -->|ACTIVE| STREAMING_RESUME["Streaming: resume from<br/>last_committed_ledger + 1"]:::action
-    RS -->|TRANSITIONING| TRANS_RESUME["Streaming: spawn transition goroutine<br/>scan lfs_done + CF done flags<br/>Phase 1: flush remaining chunks from ledger store<br/>Phase 2: rebuild incomplete RecSplit CFs from txhash store<br/>resume streaming from last_committed_ledger + 1"]:::action
-    SKIP --> NEXT{more ranges?}:::decision
+    RS -->|INGESTING| BACKFILL_RESUME["Backfill: scan ALL 1000 chunk flag pairs<br/>per chunk: both flags = skip<br/>any flag absent = full rewrite of both files<br/>(gaps are expected, not exceptional)"]
+    RS -->|RECSPLIT_BUILDING| RECSPLIT_RESUME["Backfill: scan CF done flags<br/>resume from first incomplete CF"]
+    RS -->|ACTIVE| STREAMING_RESUME["Streaming: resume from<br/>last_committed_ledger + 1"]
+    RS -->|TRANSITIONING| TRANS_RESUME["Streaming: spawn transition goroutine<br/>scan lfs_done + CF done flags<br/>Phase 1: flush remaining chunks from ledger store<br/>Phase 2: rebuild incomplete RecSplit CFs from txhash store<br/>resume streaming from last_committed_ledger + 1"]
+    SKIP --> NEXT{more ranges?}
     SKIP2 --> NEXT
     BACKFILL_RESUME --> NEXT
     RECSPLIT_RESUME --> NEXT

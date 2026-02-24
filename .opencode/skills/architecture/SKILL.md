@@ -38,8 +38,8 @@ Two **separate RocksDB instances** per active range — NOT one instance with tw
 
 | Store | Path | Schema | Column Families |
 |-------|------|--------|-----------------|
-| Ledger store | `active/rocksdb/{rangeID:04d}-ledger-store/` | `key=uint32BE(ledgerSeq)`, `value=zstd(LCM)` | **None** — default CF only |
-| TxHash store | `active/rocksdb/{rangeID:04d}-txhash-store/` | `key=txhash[32]`, `value=uint32BE(ledgerSeq)` | **16 CFs**, one per nibble `0`–`f`; route via `txhash[0] >> 4` |
+| Ledger store | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` | `key=uint32BE(ledgerSeq)`, `value=zstd(LCM)` | **None** — default CF only |
+| TxHash store | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` | `key=txhash[32]`, `value=uint32BE(ledgerSeq)` | **16 CFs**, one per nibble `0`–`f`; route via `txhash[0] >> 4` |
 
 At most one active range exists at a time. Both stores stay open for queries until the transition goroutine sets `COMPLETE` and deletes them.
 
@@ -50,9 +50,9 @@ At most one active range exists at a time. Both stores stay open for queries unt
 ```
 {data_dir}/
 ├── meta/rocksdb/                              ← Meta store (WAL NEVER disabled)
-├── active/rocksdb/
-│   ├── {rangeID:04d}-ledger-store/            ← Streaming only; default CF
-│   └── {rangeID:04d}-txhash-store/            ← Streaming only; 16 CFs by nibble
+├── <active_stores_base_dir>/
+│   ├── ledger-store-chunk-{chunkID:06d}/      ← Streaming only; default CF; one per 10K-ledger chunk
+│   └── txhash-store-range-{rangeID:04d}/       ← Streaming only; 16 CFs by nibble; one per 10M-ledger range
 └── immutable/
     ├── ledgers/chunks/{XXXX}/{YYYYYY}.data    ← LFS chunk files (+ .index)
     └── txhash/{rangeID:04d}/
@@ -183,8 +183,8 @@ Queries served in streaming mode only. Routing by range state:
 
 | Range State | `getLedgerBySequence` | `getTransactionByHash` |
 |-------------|----------------------|----------------------|
-| `ACTIVE` | `{rangeID:04d}-ledger-store/` (default CF) | `{rangeID:04d}-txhash-store/` (CF for nibble) |
-| `TRANSITIONING` | `{rangeID:04d}-ledger-store/` (still open) | `{rangeID:04d}-txhash-store/` (still open) |
+| `ACTIVE` | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` (default CF) | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` (CF for nibble) |
+| `TRANSITIONING` | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` (still open) | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` (still open) |
 | `COMPLETE` | `immutable/ledgers/chunks/{XXXX}/{YYYYYY}.data` | `immutable/txhash/{N:04d}/index/cf-{nibble}.idx` |
 
 `getTransactionByHash` probes ranges newest→oldest: ACTIVE first, TRANSITIONING, then COMPLETE (RecSplit).
@@ -269,3 +269,14 @@ helpers/
 - Doc structure: Overview → Diagram → Design → Data Model → Error Handling
 - Every line carries information; no filler prose
 - File naming: `NN-short-name.md` (zero-padded number)
+- **Mermaid diagrams: plain black/white ONLY** — never use `classDef` color blocks or `:::className` annotations; all diagrams must render with default Mermaid theming
+- **MANDATORY: Verify Mermaid renders correctly** — after writing any Mermaid diagram, open a Markdown preview (e.g. VS Code preview, GitHub preview, or mermaid.live) and confirm the diagram renders without errors before considering the doc complete
+
+### Active Store Naming Conventions
+
+| Store | Path Pattern | Transition Cadence |
+|-------|-------------|-------------------|
+| Ledger store | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` | Every 10K ledgers (chunk boundary) |
+| TxHash store | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` | Every 10M ledgers (range boundary) |
+
+`<active_stores_base_dir>` is the operator-configured path for active stores (default: `{data_dir}/active`). `{chunkID:06d}` is the current chunk ID (6 digits). `{rangeID:04d}` is the range ID (4 digits). These are the naming conventions for ALL docs — do not invent alternative prefixes.

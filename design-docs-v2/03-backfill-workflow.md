@@ -21,34 +21,30 @@ Backfill mode ingests historical ledger ranges offline, writing directly to immu
 
 ```mermaid
 flowchart TD
-    classDef decision fill:#fff8e8,stroke:#cc8800
-    classDef action fill:#eef8ee,stroke:#228b22
-    classDef state fill:#e8f0ff,stroke:#3366cc
-
-    START(["Start: parse --start-ledger, --end-ledger"]) --> VALIDATE["Validate range alignment<br/>start = rangeFirstLedger(N), end = rangeLastLedger(M)"]:::action
-    VALIDATE --> RANGES["Enumerate ranges to ingest<br/>(e.g., ranges 0, 1, 2 for ledgers 2–30,000,001)"]:::action
-    RANGES --> DISPATCH["Dispatch up to 2 range orchestrators in parallel"]:::action
+    START(["Start: parse --start-ledger, --end-ledger"]) --> VALIDATE["Validate range alignment<br/>start = rangeFirstLedger(N), end = rangeLastLedger(M)"]
+    VALIDATE --> RANGES["Enumerate ranges to ingest<br/>(e.g., ranges 0, 1, 2 for ledgers 2–30,000,001)"]
+    RANGES --> DISPATCH["Dispatch up to 2 range orchestrators in parallel"]
 
     subgraph ORCHESTRATOR["Range Orchestrator (per range)"]
         direction TB
-        INIT["Set range:N:state = INGESTING in meta store"]:::state
-        INIT --> SCAN["Scan all 1000 chunk flag pairs<br/>build skip-set: chunks where lfs_done=1 AND txhash_done=1"]:::action
-        SCAN --> BSB_INIT["Instantiate 20 BSB instances in parallel<br/>BSB instance K → chunks (rangeFirstChunk + K×50)..(rangeFirstChunk + K×50+49)<br/>where rangeFirstChunk = rangeID × 1000"]:::action
-        BSB_INIT --> BSB_PARALLEL["All 20 BSB instances run concurrently<br/>(each independently fetches + writes its 50-chunk slice)"]:::action
-        BSB_PARALLEL --> CHUNK_LOOP["Each BSB instance: for each chunk in its slice"]:::action
-        CHUNK_LOOP --> WRITE_CHUNK["Write chunk sub-workflow<br/>(skip if both flags set; see below)"]:::action
-        WRITE_CHUNK --> MORE_CHUNKS{more chunks in slice?}:::decision
+        INIT["Set range:N:state = INGESTING in meta store"]
+        INIT --> SCAN["Scan all 1000 chunk flag pairs<br/>build skip-set: chunks where lfs_done=1 AND txhash_done=1"]
+        SCAN --> BSB_INIT["Instantiate 20 BSB instances in parallel<br/>BSB instance K → chunks (rangeFirstChunk + K×50)..(rangeFirstChunk + K×50+49)<br/>where rangeFirstChunk = rangeID × 1000"]
+        BSB_INIT --> BSB_PARALLEL["All 20 BSB instances run concurrently<br/>(each independently fetches + writes its 50-chunk slice)"]
+        BSB_PARALLEL --> CHUNK_LOOP["Each BSB instance: for each chunk in its slice"]
+        CHUNK_LOOP --> WRITE_CHUNK["Write chunk sub-workflow<br/>(skip if both flags set; see below)"]
+        WRITE_CHUNK --> MORE_CHUNKS{more chunks in slice?}
         MORE_CHUNKS -->|yes| CHUNK_LOOP
-        MORE_CHUNKS -->|no| BSB_DONE["BSB instance complete"]:::action
-        BSB_DONE --> ALL_DONE{all 20 BSB instances done?}:::decision
+        MORE_CHUNKS -->|no| BSB_DONE["BSB instance complete"]
+        BSB_DONE --> ALL_DONE{all 20 BSB instances done?}
         ALL_DONE -->|no| BSB_PARALLEL
-        ALL_DONE -->|yes| ALL_CHUNKS_DONE["All 1000 chunks complete<br/>→ trigger backfill transition workflow"]:::state
-        ALL_CHUNKS_DONE --> TRANSITION["Backfill transition workflow<br/>(RecSplit build — see doc 05)"]:::action
-        TRANSITION --> RANGE_DONE["Set range:N:state = COMPLETE"]:::state
+        ALL_DONE -->|yes| ALL_CHUNKS_DONE["All 1000 chunks complete<br/>→ trigger backfill transition workflow"]
+        ALL_CHUNKS_DONE --> TRANSITION["Backfill transition workflow<br/>(RecSplit build — see doc 05)"]
+        TRANSITION --> RANGE_DONE["Set range:N:state = COMPLETE"]
     end
 
     DISPATCH --> ORCHESTRATOR
-    RANGE_DONE --> NEXT_RANGE{more ranges?}:::decision
+    RANGE_DONE --> NEXT_RANGE{more ranges?}
     NEXT_RANGE -->|yes| DISPATCH
     NEXT_RANGE -->|no| EXIT(["Process exits"])
 ```
@@ -61,17 +57,14 @@ Each chunk (10K ledgers) runs the following steps:
 
 ```mermaid
 flowchart TD
-    classDef skip fill:#f5f5f5,stroke:#999
-    classDef action fill:#eef8ee,stroke:#228b22
-
     CHECK["Check meta store:<br/>lfs_done=1 AND txhash_done=1?"]
-    CHECK -->|"yes — skip"| DONE(["chunk complete"]):::skip
-    CHECK -->|"no — process"| FETCH["Fetch ledgers from BSB (10K ledgers)"]:::action
-    FETCH --> PROCESS["For each ledger:<br/>1. Compress LCM (zstd) → append to open LFS file handle (YYYYYY.data)<br/>2. Extract transactions → append to open txhash file handle (YYYYYY.bin)<br/>   (txhash[32] || ledgerSeq[4], 36 bytes/entry)<br/>3. Every ~100 ledgers: OS write() to both file handles<br/>   (page cache updated; handles stay open; NO fsync)"]:::action
-    PROCESS --> LFS_FLUSH["Chunk boundary reached (10K ledgers):<br/>flush() + fsync() LFS file handles<br/>(YYYYYY.data + YYYYYY.index) → close"]:::action
-    LFS_FLUSH --> SET_LFS["meta: lfs_done=1 for this chunk"]:::action
-    SET_LFS --> TXHASH_FLUSH["Flush + fsync raw txhash flat file<br/>(YYYYYY.bin)"]:::action
-    TXHASH_FLUSH --> SET_TX["meta: txhash_done=1 for this chunk"]:::action
+    CHECK -->|"yes — skip"| DONE(["chunk complete"])
+    CHECK -->|"no — process"| FETCH["Fetch ledgers from BSB (10K ledgers)"]
+    FETCH --> PROCESS["For each ledger:<br/>1. Compress LCM (zstd) → append to open LFS file handle (YYYYYY.data)<br/>2. Extract transactions → append to open txhash file handle (YYYYYY.bin)<br/>   (txhash[32] || ledgerSeq[4], 36 bytes/entry)<br/>3. Every ~100 ledgers: OS write() to both file handles<br/>   (page cache updated; handles stay open; NO fsync)"]
+    PROCESS --> LFS_FLUSH["Chunk boundary reached (10K ledgers):<br/>flush() + fsync() LFS file handles<br/>(YYYYYY.data + YYYYYY.index) → close"]
+    LFS_FLUSH --> SET_LFS["meta: lfs_done=1 for this chunk"]
+    SET_LFS --> TXHASH_FLUSH["Flush + fsync raw txhash flat file<br/>(YYYYYY.bin)"]
+    TXHASH_FLUSH --> SET_TX["meta: txhash_done=1 for this chunk"]
     SET_TX --> DONE2(["chunk complete"])
 ```
 
@@ -129,28 +122,24 @@ BufferedStorageBackend (BSB) is the GCS-backed ledger source used during backfil
 
 ```mermaid
 flowchart LR
-    classDef orch fill:#e8f0ff,stroke:#3366cc
-    classDef bsb fill:#eef8ee,stroke:#228b22
-    classDef async fill:#fff8e8,stroke:#cc8800
-
     subgraph P1["Orchestrator: Range 0"]
         direction TB
-        B1["BSB 0 (chunks 0–49, ledgers 2–500,001)"]:::bsb
-        B2["BSB 1 (chunks 50–99, ledgers 500,002–1,000,001)"]:::bsb
+        B1["BSB 0 (chunks 0–49, ledgers 2–500,001)"]
+        B2["BSB 1 (chunks 50–99, ledgers 500,002–1,000,001)"]
         BD["BSB 2–18 (...)"]
-        B20["BSB 19 (chunks 950–999, ledgers 9,500,002–10,000,001)"]:::bsb
-        RS0["RecSplit build (async, ~4h)"]:::async
+        B20["BSB 19 (chunks 950–999, ledgers 9,500,002–10,000,001)"]
+        RS0["RecSplit build (async, ~4h)"]
         B1 & B2 & BD & B20 -->|"all run concurrently"| RS0
-    end:::orch
+    end
 
     subgraph P2["Orchestrator: Range 1"]
         direction TB
-        C1["BSB 0 (chunks 1000–1049)"]:::bsb
+        C1["BSB 0 (chunks 1000–1049)"]
         C2["BSB 1–18 (...)"]
-        C20["BSB 19 (chunks 1950–1999)"]:::bsb
-        RS1["RecSplit build (async, ~4h)"]:::async
+        C20["BSB 19 (chunks 1950–1999)"]
+        RS1["RecSplit build (async, ~4h)"]
         C1 & C2 & C20 -->|"all run concurrently"| RS1
-    end:::orch
+    end
 
     P1 -.->|"start P2 when P1 ingestion done<br/>(RecSplit still running)"| P2
 ```

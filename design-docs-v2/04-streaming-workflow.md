@@ -31,21 +31,21 @@ Stores full ledger data for the range. No column families — default CF only.
 |-----|-------|-------|
 | `uint32BE(ledgerSeq)` | `zstd(LedgerCloseMeta bytes)` | Big-endian key for lexicographic order |
 
-Path: `{data_dir}/active/rocksdb/{rangeID:04d}-ledger-store/`
+Path: `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/`
 
 WAL is **required** (never `DisableWAL`).
 
 ### TxHash Store
 
-Stores transaction hash → ledger sequence mappings, sharded into 16 column families by the first hex nibble of the txhash.
+Stores transaction hash → ledger sequence mappings, sharded into 16 column families by the first hex character of the txhash (`0`–`f`).
 
 | CF Name | Key | Value | Notes |
 |---------|-----|-------|-------|
 | `cf-0` through `cf-f` | `txhash[32]` | `uint32BE(ledgerSeq)` | 32-byte raw hash; 4-byte value |
 
-CF routing: `cfIndex = txhash[0] >> 4` (high nibble of first byte, values `0x0`–`0xf`).
+CF routing: first hex character of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes, values `0x0`–`0xf`).
 
-Path: `{data_dir}/active/rocksdb/{rangeID:04d}-txhash-store/`
+Path: `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/`
 
 WAL is **required** (never `DisableWAL`).
 
@@ -77,26 +77,22 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    classDef decision fill:#fff8e8,stroke:#cc8800
-    classDef write fill:#eef8ee,stroke:#228b22
-    classDef meta fill:#e8f0ff,stroke:#3366cc
-
-    LOOP(["ledger arrives from CaptiveStellarCore"]) --> INGEST_LEDGER["Write to active ledger store (default CF)<br/>key = uint32BE(ledgerSeq)<br/>value = zstd(LCM bytes) — WriteBatch + WAL"]:::write
-    INGEST_LEDGER --> INGEST_TX["Write to active txhash store (16 CFs by nibble)<br/>for each tx: key = txhash[32], value = uint32BE(ledgerSeq)<br/>CF = txhash[0] >> 4 — WriteBatch + WAL"]:::write
-    INGEST_TX --> CHECKPOINT["Update: streaming:last_committed_ledger = ledgerSeq"]:::meta
-    CHECKPOINT --> CHUNK_BOUNDARY{ledgerSeq == chunkLastLedger?}:::decision
+    LOOP(["ledger arrives from CaptiveStellarCore"]) --> INGEST_LEDGER["Write to active ledger store (default CF)<br/>key = uint32BE(ledgerSeq)<br/>value = zstd(LCM bytes) — WriteBatch + WAL"]
+    INGEST_LEDGER --> INGEST_TX["Write to active txhash store (16 CFs by first hex char)<br/>for each tx: key = txhash[32], value = uint32BE(ledgerSeq)<br/>CF = first hex char of txhash string — WriteBatch + WAL"]
+    INGEST_TX --> CHECKPOINT["Update: streaming:last_committed_ledger = ledgerSeq"]
+    CHECKPOINT --> CHUNK_BOUNDARY{ledgerSeq == chunkLastLedger?}
     CHUNK_BOUNDARY -->|no| RANGE_BOUNDARY
-    CHUNK_BOUNDARY -->|yes| FLUSH_LFS["Background goroutine: flush chunk to LFS<br/>read 10K ledgers from ledger store → write .data + .index<br/>fsync → set range:N:chunk:C:lfs_done = '1'<br/>(range state stays ACTIVE)"]:::write
-    FLUSH_LFS --> RANGE_BOUNDARY{ledgerSeq == rangeLastLedger?}:::decision
+    CHUNK_BOUNDARY -->|yes| FLUSH_LFS["Background goroutine: flush chunk to LFS<br/>read 10K ledgers from ledger store → write .data + .index<br/>fsync → set range:N:chunk:C:lfs_done = '1'<br/>(range state stays ACTIVE)"]
+    FLUSH_LFS --> RANGE_BOUNDARY{ledgerSeq == rangeLastLedger?}
     RANGE_BOUNDARY -->|no| LOOP
     RANGE_BOUNDARY -->|yes| SPAWN["Spawn background goroutine:<br/>streaming transition workflow for range N<br/>(see doc 06)"]
-    SPAWN --> NEWRANGE["Create new active ledger store + txhash store for range N+1<br/>Set range:N+1:state = ACTIVE"]:::meta
+    SPAWN --> NEWRANGE["Create new active ledger store + txhash store for range N+1<br/>Set range:N+1:state = ACTIVE"]
     NEWRANGE --> LOOP
 ```
 
 **Per-ledger write detail**:
 - Marshal LCM to binary → zstd compress → write to ledger store (default CF) with key = `uint32BE(ledgerSeq)`, in a single `WriteBatch` (WAL enabled)
-- For each transaction in ledger: write `txhash[32] → uint32BE(ledgerSeq)` to txhash store, routing to CF by `txhash[0] >> 4`, in a single `WriteBatch` (WAL enabled)
+- For each transaction in ledger: write `txhash[32] → uint32BE(ledgerSeq)` to txhash store, routing to CF by first hex character of the txhash string (equivalently `txhash[0] >> 4` on raw bytes), in a single `WriteBatch` (WAL enabled)
 - After both WriteBatches succeed: update `streaming:last_committed_ledger` in meta store
 
 **Chunk boundary behavior** (every 10K ledgers, while ACTIVE):

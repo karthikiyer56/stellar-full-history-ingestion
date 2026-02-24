@@ -73,3 +73,29 @@ make test-stores
 ## Building Other Modules
 
 Each module has its own `go build` command. See the README in each directory for details.
+
+---
+
+## Design Documentation
+
+Two generations of design docs live in this repo:
+
+| Version | Directory | Tag | Status |
+|---------|-----------|-----|--------|
+| v1 | [`design-docs/`](./design-docs/) | `v8.0.0` | Superseded |
+| v2 | [`design-docs-v2/`](./design-docs-v2/) | `v11.0.0` | **Current** |
+
+### What changed from v1 → v2
+
+| Dimension | v1 (`design-docs/`) | v2 (`design-docs-v2/`) |
+|-----------|---------------------|------------------------|
+| Backfill storage | RocksDB active stores during ingestion | **No RocksDB** — direct write to LFS chunks + raw txhash flat files |
+| Backfill transition | Unified transition workflow shared with streaming | **Separate** per-range RecSplit build, triggered after all 1,000 chunks complete |
+| WAL requirement during backfill | Required concern | **Not applicable** — no RocksDB in backfill path |
+| `transitioning/` directory | Created on filesystem | **Eliminated** — transition state tracked in meta store only |
+| `global:mode` meta key | Tracked in meta store | **Eliminated** — mode determined by `--mode` startup flag |
+| BSB parallelism | Vague | **Explicit**: 20 BSB instances per orchestrator, max 2 orchestrators |
+| Flush discipline | Unspecified | **Every ~100 ledgers** — no unbounded RAM accumulation |
+| Transition workflows | One unified workflow for both modes | **Two separate workflows** — backfill transition and streaming transition |
+| Operator runbook | Scattered across docs | **Dedicated doc** (`13-recommended-operator-approach.md`) |
+| Metrics and sizing | Inline in architecture doc | **Dedicated doc** (`12-metrics-and-sizing.md`) with storage estimates and memory budgets |

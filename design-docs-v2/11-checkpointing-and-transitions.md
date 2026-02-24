@@ -88,7 +88,7 @@ func chunkToRangeID(chunkID uint32) uint32 {
 BSB instances are concurrent workers, each assigned a contiguous sub-range of a 10M-ledger range. All instances start simultaneously and run in parallel.
 
 ```go
-// With num_instances = 20:
+// With num_bsb_instances_per_range = 20:
 bsbInstanceSize = RangeSize / 20 = 500_000  // ledgers per BSB instance
 chunksPerInstance = bsbInstanceSize / ChunkSize = 50
 
@@ -96,7 +96,7 @@ chunksPerInstance = bsbInstanceSize / ChunkSize = 50
 bsbFirstLedger(R, B) = rangeFirstLedger(R) + B*bsbInstanceSize
 bsbLastLedger(R, B)  = rangeFirstLedger(R) + (B+1)*bsbInstanceSize - 1
 
-// With num_instances = 10:
+// With num_bsb_instances_per_range = 10:
 bsbInstanceSize = 1_000_000
 chunksPerInstance = 100
 ```
@@ -191,7 +191,7 @@ range:{rangeID:04d}:chunk:{chunkID:06d}:txhash_done = "1"  (written after fsync 
 
 **Resume rule**: On restart, scan ALL 1,000 chunks for each non-COMPLETE range. Skip chunks where both flags = `"1"`. Rewrite from scratch any chunk with missing flags.
 
-**Partial file safety**: If `lfs_done` is absent, the `.data` and `.index` files may be partial. Truncate and rewrite. If `lfs_done = "1"` but `txhash_done` is absent, only rewrite the `.bin` file (re-fetch same ledgers to extract transactions).
+**Partial file safety**: If either `lfs_done` or `txhash_done` is absent (or not `"1"`), **both** files are deleted and rewritten from scratch. There is no partial-rewrite path — even if only one flag is missing, both the `.data`/`.index` and the `.bin` are discarded and re-fetched. The only way to skip a chunk is if **both** flags are `"1"`.
 
 ### Chunk Write Sequence
 

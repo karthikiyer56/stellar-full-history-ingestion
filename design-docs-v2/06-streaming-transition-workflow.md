@@ -33,45 +33,49 @@ At trigger:
 
 ```mermaid
 flowchart TD
-    classDef action fill:#eef8ee,stroke:#228b22
-    classDef meta fill:#e8f0ff,stroke:#3366cc
-    classDef decision fill:#fff8e8,stroke:#cc8800
-    classDef query fill:#fff0f0,stroke:#cc3333
-
-    START(["Background goroutine starts for range N"]) --> SET_TRANS["range:N:state = TRANSITIONING<br/>(already set before goroutine spawned)"]:::meta
-    SET_TRANS --> LFS_PHASE["Phase 1: Flush remaining LFS chunks"]:::action
+    START(["Background goroutine starts for range N"]) --> SET_TRANS["range:N:state = TRANSITIONING<br/>(already set before goroutine spawned)"]
+    SET_TRANS --> LFS_PHASE["Phase 1: Flush remaining LFS chunks"]
     LFS_PHASE --> CHUNK_LOOP["For each chunk 0..999 in range N"]
-    CHUNK_LOOP --> LFS_DONE{lfs_done = '1'?}:::decision
+    CHUNK_LOOP --> LFS_DONE{lfs_done = '1'?}
     LFS_DONE -->|yes| MORE["skip (already flushed during ACTIVE)"]
-    LFS_DONE -->|no| READ_CHUNK["Read 10K ledgers from range N ledger store<br/>(default CF, sequential scan by uint32BE key)"]:::action
-    READ_CHUNK --> WRITE_LFS["Write LFS chunk file:<br/>{chunkID:06d}.data + .index<br/>zstd-compressed LCM records + offset table<br/>fsync"]:::action
-    WRITE_LFS --> SET_LFS["Set range:N:chunk:{chunkID:06d}:lfs_done = 1"]:::meta
-    SET_LFS --> MORE{more chunks?}:::decision
+    LFS_DONE -->|no| READ_CHUNK["Read 10K ledgers from range N ledger store<br/>(sequential scan by uint32BE key<br/>across the appropriate chunk's RocksDB store)"]
+    READ_CHUNK --> WRITE_LFS["Write LFS chunk file:<br/>{chunkID:06d}.data + .index<br/>zstd-compressed LCM records + offset table<br/>fsync"]
+    WRITE_LFS --> SET_LFS["Set range:N:chunk:{chunkID:06d}:lfs_done = 1"]
+    SET_LFS --> MORE{more chunks?}
     MORE -->|yes| CHUNK_LOOP
-    MORE -->|no| TXHASH_PHASE["Phase 2: RecSplit Build from TxHash Store"]:::action
+    MORE -->|no| TXHASH_PHASE["Phase 2: RecSplit Build from TxHash Store"]
 
-    TXHASH_PHASE --> SET_RS_STATE["Set range:N:recsplit:state = BUILDING"]:::meta
-    SET_RS_STATE --> CF_LOOP["For each CF nibble 0..15"]
-    CF_LOOP --> CF_DONE2{cf:XX:done = 1?}:::decision
-    CF_DONE2 -->|yes| NEXT_CF["Skip (already built)"]
-    CF_DONE2 -->|no| SCAN_CF["Scan txhash store CF for nibble X<br/>iterate all keys in cf-X where key[0] >> 4 == X<br/>build RecSplit MPH over (txhash, ledgerSeq) pairs<br/>write immutable/txhash/{N:04d}/index/cf-{X}.idx<br/>fsync"]:::action
-    SCAN_CF --> SET_CF["Set range:N:recsplit:cf:{X:02d}:done = 1"]:::meta
+    TXHASH_PHASE --> SET_RS_STATE["Set range:N:recsplit:state = BUILDING"]
+    SET_RS_STATE --> SPAWN_CFS["Spawn 16 goroutines (one per CF: 0..f)<br/>All goroutines run concurrently"]
+    SPAWN_CFS --> CF_DONE2{cf:XX:done = 1?<br/>per goroutine}
+    CF_DONE2 -->|yes| NEXT_CF["Goroutine exits immediately<br/>(CF already built)"]
+    CF_DONE2 -->|no| SCAN_CF["Scan txhash store CF X<br/>iterate all keys where first hex char of txhash == X<br/>build RecSplit MPH over (txhash, ledgerSeq) pairs<br/>write immutable/txhash/{N:04d}/index/cf-{X}.idx<br/>fsync"]
+    SCAN_CF --> SET_CF["Set range:N:recsplit:cf:{X:02d}:done = 1"]
     SET_CF --> NEXT_CF
-    NEXT_CF --> MORE_CF{more CFs?}:::decision
-    MORE_CF -->|yes| CF_LOOP
-    MORE_CF -->|no| VERIFY["Verify: spot-check random ledgers and txhashes<br/>against new immutable stores"]:::action
-    VERIFY --> DELETE_ACTIVE["Delete active ledger store + txhash store for range N"]:::action
-    DELETE_ACTIVE --> SET_COMPLETE["range:N:recsplit:state = COMPLETE<br/>range:N:state = COMPLETE"]:::meta
-    SET_COMPLETE --> DONE(["Range N transition complete"])
+    NEXT_CF --> ALL_DONE{"All 16 goroutines<br/>complete?"}
+    ALL_DONE -->|no| WAIT["Wait"]
+    ALL_DONE -->|yes| VERIFY["Verify: spot-check random ledgers and txhashes<br/>against new immutable stores"]
+    VERIFY --> SET_COMPLETE["range:N:recsplit:state = COMPLETE<br/>range:N:state = COMPLETE<br/>(meta store written before router swap)"]
+    SET_COMPLETE --> ADD_IMM["router.AddImmutableStores(N, lfs, recsplit)<br/>queries for range N now route to LFS + RecSplit"]
+    ADD_IMM --> DELETE_ACTIVE["router.RemoveTransitioningStores(N)<br/>close + delete active ledger store + txhash store for range N<br/>(safe: routing already swapped to immutable)"]
+    DELETE_ACTIVE --> DONE(["Range N transition complete"])
 ```
 
-**Query routing during transition**: While `range:N:state == "TRANSITIONING"`, both active RocksDB stores for range N remain open. All queries for range N ledgers/transactions are served from them. The immutable LFS and RecSplit files are not used for queries until `state == "COMPLETE"` and both active stores are deleted.
+**Query routing during transition**: While `range:N:state == "TRANSITIONING"`, both active RocksDB stores for range N remain open. All queries for range N ledgers/transactions are served from them. The immutable LFS and RecSplit files are not used for queries until `AddImmutableStores` completes and routes the QueryRouter to immutable stores. The active stores are only deleted **after** the router swap — there is no query gap.
+
+**Critical ordering**: `SET_COMPLETE` (meta store) → `AddImmutableStores` (router swap) → `RemoveTransitioningStores` (delete). Deletion always happens last, after routing is already pointed at immutable stores.
 
 ---
 
 ## Phase 1: LFS Chunk Writes
 
-Each chunk (10K ledgers) is read from the active ledger store (default CF, sequential scan by `uint32BE(ledgerSeq)` key) and written to an LFS chunk file. The data in RocksDB is already zstd-compressed; it is written as-is into the LFS chunk format (with an offset index for random access).
+Each chunk (10K ledgers) is read from the active ledger store and written to an LFS chunk file.
+
+**Which stores are read**: By the time the transition goroutine spawns, the streaming ingestion loop has already moved to range N+1's first `ledger-store-chunk-{N*1000:06d}/`. Range N's ledgers are spread across up to 1000 chunk stores (`ledger-store-chunk-{rangeFirstChunk:06d}/` through `ledger-store-chunk-{rangeLastChunk:06d}/`). Most of these were already flushed to LFS during the ACTIVE phase (background per-chunk flush). The transition goroutine reads only from the chunk stores that haven't yet been flushed.
+
+**Read method**: Sequential scan by `uint32BE(ledgerSeq)` key within each chunk's RocksDB store (default CF). The data is already zstd-compressed in RocksDB; it is written as-is into the LFS chunk format with an offset index for random access.
+
+**Transitioning pointer**: The `transitioningLedgerStore` in the QueryRouter holds the **last chunk store of range N** (e.g. `ledger-store-chunk-005999/` for range 5). This is the store that was current at the range boundary and is still open for reads during transition. The transition goroutine may need to open earlier chunk stores (e.g. `ledger-store-chunk-005000/` through `ledger-store-chunk-005998/`) directly from disk if they still need to be flushed.
 
 **LFS chunk file format**:
 - `.data` file: contiguous compressed LCM records (variable-length)
@@ -83,13 +87,16 @@ Each chunk (10K ledgers) is read from the active ledger store (default CF, seque
 
 ## Phase 2: RecSplit Build from Active Store
 
-Unlike backfill (which reads raw flat files), the streaming transition reads directly from the active txhash store. For each of the 16 nibbles:
+Unlike backfill (which reads raw flat files), the streaming transition reads directly from the active txhash store. All 16 CF index files are built **in parallel** — 16 goroutines run concurrently, one per CF (`0`–`f`). Each goroutine independently:
 
-1. Iterate all keys in the txhash store CF for nibble X (where `key[0] >> 4 == nibble`)
-2. Build RecSplit minimal perfect hash over the matching `(txhash, ledgerSeq)` pairs
-3. Write `immutable/txhash/{rangeID:04d}/index/cf-{nibble}.idx`
-4. fsync
-5. Set `range:N:recsplit:cf:{nibble:02d}:done = 1` in meta store
+1. Checks `recsplit:cf:{X:02d}:done` — if already `"1"`, exits immediately (crash resume)
+2. Iterates all keys in txhash store CF `X` (the CF whose name matches the first hex character of the txhash; `key[0] >> 4 == X` in raw byte terms)
+3. Builds RecSplit minimal perfect hash over the matching `(txhash, ledgerSeq)` pairs
+4. Writes `immutable/txhash/{rangeID:04d}/index/cf-{X}.idx`
+5. fsyncs
+6. Sets `range:N:recsplit:cf:{X:02d}:done = 1` in meta store
+
+The orchestrator waits for all 16 goroutines to complete before proceeding to verification.
 
 The active RocksDB store is read-only during RecSplit build (ingestion has moved to range N+1's store).
 
@@ -132,9 +139,11 @@ Per-CF progress:
   ...
   range:0000:recsplit:cf:0f:done       →  "1"
 
-Verification passes, active store deleted:
+Verification passes, router swap and active store deleted:
   range:0000:recsplit:state            →  "COMPLETE"
   range:0000:state                     →  "COMPLETE"
+  # router.AddImmutableStores(0, ...) called next — queries now route to LFS + RecSplit
+  # router.RemoveTransitioningStores(0) called last — active stores deleted from disk
 ```
 
 For contrast, range 5 (global chunks 005000–005999):
@@ -156,6 +165,7 @@ Phase 2 RecSplit:
   range:0005:recsplit:cf:0f:done       →  "1"
   range:0005:recsplit:state            →  "COMPLETE"
   range:0005:state                     →  "COMPLETE"
+  # router.AddImmutableStores(5, ...) → router.RemoveTransitioningStores(5)
 ```
 
 ---
@@ -178,13 +188,10 @@ If the streaming daemon crashes while the transition goroutine is running:
 
 ```mermaid
 flowchart LR
-    classDef ingest fill:#eef8ee,stroke:#228b22
-    classDef trans fill:#fff8e8,stroke:#cc8800
-
     T0(["Ledger 10,000,001 committed"]) --> SPAWN["Spawn transition goroutine for range 0"]
     T0 --> NEWSTORE["Create active store for range 1"]
-    NEWSTORE --> INGEST1["Continue ingesting range 1<br/>(ledgers 10,000,002+)"]:::ingest
-    SPAWN --> TRANS0["Transition range 0:<br/>LFS chunks + RecSplit<br/>(runs concurrently)"]:::trans
+    NEWSTORE --> INGEST1["Continue ingesting range 1<br/>(ledgers 10,000,002+)"]
+    SPAWN --> TRANS0["Transition range 0:<br/>LFS chunks + RecSplit<br/>(runs concurrently)"]
     INGEST1 -.->|"queries for range 0<br/>served from still-open<br/>range 0 active store"| TRANS0
     TRANS0 --> COMPLETE["range:0000:state = COMPLETE<br/>Active store deleted"]
 ```

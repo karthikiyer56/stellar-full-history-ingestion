@@ -15,18 +15,12 @@ These two modes have **separate transition workflows** and **separate crash reco
 
 ```mermaid
 flowchart TB
-    classDef mode fill:#f0f4ff,stroke:#3366cc,stroke-width:2px
-    classDef store fill:#eef8ee,stroke:#228b22,stroke-width:1.5px
-    classDef meta fill:#fff7e6,stroke:#cc8800,stroke-width:1.5px
-    classDef source fill:#fdf5ff,stroke:#8833cc,stroke-width:1.5px
-    classDef query fill:#fff0f0,stroke:#cc3333,stroke-width:1.5px
-
     subgraph BACKFILL["BACKFILL MODE (offline, no queries)"]
         direction TB
-        BSB["BufferedStorageBackend (BSB)<br/>Up to 2 parallel range orchestrators<br/>Each orchestrator: 20 BSB instances (concurrent)"]:::source
-        LFS_BF["LFS Chunk Files<br/>immutable/ledgers/chunks/<br/>(written directly, no RocksDB)"]:::store
-        TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/<br/>(36 bytes/entry: hash[32]+seq[4])"]:::store
-        RECSPLIT["RecSplit Index Files<br/>immutable/txhash/XXXX/index/<br/>(built once all 1000 chunks complete)"]:::store
+        BSB["BufferedStorageBackend (BSB)<br/>Up to 2 parallel range orchestrators<br/>Each orchestrator: 20 BSB instances (concurrent)"]
+        LFS_BF["LFS Chunk Files<br/>immutable/ledgers/chunks/<br/>(written directly, no RocksDB)"]
+        TXRAW["Raw TxHash Flat Files<br/>immutable/txhash/XXXX/raw/<br/>(36 bytes/entry: hash[32]+seq[4])"]
+        RECSPLIT["RecSplit Index Files<br/>immutable/txhash/XXXX/index/<br/>(built once all 1000 chunks complete)"]
         BSB --> LFS_BF
         BSB --> TXRAW
         TXRAW -->|"all 1000 chunks done → trigger"| RECSPLIT
@@ -34,9 +28,9 @@ flowchart TB
 
     subgraph STREAMING["STREAMING MODE (live, serves queries)"]
         direction TB
-        CORE["CaptiveStellarCore<br/>batch size = 1 ledger"]:::source
-        ACTIVE["Active Store (RocksDB)<br/>Current range, mutable"]:::store
-        IMMUTABLE["Immutable Stores<br/>LFS + RecSplit<br/>Completed ranges"]:::store
+        CORE["CaptiveStellarCore<br/>batch size = 1 ledger"]
+        ACTIVE["Active Store (RocksDB)<br/>Current range, mutable"]
+        IMMUTABLE["Immutable Stores<br/>LFS + RecSplit<br/>Completed ranges"]
         CORE --> ACTIVE
         ACTIVE -->|"range complete → transition workflow"| IMMUTABLE
     end
@@ -44,14 +38,16 @@ flowchart TB
     subgraph META["META STORE (RocksDB, both modes)"]
         direction LR
         MK["Per-range state, chunk completion flags,<br/>RecSplit build state, checkpoint ledgers"]
-    end:::meta
+    end
 
     subgraph QUERY["QUERY LAYER (streaming mode only)"]
-        HTTP["HTTP Server<br/>getTransactionByHash / getLedgerBySequence"]:::query
-        ROUTER["Query Router"]:::query
+        HTTP["HTTP Server<br/>getTransactionByHash / getLedgerBySequence"]
+        ROUTER["Query Router"]
+        ACTIVE_Q["Active Stores<br/>(RocksDB)"]
+        IMMUTABLE_Q["Immutable Stores<br/>(LFS + RecSplit)"]
         HTTP --> ROUTER
-        ROUTER --> ACTIVE
-        ROUTER --> IMMUTABLE
+        ROUTER --> ACTIVE_Q
+        ROUTER --> IMMUTABLE_Q
     end
 ```
 
@@ -79,10 +75,10 @@ flowchart TB
 
 **Two separate RocksDB instances** per range being ingested in streaming mode:
 
-- **Ledger store** (`active/rocksdb/{rangeID:04d}-ledger-store/`) — default CF only. Key: `uint32BE(ledgerSeq)`, Value: `zstd(LedgerCloseMeta)`.
-- **TxHash store** (`active/rocksdb/{rangeID:04d}-txhash-store/`) — 16 column families, one per hex nibble `0`–`f`. Key: `txhash[32]`, Value: `uint32BE(ledgerSeq)`. CF routing: `txhash[0] >> 4`.
+- **Ledger store** (`<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/`) — default CF only. Key: `uint32BE(ledgerSeq)`, Value: `zstd(LedgerCloseMeta)`. One RocksDB instance per 10K-ledger chunk; transitions at every chunk boundary.
+- **TxHash store** (`<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/`) — 16 column families, one per first hex character of the txhash (`0`–`f`). Key: `txhash[32]`, Value: `uint32BE(ledgerSeq)`. CF routing: first hex char of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes). One RocksDB instance per 10M-ledger range.
 
-At most one pair of active stores exists at a time. Both are replaced when the range boundary is crossed. **The ledger store has no column families** — it uses only the default CF.
+At most one pair of active stores exists at a time. The ledger store is replaced at every 10K-ledger chunk boundary; the txhash store is replaced at every 10M-ledger range boundary. **The ledger store has no column families** — it uses only the default CF.
 
 ### Immutable Stores (both modes)
 
@@ -91,7 +87,7 @@ At most one pair of active stores exists at a time. Both are replaced when the r
 - Data: individually zstd-compressed `LedgerCloseMeta` records
 - Written per chunk (10K ledgers) during ingestion
 
-**RecSplit Index** — minimal perfect hash, 16 column family files sharded by first hex nibble of txhash:
+**RecSplit Index** — minimal perfect hash, 16 column family files sharded by the first hex character of the txhash (`0`–`f`):
 - Path: `immutable/txhash/XXXX/index/cf-{0..f}.idx`
 - Built once per range, after all 1000 chunk raw txhash flat files are written
 - Build time: ~4 hours per range
@@ -118,14 +114,10 @@ See [02-meta-store-design.md](./02-meta-store-design.md) for full key hierarchy.
 
 ```mermaid
 flowchart TD
-    classDef level0 fill:#e8f0ff,stroke:#3366cc
-    classDef level1 fill:#f0ffe8,stroke:#228b22
-    classDef level2 fill:#fff8e8,stroke:#cc8800
-
-    ORCH["Range Orchestrator (up to 2 parallel)<br/>Spans one 10M-ledger range"]:::level0
-    BSB["BSB Instance (up to 20 per orchestrator, run concurrently)<br/>Spans 500K ledgers (num_instances=20) or 1M (num_instances=10)"]:::level1
-    CHUNK["Chunk Sub-workflow<br/>10K ledgers = 1 LFS chunk + 1 raw txhash file"]:::level2
-    RECSPLIT2["RecSplit Sub-workflow<br/>1 per range, after all 1000 chunks complete"]:::level0
+    ORCH["Range Orchestrator (up to 2 parallel)<br/>Spans one 10M-ledger range"]
+    BSB["BSB Instance (up to 20 per orchestrator, run concurrently)<br/>Spans 500K ledgers (num_bsb_instances_per_range=20) or 1M (num_bsb_instances_per_range=10)"]
+    CHUNK["Chunk Sub-workflow<br/>10K ledgers = 1 LFS chunk + 1 raw txhash file"]
+    RECSPLIT2["RecSplit Sub-workflow<br/>1 per range, after all 1000 chunks complete"]
 
     ORCH --> BSB
     BSB --> CHUNK
@@ -196,17 +188,13 @@ The backfill transition is a **RecSplit index build**, not a store conversion. T
 
 ```mermaid
 flowchart TD
-    classDef action fill:#eef8ee,stroke:#228b22
-    classDef meta fill:#e8f0ff,stroke:#3366cc
-    classDef async fill:#fff8e8,stroke:#cc8800
-
-    DONE1000(["All 1000 chunks complete for range N<br/>(lfs_done + txhash_done set for every chunk)"]) --> SET_RS["Set range:N:state = RECSPLIT_BUILDING"]:::meta
-    SET_RS --> BUILD_CFS["For each CF nibble 0..15:<br/>scan 1000 raw txhash flat files → build RecSplit MPH → write cf-N.idx → fsync → set cf:XX:done"]:::action
-    BUILD_CFS --> RS_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]:::meta
-    RS_COMPLETE --> DELETE_RAW["Delete raw txhash flat files<br/>immutable/txhash/{N:04d}/raw/*.bin"]:::action
+    DONE1000(["All 1000 chunks complete for range N<br/>(lfs_done + txhash_done set for every chunk)"]) --> SET_RS["Set range:N:state = RECSPLIT_BUILDING"]
+    SET_RS --> BUILD_CFS["For each CF nibble 0..15:<br/>scan 1000 raw txhash flat files → build RecSplit MPH → write cf-N.idx → fsync → set cf:XX:done"]
+    BUILD_CFS --> RS_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]
+    RS_COMPLETE --> DELETE_RAW["Delete raw txhash flat files<br/>immutable/txhash/{N:04d}/raw/*.bin"]
     DELETE_RAW --> RANGE_DONE(["Range N complete"])
 
-    SET_RS -->|"orchestrator slot freed"| INGEST_NEXT["Range N+1 ingestion starts<br/>(concurrent with RecSplit build)"]:::async
+    SET_RS -->|"orchestrator slot freed"| INGEST_NEXT["Range N+1 ingestion starts<br/>(concurrent with RecSplit build)"]
 ```
 
 **Key facts**:
@@ -225,17 +213,13 @@ The streaming transition is an **active RocksDB → immutable storage conversion
 
 ```mermaid
 flowchart TD
-    classDef action fill:#eef8ee,stroke:#228b22
-    classDef meta fill:#e8f0ff,stroke:#3366cc
-    classDef query fill:#fff0f0,stroke:#cc3333
-
-    BOUNDARY(["Range N last ledger committed\nledger == rangeLastLedger(N)"]) --> SPAWN["Spawn background transition goroutine\nSet range:N:state = TRANSITIONING\nCreate active store for range N+1"]:::meta
-    SPAWN --> INGEST_NEXT["Range N+1 ingestion continues\n(main goroutine)"]:::action
-    SPAWN --> PHASE1["Phase 1: LFS chunk writes\nRead 10K ledgers from ledger store (default CF) → write .data + .index → fsync → set lfs_done\n(most chunks already flushed during ACTIVE; only remaining chunks written here)"]:::action
-    PHASE1 --> PHASE2["Phase 2: RecSplit build\nScan txhash store per nibble CF (0–f)\n→ build MPH → write cf-N.idx → fsync → set cf:XX:done\n(16 CFs; no raw flat files)"]:::action
-    PHASE2 --> VERIFY["Verify: spot-check 100 random ledgers + 100 txhashes\nagainst new immutable files"]:::action
-    VERIFY -->|pass| DELETE["Delete active RocksDB store for range N\nSet range:N:state = COMPLETE"]:::meta
-    VERIFY -->|fail| ABORT["ABORT — do NOT delete active store\nLog error; operator intervention"]:::action
+    BOUNDARY(["Range N last ledger committed\nledger == rangeLastLedger(N)"]) --> SPAWN["Spawn background transition goroutine\nSet range:N:state = TRANSITIONING\nCreate active store for range N+1"]
+    SPAWN --> INGEST_NEXT["Range N+1 ingestion continues\n(main goroutine)"]
+    SPAWN --> PHASE1["Phase 1: LFS chunk writes\nRead 10K ledgers from ledger store (default CF) → write .data + .index → fsync → set lfs_done\n(most chunks already flushed during ACTIVE; only remaining chunks written here)"]
+    PHASE1 --> PHASE2["Phase 2: RecSplit build\nScan txhash store per nibble CF (0–f)\n→ build MPH → write cf-N.idx → fsync → set cf:XX:done\n(16 CFs; no raw flat files)"]
+    PHASE2 --> VERIFY["Verify: spot-check 100 random ledgers + 100 txhashes\nagainst new immutable files"]
+    VERIFY -->|pass| DELETE["Delete active RocksDB store for range N\nSet range:N:state = COMPLETE"]
+    VERIFY -->|fail| ABORT["ABORT — do NOT delete active store\nLog error; operator intervention"]
 
     BOUNDARY -.->|"range N queries\nserved from active store\nuntil state = COMPLETE"| PHASE1
 ```
@@ -276,16 +260,13 @@ Both modes use the meta store as the source of truth for crash recovery. WAL is 
 
 ```mermaid
 flowchart TD
-    classDef decision fill:#fff8e8,stroke:#cc8800
-    classDef action fill:#eef8ee,stroke:#228b22
-
     START(["Process restart"]) --> SCAN_RANGES["Scan all range:N:state in meta store"]
-    SCAN_RANGES --> CHECK_RANGE{range:N:state?}:::decision
+    SCAN_RANGES --> CHECK_RANGE{range:N:state?}
     CHECK_RANGE -->|COMPLETE| SKIP_RANGE["Skip range N entirely"]
-    CHECK_RANGE -->|INGESTING| SCAN_CHUNKS["Scan all 1000 chunk flags for range N\n(lfs_done + txhash_done)"]:::action
-    CHECK_RANGE -->|RECSPLIT_BUILDING| RESUME_RS["Resume RecSplit:\nscan cf:XX:done flags\nrebuild incomplete CFs"]:::action
+    CHECK_RANGE -->|INGESTING| SCAN_CHUNKS["Scan all 1000 chunk flags for range N\n(lfs_done + txhash_done)"]
+    CHECK_RANGE -->|RECSPLIT_BUILDING| RESUME_RS["Resume RecSplit:\nscan cf:XX:done flags\nrebuild incomplete CFs"]
     SCAN_CHUNKS --> SKIP_DONE["Skip chunks where both flags = 1"]
-    SCAN_CHUNKS --> REDO["Re-ingest chunks with any flag missing"]:::action
+    SCAN_CHUNKS --> REDO["Re-ingest chunks with any flag missing"]
 ```
 
 **Resume rule**: restart from first incomplete chunk. Completed chunks (both `lfs_done` and `txhash_done` set after fsync) are never re-ingested. BSB instances resume independently — non-contiguous completion is safe.
@@ -294,15 +275,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    classDef decision fill:#fff8e8,stroke:#cc8800
-    classDef action fill:#eef8ee,stroke:#228b22
-
     START(["Process restart"]) --> READ_LCL["Read streaming:last_committed_ledger"]
     READ_LCL --> SCAN_RANGES2["Scan all range states"]
-    SCAN_RANGES2 --> CHECK_ACTIVE{Any range ACTIVE?}:::decision
-    CHECK_ACTIVE -->|yes| RESUME_INGEST["Resume ingestion from\nlast_committed_ledger + 1"]:::action
-    CHECK_ACTIVE -->|no| CHECK_TRANS{Any range TRANSITIONING?}:::decision
-    CHECK_TRANS -->|yes| RESUME_TRANS["Resume transition:\nscan lfs_done + cf:XX:done flags\nskip completed steps"]:::action
+    SCAN_RANGES2 --> CHECK_ACTIVE{Any range ACTIVE?}
+    CHECK_ACTIVE -->|yes| RESUME_INGEST["Resume ingestion from\nlast_committed_ledger + 1"]
+    CHECK_ACTIVE -->|no| CHECK_TRANS{Any range TRANSITIONING?}
+    CHECK_TRANS -->|yes| RESUME_TRANS["Resume transition:\nscan lfs_done + cf:XX:done flags\nskip completed steps"]
     CHECK_TRANS -->|no| ERROR["No active state found\n— operator intervention"]
 ```
 

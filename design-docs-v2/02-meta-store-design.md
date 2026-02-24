@@ -107,14 +107,16 @@ range:0005:chunk:005999:lfs_done  →  absent ← last chunk of range 5 (global 
 
 ### Sub-workflow 3: RecSplit Build State (Backfill + Streaming Transition)
 
-Two key types per range: one top-level state key and one done flag per column family (16 CFs total, one per hex nibble).
+Two key types per range: one top-level state key and one done flag per column family (16 CFs total, one per first hex character of the txhash: `0`–`f`).
 
 | Key Pattern | Value Type | Written By | Written When |
 |-------------|-----------|-----------|-------------|
 | `range:{N:04d}:recsplit:state` | enum string (see [RecSplit State Enum](#recsplit-state-enum)) | RecSplit builder goroutine | Set to `BUILDING` when RecSplit build starts; set to `COMPLETE` after all 16 CF index files are built and the range transitions to COMPLETE |
-| `range:{N:04d}:recsplit:cf:{XX:02d}:done` | `"1"` or absent | RecSplit builder goroutine | After CF index file for column family XX (00–0f) is fsynced to disk |
+| `range:{N:04d}:recsplit:cf:{XX}:done` | `"1"` or absent | RecSplit builder goroutine | After CF index file for CF `XX` is fsynced to disk |
 
-There are exactly **16 CF keys per range** (for hex nibbles 00 through 0f):
+The CF segment `{XX}` in the key uses two-char zero-padded hex (`00`–`0f`) for lexicographic sort order in RocksDB. The corresponding CF names (and index file names) use single-char hex: `0`–`f`.
+
+There are exactly **16 CF keys per range** (CF key suffixes `00`–`0f`, corresponding to CF names `0`–`f`):
 
 ```
 range:{N:04d}:recsplit:cf:00:done   ← txhashes starting with 0x0...
@@ -147,7 +149,7 @@ range:0000:recsplit:state        →  "BUILDING"
 range:0000:recsplit:cf:00:done   →  "1"
 range:0000:recsplit:cf:01:done   →  "1"
 range:0000:recsplit:cf:02:done   →  "1"
-range:0000:recsplit:cf:03:done   →  absent  ← crash before CF 3 started
+range:0000:recsplit:cf:03:done   →  absent  ← crash before CF '3' started
 range:0000:recsplit:cf:04:done   →  absent
 ...
 range:0000:recsplit:cf:0f:done   →  absent

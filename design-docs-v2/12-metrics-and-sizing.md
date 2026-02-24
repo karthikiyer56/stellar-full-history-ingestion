@@ -13,13 +13,13 @@
 | `ChunkSize`                                                       | 10,000 ledgers     | One chunk = one LFS file pair + one raw txhash flat file (during backfill mode)         |
 | Chunks per range                                                  | 1,000              | = RangeSize (10M) ÷ ChunkSize (10K)                                                     |
 | RecSplit column families                                          | 16                 | Sharded by first hex nibble of txhash (`0`–`f`)                                         |
-| Default Buffered Storage Backend (BSB) instances per orchestrator | 20                 | `[backfill.bsb].num_instances`                                                          |
+| Default Buffered Storage Backend (BSB) instances per orchestrator | 20                 | `[backfill.bsb].num_bsb_instances_per_range`                                                          |
 | Max parallel range orchestrators                                  | 2                  | `[backfill].parallel_ranges`                                                            |
 | Max BSB instances in flight                                       | 40                 | 2 orchestrators × 20 BSB instances per orcheastrator                                    |
-| Ledgers per BSB instance (`num_instances=20`)                     | 500,000            | = RangeSize ÷ 20                                                                        |
-| Ledgers per BSB instance (`num_instances=10`)                     | 1,000,000          | = RangeSize ÷ 10                                                                        |
-| Chunks per BSB instance (`num_instances=20`)                      | 50                 | = 500K ÷ 10K                                                                            |
-| Chunks per BSB instance (`num_instances=10`)                      | 100                | = 1M ÷ 10K                                                                              |
+| Ledgers per BSB instance (`num_bsb_instances_per_range=20`)                     | 500,000            | = RangeSize ÷ 20                                                                        |
+| Ledgers per BSB instance (`num_bsb_instances_per_range=10`)                     | 1,000,000          | = RangeSize ÷ 10                                                                        |
+| Chunks per BSB instance (`num_bsb_instances_per_range=20`)                      | 50                 | = 500K ÷ 10K                                                                            |
+| Chunks per BSB instance (`num_bsb_instances_per_range=10`)                      | 100                | = 1M ÷ 10K                                                                            |
 | BSB internal prefetch window                                      | 1,000 ledgers      | `[backfill.bsb].buffer_size`                                                            |
 | BSB internal download workers                                     | 20                 | `[backfill.bsb].num_workers`                                                            |
 | Flush interval                                                    | ~100 ledgers       | `[backfill].flush_interval`; max ledgers in RAM when trying to write a chunk on the LFS |
@@ -53,19 +53,19 @@ See [11-checkpointing-and-transitions.md](./11-checkpointing-and-transitions.md)
 | LFS chunk files | `immutable/ledgers/chunks/` | ~1.5 TB | 1,000 `.data` + `.index` pairs, zstd-compressed LCMs |
 | RecSplit index | `immutable/txhash/{N:04d}/index/` | ~15 GB  | 16 CF files (`cf-0.idx`–`cf-f.idx`) |
 | Raw txhash flat files | `immutable/txhash/{N:04d}/raw/` | ~120 GB | Temporary; deleted after all 16 CF indexes are built |
-| Active ledger store | `active/rocksdb/{N:04d}-ledger-store/` | ~1.7 TB | Streaming only; default CF; deleted post-transition |
-| Active txhash store | `active/rocksdb/{N:04d}-txhash-store/` | ~150 GB | Streaming only; 16 CFs by nibble; deleted post-transition |
+| Active ledger store | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` | ~1.7 TB | Streaming only; default CF; deleted post-transition |
+| Active txhash store | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` | ~150 GB | Streaming only; 16 CFs by nibble; deleted post-transition |
 | Meta store | `meta/rocksdb/` | ~100 MB | Shared across all ranges; grows slowly |
 
 **Peak disk required during backfill** (2 ranges in flight simultaneously): ~2 × (~1.5 TB LFS + ~120 GB raw) + ~100 MB meta ≈ **~3.2 TB**.
 
-**Peak disk required during streaming**: active ledger store (~1.7 TB) + active txhash store (~15 GB) + prior immutable ranges + meta ≈ **~1.7 TB active + immutable history**.
+**Peak disk required during streaming**: active ledger store (~1.7 TB) + active txhash store (~150 GB) + prior immutable ranges + meta ≈ **~1.85 TB active + immutable history**.
 
 ---
 
 ## Memory Budget — Backfill (BSB Mode)
 
-> **TBD** — Observed RSS with `num_instances=20` can reach ~40 GB in practice. Theoretical bottom-up estimates do not match observed usage; profiling needed before publishing numbers.
+> **TBD** — Observed RSS with `num_bsb_instances_per_range=20` can reach ~40 GB in practice. Theoretical bottom-up estimates do not match observed usage; profiling needed before publishing numbers.
 
 **`flush_interval` RAM cap**: `flush_interval=100` keeps per-chunk write buffer under ~250 KB. Never set above 10,000 (chunk size) — that would accumulate an entire chunk in RAM before any flush.
 
@@ -102,15 +102,15 @@ See [11-checkpointing-and-transitions.md](./11-checkpointing-and-transitions.md)
 | Operation | Duration | Notes |
 |-----------|----------|-------|
 | RecSplit build per range | ~4 hours | ~3B transactions, 16 CF passes over 1,000 raw flat files |
-| Chunk scan on resume | < 10 ms | At startup after a crash: reads `range:N:chunk:C:lfs_done` + `txhash_done` from meta store for up to 1,000 chunks per range to find the first incomplete chunk. ~2,000 RocksDB `Get` calls — negligible. |
+| Chunk scan on resume | < 10 ms | At startup after a crash: reads `range:N:chunk:C:lfs_done` + `txhash_done` from meta store for ALL 1,000 chunks per range unconditionally — no early exit. Non-contiguous gaps from parallel BSB instances mean there is no "first incomplete chunk" concept. ~2,000 RocksDB `Get` calls per range — negligible. |
 | Progress log interval | 1 minute | Wall-clock elapsed from process start |
 
 ---
 
-## `num_instances` Trade-off
+## `num_bsb_instances_per_range` Trade-off
 
-| `num_instances` | BSB span | Chunks/instance | Parallelism | RAM overhead |
-|----------------|----------|-----------------|-------------|-------------|
+| `num_bsb_instances_per_range` | BSB span | Chunks/instance | Parallelism | RAM overhead |
+|-------------------------------|----------|-----------------|-------------|-------------|
 | `20` (default) | 500K ledgers | 50 | Higher | TBD |
 | `10` | 1M ledgers | 100 | Lower | TBD |
 

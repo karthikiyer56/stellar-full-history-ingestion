@@ -4,7 +4,7 @@
 
 The backfill transition workflow builds the RecSplit minimal perfect hash index for a range after all 1,000 chunk sub-workflows (both `lfs_done` and `txhash_done`) are complete. It is triggered by the range orchestrator, runs synchronously in the orchestrator goroutine, and takes approximately 4 hours per range.
 
-All 16 CF index files are built **in parallel** — 16 goroutines run concurrently, one per CF. Each goroutine reads all 1,000 raw txhash flat files for the range, filters by its nibble, builds its RecSplit index, fsyncs, and sets its done flag. The orchestrator waits for all 16 goroutines to complete before setting state to COMPLETE.
+All 16 CF index files are built **in parallel** — 16 goroutines run concurrently, one per CF (`0`–`f`). Each goroutine reads all 1,000 raw txhash flat files for the range, filters by its CF (first hex character of the txhash), builds its RecSplit index, fsyncs, and sets its done flag. The orchestrator waits for all 16 goroutines to complete before setting state to COMPLETE.
 
 While RecSplit builds for range N, the orchestrator slot is freed and the next range (N+1) begins ingesting immediately. RecSplit for range N and ingestion of range N+1 run concurrently.
 
@@ -27,22 +27,25 @@ This workflow has **no analog in the streaming transition**. There is no active 
 
 ```mermaid
 flowchart TD
-    classDef action fill:#eef8ee,stroke:#228b22
-    classDef meta fill:#e8f0ff,stroke:#3366cc
-    classDef decision fill:#fff8e8,stroke:#cc8800
+    START(["All 1000 chunks complete for range N"]) --> SET_STATE["Set range:N:state = RECSPLIT_BUILDING<br/>Set range:N:recsplit:state = BUILDING"]
+    SET_STATE --> SCAN_CFS["Scan per-CF done flags<br/>(range:N:recsplit:cf:XX:done)"]
+    SCAN_CFS --> SPAWN["Spawn 16 goroutines (one per CF 0..15)<br/>All 16 run concurrently — each independently:"]
 
-    START(["All 1000 chunks complete for range N"]) --> SET_STATE["Set range:N:state = RECSPLIT_BUILDING<br/>Set range:N:recsplit:state = BUILDING"]:::meta
-    SET_STATE --> SCAN_CFS["Scan per-CF done flags<br/>(range:N:recsplit:cf:XX:done)"]:::action
-    SCAN_CFS --> SPAWN["Spawn 16 goroutines (one per CF 0..15)<br/>Goroutines run concurrently"]:::action
-    SPAWN --> CF_DONE{cf:XX:done = 1?<br/>(per goroutine)}:::decision
-    CF_DONE -->|yes| NEXT_CF["Goroutine exits — CF already built"]
-    CF_DONE -->|no| BUILD_CF["Build RecSplit index for CF N, nibble X:<br/>1. Scan all 1000 raw txhash flat files for range N<br/>2. Filter entries where txhash[0] >> 4 == X (high nibble)<br/>3. Build minimal perfect hash over filtered hashes<br/>4. Write: immutable/txhash/{N:04d}/index/cf-{X}.idx<br/>5. fsync"]:::action
-    BUILD_CF --> SET_CF_DONE["Set range:N:recsplit:cf:{X:02d}:done = 1"]:::meta
-    SET_CF_DONE --> NEXT_CF
-    NEXT_CF --> ALL_DONE{"All 16 goroutines<br/>complete?"}:::decision
-    ALL_DONE -->|no| NEXT_CF
-    ALL_DONE -->|yes| SET_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]:::meta
-    SET_COMPLETE --> CLEANUP["Delete raw txhash flat files for range N<br/>immutable/txhash/{N:04d}/raw/*.bin"]:::action
+    subgraph GOROUTINE["Each goroutine (CF nibble X, runs in parallel with other 15)"]
+        direction TB
+        CF_CHECK{cf:X:done = 1?}
+        CF_SKIP["Goroutine exits — CF already built"]
+        CF_BUILD["Build RecSplit index for CF X:<br/>1. Scan all 1000 raw txhash flat files for range N<br/>2. Filter entries where txhash[0] >> 4 == X<br/>3. Build minimal perfect hash over filtered hashes<br/>4. Write: immutable/txhash/{N:04d}/index/cf-{X}.idx<br/>5. fsync"]
+        CF_SET_DONE["Set range:N:recsplit:cf:{X:02d}:done = 1"]
+        CF_CHECK -->|yes| CF_SKIP
+        CF_CHECK -->|no| CF_BUILD
+        CF_BUILD --> CF_SET_DONE
+    end
+
+    SPAWN --> GOROUTINE
+    GOROUTINE --> WAIT["Wait for all 16 goroutines to complete"]
+    WAIT --> SET_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]
+    SET_COMPLETE --> CLEANUP["Delete raw txhash flat files for range N<br/>immutable/txhash/{N:04d}/raw/*.bin"]
     CLEANUP --> DONE(["Range N backfill complete"])
 ```
 
@@ -59,19 +62,15 @@ immutable/txhash/{rangeID:04d}/raw/{chunkID:06d}.bin
 
 Format: `[txhash[32] || ledgerSeq[4]]` repeated, 36 bytes per entry. File is NOT sorted.
 
-### Sharding by First Hex Nibble
+### Sharding by First Hex Character
 
-The ~3B transactions for a 10M-ledger range are sharded across 16 column family files based on the first hex nibble (high nibble of the first byte) of the transaction hash:
-
-```
-nibble = txhash[0] >> 4   // values 0x0..0xF → CFs 0..15
-```
+The ~3B transactions for a 10M-ledger range are sharded across 16 column family files based on the first hex character of the transaction hash string (`0`–`f`). In raw byte terms: `txhash[0] >> 4`, giving values `0x0`–`0xF` mapping to CF names `0`–`f`.
 
 Each CF index file (`cf-{0..f}.idx`) is a self-contained RecSplit minimal perfect hash for the transactions in that CF.
 
 ### Build Algorithm per CF
 
-16 goroutines run concurrently (one per nibble 0x0..0xF). Each goroutine independently executes:
+16 goroutines run concurrently (one per CF, `0`–`f`). Each goroutine independently executes:
 
 ```
 for each of 1000 raw chunk files:
@@ -103,17 +102,14 @@ See [08-query-routing.md](./08-query-routing.md) for false-positive handling.
 
 ```mermaid
 flowchart LR
-    classDef ingest fill:#eef8ee,stroke:#228b22
-    classDef build fill:#fff8e8,stroke:#cc8800
-
     T0(["t=0: Range 0 ingestion complete"]) --> A
     subgraph parallel["Concurrent execution"]
-        A["RecSplit build: Range 0<br/>(~4 hours)"]:::build
-        B["Range 1 ingestion begins<br/>(BSB parallelism)"]:::ingest
+        A["RecSplit build: Range 0<br/>(~4 hours)"]
+        B["Range 1 ingestion begins<br/>(BSB parallelism)"]
     end
     A --> C(["t=4h: Range 0 COMPLETE"])
     B --> D(["Range 1 ingestion complete"])
-    D --> E["RecSplit build: Range 1"]:::build
+    D --> E["RecSplit build: Range 1"]
 ```
 
 The orchestrator scheduler does not block range N+1 on range N's RecSplit completion. Range N+1 ingestion starts as soon as the range N orchestrator releases its slot (after ingestion finishes, before RecSplit finishes).
