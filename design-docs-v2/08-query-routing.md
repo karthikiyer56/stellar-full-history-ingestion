@@ -376,16 +376,16 @@ The following diagram shows how the router's internal state evolves as a range m
 
 ```mermaid
 flowchart TD
-    START(["[*]"])
+    START(["range created"])
     ACTIVE["ACTIVE<br/>Queries → active RocksDB stores:<br/>active/ledger-store-chunk-YYYYYY/<br/>active/txhash-store-range-XXXX/"]
     TRANSITIONING["TRANSITIONING<br/>Queries still → same RocksDB stores<br/>Transition goroutine runs concurrently<br/>No query gap. No lock held during I/O."]
     COMPLETE["COMPLETE<br/>Queries → immutable stores:<br/>immutable/ledgers/chunks/ (LFS)<br/>immutable/txhash/XXXX/index/ (RecSplit)<br/>RocksDB stores deleted from disk."]
-    END(["[*]"])
+    END(["immutable forever"])
 
-    START -->|"AddActiveStore(rangeN)<br/>called at range boundary"| ACTIVE
-    ACTIVE -->|"PromoteToTransitioning(rangeN)<br/>AddActiveStore(rangeN+1) called immediately after"| TRANSITIONING
-    TRANSITIONING -->|"AddImmutableStores(rangeN)<br/>RemoveTransitioningStores(rangeN) called next"| COMPLETE
-    COMPLETE -->|"range is immutable forever"| END
+    START -->|"AddActiveStore(rangeN)"| ACTIVE
+    ACTIVE -->|"PromoteToTransitioning(rangeN)<br/>then AddActiveStore(rangeN+1)"| TRANSITIONING
+    TRANSITIONING -->|"AddImmutableStores(rangeN)<br/>then RemoveTransitioningStores(rangeN)"| COMPLETE
+    COMPLETE --> END
 ```
 
 ### Concurrent Timeline at Range Boundary
