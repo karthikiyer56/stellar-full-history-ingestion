@@ -7,15 +7,43 @@
 
 ## What Changed from v1
 
-| Dimension | v1 | v2 |
-|-----------|----|----|
-| Backfill storage | RocksDB active stores | **Direct write to LFS + raw txhash flat files** (no RocksDB) |
-| Backfill transition | Unified transition workflow with streaming | **Separate per-range RecSplit build** |
-| WAL during backfill | Required concern | **Not applicable** (no RocksDB) |
-| `transitioning/` directory | Created on filesystem | **Eliminated** — state tracked in meta store only |
-| `global:mode` meta key | Tracked in meta store | **Eliminated** — determined by startup flags |
-| BSB parallelism | Vague | **Explicit**: 20 batches/orchestrator, 2 orchestrators max |
-| Flush discipline | Unspecified | **Every ~100 ledgers** — no unbounded RAM accumulation |
+> v1 design docs are tagged [`v8.0.0`](https://github.com/karthikiyer56/stellar-full-history-ingestion/tree/v8.0.0/design-docs) in `design-docs/`.
+
+### The Fundamental Break
+
+In v1, backfill and streaming were structurally similar pipelines — both wrote through RocksDB as an intermediate store, and both shared a unified transition workflow that converted RocksDB data into immutable files. The v2 redesign breaks this symmetry entirely. **Backfill and streaming are now completely different pipelines with different storage backends, different sub-flow cadences, and separate transition workflows that share no code or state.**
+
+The single biggest driver of this change: RocksDB is the wrong tool for backfill. Backfill ingests tens of millions of ledgers sequentially with no concurrent reads — there is no need for a mutable, WAL-backed store. Writing directly to the final immutable format eliminates an entire class of storage overhead, crash recovery complexity, and disk amplification.
+
+### Backfill Pipeline
+
+The v2 backfill pipeline is a parallel bulk loader that writes directly to the immutable output format.
+
+- **No RocksDB at all.** Neither the ledger store nor the txhash store uses RocksDB during backfill ingestion. Ledgers are written directly to LFS chunk files (`immutable/ledgers/chunks/XXXX/YYYYYY.data`), and transaction hashes are written directly to raw flat files (`immutable/txhash/XXXX/raw/YYYYYY.bin`, 36 bytes per entry). No WAL, no compaction, no intermediate mutable store.
+
+- **BSB parallelism is explicit and structured.** Up to 2 orchestrators run concurrently, each driving up to 20 `BufferedStorageBackend` (BSB) instances. Each BSB instance fetches and processes ledger batches independently. v1 described parallelism vaguely; v2 defines the exact concurrency budget.
+
+- **Ledger store and txhash store have different sub-flow cadences.** The ledger store sub-flow operates at chunk granularity (10K ledgers per chunk, 1,000 chunks per range). The txhash sub-flow collects raw flat files across all 1,000 chunks of a range, then triggers a single RecSplit index build for the whole range once all chunks are complete. These are independent workflows running at different granularities.
+
+- **RecSplit index build is a separate async step.** After all 1,000 chunks of a range complete, a RecSplit build runs to produce the 16 per-CF index files. This build takes ~4 hours for a 10M-ledger range and runs concurrently with the next range's ingestion. In v1, index construction was interleaved with the transition workflow shared with streaming.
+
+- **Flush discipline is explicit.** Backfill flushes every ~100 ledgers to cap RAM usage. v1 left this unspecified, which could cause unbounded memory accumulation under high-throughput ingestion.
+
+- **Crash recovery is chunk-atomic.** A chunk is only considered complete when both `lfs_done` and `txhash_done` flags are set in the meta store after an fsync. On restart, any incomplete chunk is re-ingested from scratch. No WAL replay needed.
+
+### Streaming Pipeline
+
+The v2 streaming pipeline retains RocksDB as the active store (necessary for concurrent reads during live ingestion), but the transition workflow is now completely separate from backfill.
+
+- **Active store cadence is split.** In v1, the ledger store and txhash store were treated as a unified pair. In v2 they have different swap cadences: the **ledger store** rotates at every chunk boundary (~every 10K ledgers, ~1,000 swaps per range via `SwapActiveLedgerStore`), while the **txhash store** rotates only at range boundaries (~every 10M ledgers, ~1 swap per range via `AddActiveStore`). These are independent operations on independent RocksDB instances.
+
+- **Streaming transition is a background goroutine, not a shared workflow.** When a range boundary is hit, the active stores are promoted to `TRANSITIONING` state and a background goroutine takes over conversion: Phase 1 writes LFS chunk files, Phase 2 builds the RecSplit index. Ingestion of the next range proceeds concurrently on new active stores. There is no query gap — the transitioning RocksDB stores remain open and queryable until `COMPLETE`.
+
+- **`transitioning/` directory is eliminated.** v1 created a `transitioning/` directory on the filesystem during the transition phase. v2 tracks all transition state in the meta store only. The filesystem only ever contains the final immutable output.
+
+- **`global:mode` meta key is eliminated.** v1 stored the current pipeline mode in the meta store. v2 determines mode from the `--mode` startup flag. The meta store contains only per-range and per-chunk state.
+
+- **Streaming cannot start until all prior ranges are COMPLETE.** There is no partial handoff between backfill and streaming. The streaming process validates this invariant at startup and aborts if any range is in an incomplete state.
 
 ---
 
