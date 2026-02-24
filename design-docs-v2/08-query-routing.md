@@ -375,33 +375,17 @@ router.RemoveTransitioningStores(rangeID)            // delete RocksDB (safe: ro
 The following diagram shows how the router's internal state evolves as a range moves through the full lifecycle.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> ACTIVE: AddActiveStore(rangeN)\ncalled at range boundary
+flowchart TD
+    START(["[*]"])
+    ACTIVE["ACTIVE<br/>Queries → active RocksDB stores:<br/>active/ledger-store-chunk-YYYYYY/<br/>active/txhash-store-range-XXXX/"]
+    TRANSITIONING["TRANSITIONING<br/>Queries still → same RocksDB stores<br/>Transition goroutine runs concurrently<br/>No query gap. No lock held during I/O."]
+    COMPLETE["COMPLETE<br/>Queries → immutable stores:<br/>immutable/ledgers/chunks/ (LFS)<br/>immutable/txhash/XXXX/index/ (RecSplit)<br/>RocksDB stores deleted from disk."]
+    END(["[*]"])
 
-    ACTIVE --> TRANSITIONING: PromoteToTransitioning(rangeN)\ncalled before spawning transition goroutine\nAddActiveStore(rangeN+1) called immediately after
-
-    TRANSITIONING --> COMPLETE: AddImmutableStores(rangeN)\ncalled after verification passes\nRemoveTransitioningStores(rangeN) called next
-
-    COMPLETE --> [*]: range is immutable forever\nLFS + RecSplit handles cached
-
-    note right of ACTIVE
-        Queries routed to:
-        <active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/
-        <active_stores_base_dir>/txhash-store-range-{rangeN:04d}/
-    end note
-
-    note right of TRANSITIONING
-        Queries still routed to same RocksDB stores.
-        Transition goroutine runs concurrently.
-        No query gap. No lock held during I/O.
-    end note
-
-    note right of COMPLETE
-        Queries routed to:
-        immutable/ledgers/chunks/ (LFS)
-        immutable/txhash/{rangeN:04d}/index/ (RecSplit)
-        RocksDB stores deleted from disk.
-    end note
+    START -->|"AddActiveStore(rangeN)<br/>called at range boundary"| ACTIVE
+    ACTIVE -->|"PromoteToTransitioning(rangeN)<br/>AddActiveStore(rangeN+1) called immediately after"| TRANSITIONING
+    TRANSITIONING -->|"AddImmutableStores(rangeN)<br/>RemoveTransitioningStores(rangeN) called next"| COMPLETE
+    COMPLETE -->|"range is immutable forever"| END
 ```
 
 ### Concurrent Timeline at Range Boundary
@@ -409,11 +393,11 @@ stateDiagram-v2
 ```mermaid
 flowchart LR
     T0(["Range N last ledger committed"])
-    P["PromoteToTransitioning(N)\nAddActiveStore(N+1)"]
+    P["PromoteToTransitioning(N)<br/>AddActiveStore(N+1)"]
 
     subgraph CONCURRENT
-        TG["Transition goroutine (range N):\nPhase 1: LFS chunk writes\nPhase 2: RecSplit build\nVerify → AddImmutableStores(N)\nRemoveTransitioningStores(N)"]
-        IG["Ingestion loop (range N+1):\nCaptiveStellarCore → active stores\nCheckpoint every ledger"]
+        TG["Transition goroutine (range N)<br/>Phase 1: LFS chunk writes<br/>Phase 2: RecSplit build<br/>Verify → AddImmutableStores(N)<br/>RemoveTransitioningStores(N)"]
+        IG["Ingestion loop (range N+1)<br/>CaptiveStellarCore → active stores<br/>Checkpoint every ledger"]
     end
 
     T0 --> P
@@ -482,26 +466,26 @@ The store handles copied into local variables are safe to use after the lock is 
 ```mermaid
 flowchart TD
     IN(["getLedgerBySequence(ledgerSeq)"])
-    IN --> RANGE["Compute rangeID\nrangeID = (ledgerSeq - 2) / 10,000,000"]
+    IN --> RANGE["Compute rangeID<br/>rangeID = (ledgerSeq - 2) / 10,000,000"]
     RANGE --> RLOCK["Acquire READ lock"]
-    RLOCK --> SNAP["Copy rangeState + store handle\nfor this rangeID into local vars"]
+    RLOCK --> SNAP["Copy rangeState + store handle<br/>for this rangeID into local vars"]
     SNAP --> RUNLOCK["Release READ lock"]
     RUNLOCK --> SW{"What is rangeState?"}
 
     SW -->|"ACTIVE or TRANSITIONING"| KEY["key = uint32BE(ledgerSeq)"]
-    KEY --> RDB["RocksDB GET\nfrom active/transitioning ledger store\ndefault CF"]
+    KEY --> RDB["RocksDB GET<br/>active/transitioning ledger store<br/>default CF"]
     RDB --> FOUND1{"record found?"}
     FOUND1 -->|no| NF1(["return NOT_FOUND"])
-    FOUND1 -->|yes| DEC1["zstd decompress record"]
+    FOUND1 -->|yes| DEC1["zstd decompress"]
     DEC1 --> RET1(["return LedgerCloseMeta"])
 
-    SW -->|"COMPLETE"| CID["Compute chunkID\nchunkID = (ledgerSeq - 2) / 10,000"]
-    CID --> CDIR["Compute chunkDir\nchunkDir = chunkID / 1000  (4-digit zero-padded)"]
-    CDIR --> IDX["Open .index file\nimmutable/ledgers/chunks/{chunkDir}/{chunkID}.index"]
-    IDX --> OFF["Read uint64 at offset\n(ledgerSeq - chunkFirstLedger) × 8\n→ byteOffset into .data file"]
-    OFF --> DAT["Open .data file\nimmutable/ledgers/chunks/{chunkDir}/{chunkID}.data"]
-    DAT --> SEEK["Seek to byteOffset\nRead variable-length record"]
-    SEEK --> DEC2["zstd decompress record"]
+    SW -->|"COMPLETE"| CID["Compute chunkID<br/>chunkID = (ledgerSeq - 2) / 10,000"]
+    CID --> CDIR["Compute chunkDir<br/>chunkDir = chunkID / 1000 (4-digit zero-padded)"]
+    CDIR --> IDX["Open .index file<br/>immutable/ledgers/chunks/chunkDir/chunkID.index"]
+    IDX --> OFF["Read uint64 at offset<br/>(ledgerSeq - chunkFirstLedger) x 8<br/>= byteOffset into .data file"]
+    OFF --> DAT["Open .data file<br/>immutable/ledgers/chunks/chunkDir/chunkID.data"]
+    DAT --> SEEK["Seek to byteOffset<br/>Read variable-length record"]
+    SEEK --> DEC2["zstd decompress"]
     DEC2 --> RET2(["return LedgerCloseMeta"])
 
     SW -->|"not present / not ingested"| NF2(["return NOT_FOUND"])
@@ -511,56 +495,73 @@ flowchart TD
 
 ## getTransactionByHash
 
+The query runs in four sequential stages. Each stage is shown separately for clarity.
+
+### Stage 1 — Setup (snapshot under lock)
+
 ```mermaid
 flowchart TD
     IN(["getTransactionByHash(txHash)"])
+    IN --> NIB["Extract CF selector<br/>first hex char of txHash = CF name<br/>e.g. 0xdd330b... → CF 'd'"]
+    NIB --> LOCK["Acquire READ lock"]
+    LOCK --> SNAP["Snapshot into local vars:<br/>activeTxHashStore<br/>transitioningTxHashStore<br/>completeRangeIDs slice"]
+    SNAP --> UNL["Release READ lock<br/>all I/O uses local copies — no lock held"]
+    UNL --> NEXT(["→ Stage 2: probe active store"])
+```
 
-    %% ── STAGE 1: Setup ──────────────────────────────────────────────
-    IN --> NIB["Extract column family selector\ntxHash = dd330bdf9dc7870e...e538f5\nfirst hex char = 'd'\n→ route to CF 'd'"]
-    NIB --> S1_LOCK["Acquire READ lock"]
-    S1_LOCK --> S1_SNAP["Copy into local vars:\n• activeTxHashStore\n• transitioningTxHashStore\n• completeRangeIDs slice"]
-    S1_SNAP --> S1_UNL["Release READ lock\n(all I/O below uses local copies — no lock held)"]
+### Stage 2 — Probe active store
 
-    %% ── STAGE 2: Probe active store ─────────────────────────────────
-    S1_UNL --> A_CHK{"active store\nexists?"}
-    A_CHK -->|no| T_CHK
-    A_CHK -->|yes| A_RDB["RocksDB GET\nCF = 'd'\nkey = dd330bdf...e538f5"]
+```mermaid
+flowchart TD
+    IN(["from Stage 1"])
+    IN --> A_CHK{"active store<br/>exists?"}
+    A_CHK -->|no| SKIP(["→ Stage 3: probe transitioning store"])
+    A_CHK -->|yes| A_RDB["RocksDB GET<br/>CF = txHash[0]<br/>key = txHash"]
     A_RDB --> A_FOUND{"found?"}
-    A_FOUND -->|no| T_CHK
-    A_FOUND -->|yes| A_FETCH["Fetch LedgerCloseMeta\nfor returned ledgerSeq"]
-    A_FETCH --> A_SCAN["Scan LCM transaction list\nfor txHash"]
-    A_SCAN --> A_MATCH{"txHash\nfound in LCM?"}
-    A_MATCH -->|yes| A_RET(["return ledgerSeq ✓"])
-    A_MATCH -->|no| A_FP["FALSE POSITIVE\nlog metric\ncontinue"]
-    A_FP --> T_CHK
+    A_FOUND -->|no| SKIP
+    A_FOUND -->|yes| A_FETCH["Fetch LedgerCloseMeta<br/>for returned ledgerSeq"]
+    A_FETCH --> A_SCAN["Scan LCM tx list<br/>for txHash"]
+    A_SCAN --> A_MATCH{"match?"}
+    A_MATCH -->|yes| RET(["return ledgerSeq ✓"])
+    A_MATCH -->|no| FP["false positive<br/>log metric"]
+    FP --> SKIP
+```
 
-    %% ── STAGE 3: Probe transitioning store ──────────────────────────
-    T_CHK{"transitioning store\nexists?"}
-    T_CHK -->|no| IMM_START
-    T_CHK -->|yes| T_RDB["RocksDB GET\nCF = 'd'\nkey = dd330bdf...e538f5"]
+### Stage 3 — Probe transitioning store
+
+```mermaid
+flowchart TD
+    IN(["from Stage 2"])
+    IN --> T_CHK{"transitioning store<br/>exists?"}
+    T_CHK -->|no| SKIP(["→ Stage 4: probe immutable ranges"])
+    T_CHK -->|yes| T_RDB["RocksDB GET<br/>CF = txHash[0]<br/>key = txHash"]
     T_RDB --> T_FOUND{"found?"}
-    T_FOUND -->|no| IMM_START
-    T_FOUND -->|yes| T_FETCH["Fetch LedgerCloseMeta\nfor returned ledgerSeq"]
-    T_FETCH --> T_SCAN["Scan LCM transaction list\nfor txHash"]
-    T_SCAN --> T_MATCH{"txHash\nfound in LCM?"}
-    T_MATCH -->|yes| T_RET(["return ledgerSeq ✓"])
-    T_MATCH -->|no| T_FP["FALSE POSITIVE\nlog metric\ncontinue"]
-    T_FP --> IMM_START
+    T_FOUND -->|no| SKIP
+    T_FOUND -->|yes| T_FETCH["Fetch LedgerCloseMeta<br/>for returned ledgerSeq"]
+    T_FETCH --> T_SCAN["Scan LCM tx list<br/>for txHash"]
+    T_SCAN --> T_MATCH{"match?"}
+    T_MATCH -->|yes| RET(["return ledgerSeq ✓"])
+    T_MATCH -->|no| FP["false positive<br/>log metric"]
+    FP --> SKIP
+```
 
-    %% ── STAGE 4: Probe immutable ranges (newest first) ───────────────
-    IMM_START["Begin immutable range loop\ncompleteRangeIDs in descending order\nexample: [5, 4, 3, 2, 1, 0]"]
-    IMM_START --> IMM_NEXT{"more ranges\nin list?"}
-    IMM_NEXT -->|no| NOT_FOUND(["return NOT_FOUND"])
-    IMM_NEXT -->|yes| IMM_POP["Take next rangeID\n(newest first)"]
-    IMM_POP --> RS["RecSplit lookup\nopen cf-d.idx for rangeID\ncandidate = index.Lookup(dd330bdf...e538f5)"]
-    RS --> RS_FOUND{"candidate\nreturned?"}
-    RS_FOUND -->|no| IMM_NEXT
-    RS_FOUND -->|yes| IMM_FETCH["Fetch LedgerCloseMeta\nfor candidate ledgerSeq\n(from LFS .data file)"]
-    IMM_FETCH --> IMM_SCAN["Scan LCM transaction list\nfor txHash"]
-    IMM_SCAN --> IMM_MATCH{"txHash\nfound in LCM?"}
-    IMM_MATCH -->|yes| IMM_RET(["return ledgerSeq ✓"])
-    IMM_MATCH -->|no| IMM_FP["FALSE POSITIVE\nlog metric\ncontinue"]
-    IMM_FP --> IMM_NEXT
+### Stage 4 — Probe immutable ranges (newest first)
+
+```mermaid
+flowchart TD
+    IN(["from Stage 3<br/>completeRangeIDs descending<br/>e.g. [5, 4, 3, 2, 1, 0]"])
+    IN --> NEXT{"more ranges?"}
+    NEXT -->|no| NF(["return NOT_FOUND"])
+    NEXT -->|yes| POP["take next rangeID"]
+    POP --> RS["RecSplit lookup<br/>cf-X.idx for rangeID<br/>candidate = index.Lookup(txHash)"]
+    RS --> RS_FOUND{"candidate<br/>returned?"}
+    RS_FOUND -->|no| NEXT
+    RS_FOUND -->|yes| FETCH["Fetch LedgerCloseMeta<br/>for candidate ledgerSeq<br/>via LFS .data file"]
+    FETCH --> SCAN["Scan LCM tx list<br/>for txHash"]
+    SCAN --> MATCH{"match?"}
+    MATCH -->|yes| RET(["return ledgerSeq ✓"])
+    MATCH -->|no| FP["false positive<br/>log metric"]
+    FP --> NEXT
 ```
 
 ### RecSplit False-Positive Handling
