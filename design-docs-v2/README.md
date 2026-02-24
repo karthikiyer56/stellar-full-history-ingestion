@@ -23,7 +23,7 @@
 
 ```mermaid
 flowchart LR
-    subgraph BACKFILL["BACKFILL MODE — offline, no queries, process exits when done"]
+    subgraph BACKFILL["BACKFILL MODE (offline, no queries, process exits when done)"]
         direction TB
         BSB["BufferedStorageBackend (BSB)<br/>Up to 2 orchestrators × 20 BSB instances<br/>each instance runs concurrently"]
         LFS_B["LFS Chunk Files<br/>immutable/ledgers/chunks/XXXX/YYYYYY.data<br/>10K ledgers per chunk, zstd compressed"]
@@ -34,7 +34,7 @@ flowchart LR
         TXRAW -->|"all 1000 chunks complete"| RECSPLIT_B
     end
 
-    subgraph STREAMING["STREAMING MODE — live ingestion, serves all query endpoints, long-running daemon"]
+    subgraph STREAMING["STREAMING MODE (live ingestion, serves all query endpoints, long-running daemon)"]
         direction TB
         CORE["CaptiveStellarCore<br/>1 ledger per batch"]
         ACTIVE["Active RocksDB Stores (per range)<br/><active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/<br/><active_stores_base_dir>/txhash-store-range-{rangeID:04d}/"]
