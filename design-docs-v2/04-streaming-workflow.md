@@ -149,7 +149,7 @@ LFS chunk flush checkpoints (separate from ledger checkpoints): `range:N:chunk:C
 
 Queries are never blocked. Both active stores remain open and queryable throughout the transition.
 
-> **getEvents placeholder**: When `getEvents` support is added, it will require a new column family in the txhash store (or a separate active events RocksDB store) for event data, with per-chunk flush to an immutable events index. Query routing for `getEvents` will follow the same ACTIVE→TRANSITIONING→COMPLETE pattern.
+> **getEvents placeholder**: When `getEvents` support is added, it will require a **separate active events RocksDB store** for event data, with per-chunk flush to an immutable events index. The events store's rotation cadence is TBD (the ledger store rotates every 10K ledgers at chunk boundaries; the txhash store rotates every 10M ledgers at range boundaries). Query routing for `getEvents` will follow the same ACTIVE→TRANSITIONING→COMPLETE pattern.
 
 ---
 
@@ -159,11 +159,11 @@ Queries are never blocked. Both active stores remain open and queryable througho
 
 When `getEvents` support is added to the streaming workflow, it will require:
 
-- A new column family in the active txhash store (or a separate events RocksDB store) for event data
-- Per-ledger event data written alongside existing txhash writes
+- A **separate active events RocksDB store** — its own RocksDB instance, independent of the ledger store and txhash store (rotation cadence TBD)
+- Per-ledger event data written alongside existing ledger and txhash writes
 - Background chunk-level flush to an immutable events index (same cadence as LFS: per 10K ledgers, while ACTIVE)
 - A Phase 3 events index build in the streaming transition workflow (after LFS and RecSplit complete)
-- Query availability: served from active store during ACTIVE/TRANSITIONING, from immutable events index once COMPLETE
+- Query availability: served from active events store during ACTIVE/TRANSITIONING, from immutable events index once COMPLETE
 
 ---
 

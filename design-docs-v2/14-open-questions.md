@@ -14,8 +14,8 @@ The current design has **four distinct workflows**, each of which carries an exp
 |----------|----------|--------------------------|
 | **Backfill ingestion** | [03-backfill-workflow.md](./03-backfill-workflow.md) | Placeholder: 3rd write step per chunk (events flat file → fsync → `events_done`) |
 | **Backfill transition** | [05-backfill-transition-workflow.md](./05-backfill-transition-workflow.md) | Placeholder: Phase 3 events index build from per-chunk event files, after RecSplit |
-| **Streaming ingestion** | [04-streaming-workflow.md](./04-streaming-workflow.md) | Placeholder: new CF in active store, per-ledger event writes, per-chunk flush to immutable events index |
-| **Streaming transition** | [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) | Placeholder: Phase 3 events index build from active RocksDB events CF, before active store deletion |
+| **Streaming ingestion** | [04-streaming-workflow.md](./04-streaming-workflow.md) | Placeholder: separate active events RocksDB store, per-ledger event writes, per-chunk flush to immutable events index |
+| **Streaming transition** | [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) | Placeholder: Phase 3 events index build from active events RocksDB store, before active stores deletion |
 
 Additionally, [07-crash-recovery.md](./07-crash-recovery.md) and [02-meta-store-design.md](./02-meta-store-design.md) both carry getEvents placeholder sections for recovery semantics and new meta store keys respectively.
 
@@ -27,9 +27,9 @@ The exact transition flow and cadence for storing **events** across all four wor
 
 **Backfill transition** — Currently: `INGESTING → RECSPLIT_BUILDING → COMPLETE`. A new Phase 3 (`EVENTS_INDEX_BUILDING`) needs to be inserted. The events index build would run after RecSplit completes, reading per-chunk event flat files (analogous to how RecSplit reads raw txhash flat files). Ordering, parallelism, and whether events index build can overlap with RecSplit build are TBD.
 
-**Streaming ingestion** — Per-ledger event data needs to be written alongside existing txhash writes (either as a new CF in the txhash store or a separate active events RocksDB store). Background per-chunk flush to immutable events index (same cadence as LFS: per 10K ledgers, while ACTIVE) is anticipated. The store architecture choice affects memory budget and crash recovery.
+**Streaming ingestion** — Per-ledger event data needs to be written to a **separate active events RocksDB store** (its own RocksDB instance, independent of the ledger store and txhash store). Background per-chunk flush to immutable events index (same cadence as LFS: per 10K ledgers, while ACTIVE) is anticipated. The events store rotation cadence and architecture affect memory budget and crash recovery.
 
-**Streaming transition** — Currently: Phase 1 (LFS chunk writes) → Phase 2 (RecSplit build) → verify → delete active store. A Phase 3 (events index build from active RocksDB events CF) must be inserted before active store deletion. The active store cannot be deleted until LFS + RecSplit + events index all complete and pass verification.
+**Streaming transition** — Currently: Phase 1 (LFS chunk writes) → Phase 2 (RecSplit build) → verify → delete active stores (both ledger store + txhash store). A Phase 3 (events index build from the active events RocksDB store) must be inserted before active stores deletion. No active store can be deleted until LFS + RecSplit + events index all complete and pass verification.
 
 **Crash recovery** — Each of the above workflows has crash recovery semantics that must extend for events. The chunk skip rule generalizes: a chunk is skippable on resume only when **all** applicable flags are set (today: `lfs_done` AND `txhash_done`; future: AND `events_done`).
 
@@ -54,7 +54,7 @@ A **new sub-flow** for events with its own state tracking across all four workfl
 # New meta store keys (additive — no modifications to existing keys):
 range:{N:04d}:chunk:{C:06d}:events_done          ← per-chunk flag, analogous to lfs_done/txhash_done
 range:{N:04d}:events_index:state                  ← PENDING / BUILDING / COMPLETE
-range:{N:04d}:events_index:cf:{XX}:done           ← per-CF or per-partition done flag
+range:{N:04d}:events_index:cf:{XX}:done           ← per-partition done flag
 ```
 
 The range state machine extends differently per mode:
@@ -73,8 +73,8 @@ ACTIVE → TRANSITIONING → COMPLETE  (unchanged — events index built within 
 |----------|----------|---------|-------|--------|
 | Backfill ingestion | 3rd write per chunk | 10K ledgers (chunk) | Ledger events from BSB | Events flat file + `events_done` flag |
 | Backfill transition | Phase 3 after RecSplit | Per range (10M ledgers) | 1,000 per-chunk event flat files | Events index files |
-| Streaming ingestion | Per-ledger write + per-chunk flush | 1 ledger (write) / 10K ledgers (flush) | Ledger events from CaptiveStellarCore | Events CF in active store + immutable events chunks |
-| Streaming transition | Phase 3 after RecSplit | Per range (10M ledgers) | Active RocksDB events CF | Events index files |
+| Streaming ingestion | Per-ledger write + per-chunk flush | 1 ledger (write) / 10K ledgers (flush) | Ledger events from CaptiveStellarCore | Active events RocksDB store + immutable events chunks |
+| Streaming transition | Phase 3 after RecSplit | Per range (10M ledgers) | Active events RocksDB store | Events index files |
 | Crash recovery | Extended skip rule | N/A | `events_done` flags | Skip only when ALL flags set |
 
 ### Design Principle

@@ -200,7 +200,7 @@ When `getEvents` support is added to the backfill transition workflow, it will r
 - A Phase 3 step after RecSplit build completes: **events index build**
 - Input: per-chunk events data files written during chunk ingestion (analogous to raw txhash flat files)
 - Output: `immutable/events/{rangeID:04d}/index/` — events index files
-- Meta store tracking: `range:{N}:events_index:state` and per-CF or per-partition done flags
+- Meta store tracking: `range:{N}:events_index:state` and per-partition done flags
 - Range state machine extends: `INGESTING → RECSPLIT_BUILDING → EVENTS_INDEX_BUILDING → COMPLETE`
 - Crash recovery: same per-unit granularity pattern as RecSplit CF tracking
 

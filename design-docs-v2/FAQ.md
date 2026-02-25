@@ -221,7 +221,7 @@ Yes, as a future work item. The current design explicitly reserves space for it 
 
 ### Q: Where would `getEvents` data be stored?
 
-During streaming ingestion, a new column family in the active RocksDB store would hold event data. During backfill, per-chunk events files would be written alongside LFS and txhash files. After a range completes, an events index would be built into `immutable/events/{rangeID:04d}/index/`.
+During streaming ingestion, a **separate active events RocksDB store** (its own RocksDB instance, independent of the ledger store and txhash store) would hold event data. During backfill, per-chunk events files would be written alongside LFS and txhash files. After a range completes, an events index would be built into `immutable/events/{rangeID:04d}/index/`.
 
 ### Q: How would crash recovery change for `getEvents`?
 

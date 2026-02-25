@@ -216,12 +216,12 @@ flowchart LR
 
 When `getEvents` support is added to the streaming transition workflow, it will require:
 
-- **Phase 3: Events index build** — after RecSplit completes, before active store deletion
-- Input: events data from the active RocksDB store (a new CF written during streaming ingestion)
+- **Phase 3: Events index build** — after RecSplit completes, before active stores deletion
+- Input: events data from the separate active events RocksDB store (written during streaming ingestion)
 - Output: `immutable/events/{rangeID:04d}/index/` — events index files
 - Meta store tracking: `range:N:events_index:state` and per-partition done flags
 - Verification step extends to include events: spot-check random events against new index
-- Active store is NOT deleted until Phase 1 (LFS), Phase 2 (RecSplit), and Phase 3 (events index) all complete
+- No active store is deleted until Phase 1 (LFS), Phase 2 (RecSplit), and Phase 3 (events index) all complete
 
 The workflow diagram above will gain a Phase 3 branch between `VERIFY` and `DELETE_ACTIVE`.
 

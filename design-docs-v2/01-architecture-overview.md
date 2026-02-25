@@ -298,14 +298,14 @@ See [07-crash-recovery.md](./07-crash-recovery.md) for all 6 crash scenarios wit
 | Document | Placeholder Location | What Will Be Added |
 |----------|---------------------|-------------------|
 | [03-backfill-workflow.md](./03-backfill-workflow.md) | `## getEvents Immutable Store — Placeholder` | Events flat file write per chunk during ingestion |
-| [04-streaming-workflow.md](./04-streaming-workflow.md) | `## getEvents Immutable Store — Placeholder` | Events CF write per ledger to active RocksDB |
+| [04-streaming-workflow.md](./04-streaming-workflow.md) | `## getEvents Immutable Store — Placeholder` | Per-ledger event writes to separate active events RocksDB store |
 | [05-backfill-transition-workflow.md](./05-backfill-transition-workflow.md) | `## getEvents Immutable Store — Placeholder` | Phase 3: events index build from per-chunk event files |
-| [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) | `## getEvents Immutable Store — Placeholder` | Phase 3: events index build from active RocksDB events CF |
+| [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) | `## getEvents Immutable Store — Placeholder` | Phase 3: events index build from active events RocksDB store |
 | [07-crash-recovery.md](./07-crash-recovery.md) | `## getEvents Immutable Store — Placeholder` | Recovery cases for events index build |
 
 **When `getEvents` is implemented**:
 - Range state machine extends: `INGESTING → RECSPLIT_BUILDING → EVENTS_INDEX_BUILDING → COMPLETE`
-- Active store (streaming) is NOT deleted until LFS + RecSplit + events index all complete
+- Active stores (streaming) are NOT deleted until LFS + RecSplit + events index all complete
 - Raw events files (backfill) are NOT deleted until events index is complete
 - New meta store keys: `range:N:events_index:state` and per-partition done flags
 
