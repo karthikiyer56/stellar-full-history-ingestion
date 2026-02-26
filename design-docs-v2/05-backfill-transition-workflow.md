@@ -93,6 +93,17 @@ serialize index to cf-{nibble}.idx
 fsync
 ```
 
+### Empty CF Handling
+
+If a CF has zero matching transactions for its nibble — i.e., no txhash in the entire range has a first hex character matching that CF — the RecSplit build for that CF produces an **empty index file** (`cf-{X}.idx` with zero entries). The `recsplit:cf:{XX}:done` flag is set normally after the empty file is fsynced.
+
+An empty index is valid:
+- Lookups against it always return NOT_FOUND, which is correct since no transactions exist for that nibble in this range
+- The implementation MUST NOT treat an empty input set as a build error or skip setting the done flag
+- On resume after crash, an empty CF whose done flag is set is skipped like any other completed CF
+
+This edge case is rare in practice (a 10M-ledger range typically has ~3B transactions with roughly uniform hash distribution), but must be handled correctly to avoid an infinite retry loop where the CF build "fails" on empty input, the done flag is never set, and the range can never reach COMPLETE.
+
 ### Query at Runtime
 
 ```

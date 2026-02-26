@@ -193,7 +193,8 @@ The backfill transition is a **RecSplit index build**, not a store conversion. T
 
 ```mermaid
 flowchart TD
-    DONE1000(["All 1000 chunks complete for range N<br/>(lfs_done + txhash_done set for every chunk)"]) --> SET_RS["Set range:N:state = RECSPLIT_BUILDING"]
+    DONE1000(["All 1000 chunks complete for range N<br/>(lfs_done + txhash_done set for every chunk)"]) --> BARRIER["WaitForAllBSBInstances()<br/>(ensure all BSB goroutines have exited<br/>and released file handles)"]
+    BARRIER --> SET_RS["Set range:N:state = RECSPLIT_BUILDING"]
     SET_RS --> BUILD_CFS["For each CF nibble 0..15:<br/>scan 1000 raw txhash flat files → build RecSplit MPH → write cf-N.idx → fsync → set cf:XX:done"]
     BUILD_CFS --> RS_COMPLETE["Set range:N:recsplit:state = COMPLETE<br/>Set range:N:state = COMPLETE"]
     RS_COMPLETE --> DELETE_RAW["Delete raw txhash flat files<br/>immutable/txhash/{N:04d}/raw/*.bin"]
@@ -228,7 +229,7 @@ flowchart TD
     PROMOTE --> SPAWN["AddActiveStore(N+1)\nSpawn RecSplit build goroutine"]
     SPAWN --> INGEST_NEXT["Range N+1 ingestion continues\n(main goroutine)\nLedger sub-flow transitions at chunk boundaries"]
     SPAWN --> RECSPLIT["RecSplit build\nScan transitioning txhash store per nibble CF (0–f)\n→ build MPH → write cf-N.idx → fsync → set cf:XX:done\n(16 CFs; no raw flat files)"]
-    RECSPLIT --> VERIFY_RS["Verify: spot-check 100 random ledgers + 100 txhashes\nagainst immutable files"]
+    RECSPLIT --> VERIFY_RS["Verify: spot-check 1,000 samples\n(minimum 1 per chunk) of ledgers +\n1,000 samples of txhashes\nagainst immutable files"]
     VERIFY_RS -->|pass| DELETE["RemoveTransitioningTxHashStore(N)\nSet range:N:state = COMPLETE"]
     VERIFY_RS -->|fail| ABORT["ABORT — do NOT delete txhash store\nLog error; operator intervention"]
 

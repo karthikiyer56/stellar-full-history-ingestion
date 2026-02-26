@@ -159,8 +159,14 @@ func rangeLastLedger(rangeID uint32) uint32 {
 - `end_ledger` must satisfy `(end_ledger - 1) % 10_000_000 == 0`
 - `end_ledger >= start_ledger`
 
-**Valid `start_ledger` values**: 2, 10000002, 20000002, 30000002, …  
+**Valid `start_ledger` values**: 2, 10000002, 20000002, 30000002, …
 **Valid `end_ledger` values**: 10000001, 20000001, 30000001, …
+
+Both `start_ledger` and `end_ledger` MUST align to range boundaries. Specifically:
+- `start_ledger` must equal `rangeFirstLedger(N)` for some range N (i.e., `(start_ledger - 2) % 10,000,000 == 0`)
+- `end_ledger` must equal `rangeLastLedger(M)` for some range M (i.e., `(end_ledger - 1) % 10,000,000 == 0`)
+
+If either value is not range-aligned, the service exits with a startup error. Partial ranges are not supported — every requested range must be complete (all 1,000 chunks).
 
 ### Path Resolution
 
@@ -170,7 +176,13 @@ func rangeLastLedger(rangeID uint32) uint32 {
 
 ### Streaming Gap Validation
 
-Before streaming starts, the service validates that all ranges prior to the start range are in `COMPLETE` state in the meta store. Any gap results in a fatal startup error.
+Before streaming starts, the service validates that all ranges prior to the current streaming range are in a valid state in the meta store:
+
+- **`COMPLETE`**: No action needed — the range is fully transitioned to immutable stores.
+- **`TRANSITIONING`** or **`RECSPLIT_BUILDING`**: Recoverable — the system automatically resumes the transition workflow for that range (spawns or resumes the RecSplit build goroutine) before starting streaming ingestion. This handles the case where a previous streaming daemon crashed mid-transition.
+- **`INGESTING`**, **`ACTIVE`**, or **absent**: Fatal startup error — the range was never fully ingested or its state is missing. The service logs the offending range IDs and their states and exits.
+
+See [04-streaming-workflow.md](./04-streaming-workflow.md) § Startup Validation for the full flowchart.
 
 ---
 

@@ -135,7 +135,7 @@ No. Streaming mode builds RecSplit directly from the active txhash store (16 CFs
 
 ### Q: What validates that there are no ledger gaps before streaming starts?
 
-At startup in streaming mode, the service reads the meta store and verifies that all ranges preceding the start range are in `COMPLETE` state. Any range in a non-COMPLETE state causes a fatal startup error. See [04-streaming-workflow.md](./04-streaming-workflow.md).
+At startup in streaming mode, the service reads the meta store and verifies that all ranges preceding the start range are in `COMPLETE` state or a recoverable transition state (`TRANSITIONING` or `RECSPLIT_BUILDING`). Ranges in a transition state are automatically resumed (the RecSplit build goroutine is re-spawned). Any range in `INGESTING`, `ACTIVE`, or absent state causes a fatal startup error — this indicates a gap that requires backfill completion first. See [04-streaming-workflow.md](./04-streaming-workflow.md).
 
 ---
 

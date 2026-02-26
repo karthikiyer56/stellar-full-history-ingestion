@@ -63,6 +63,12 @@ After per-range reconciliation, the system scans the data directory for store di
 
 All cleanup actions are logged at **WARN** level so operators can audit what was removed. Each log entry includes the artifact path, the expected range, and the reason for deletion (e.g., "no meta store entry for range 0003; deleting orphaned raw txhash directory").
 
+> **Safety note — meta store integrity assumption**: The orphaned artifact scan assumes the meta store is the authoritative source of truth. If the meta store itself is corrupted or truncated (e.g., due to disk failure affecting the meta store RocksDB), ranges that were previously COMPLETE may have no meta store entry, causing their immutable files to be incorrectly classified as orphaned and deleted. To mitigate this risk:
+>
+> 1. The reconciliation pass logs every deletion at WARN level with the full artifact path and reason — operators should review these logs on the first startup after any unexpected failure
+> 2. If an unexpectedly large number of ranges are flagged as orphaned (e.g., more than 1), the system logs a FATAL error and aborts rather than proceeding with deletion: _"More than 1 orphaned range detected — possible meta store corruption. Aborting startup. Inspect the meta store and data directory manually before restarting."_
+> 3. Operators experiencing meta store corruption should restore the meta store from backup or re-run backfill for the affected ranges rather than allowing reconciliation to delete immutable data
+
 ---
 
 ### Ordering

@@ -37,8 +37,9 @@ flowchart TD
         MORE_CHUNKS -->|no| BSB_DONE["BSB instance complete"]
         BSB_DONE --> ALL_DONE{all 20 BSB instances done?}
         ALL_DONE -->|no| BSB_PARALLEL
-        ALL_DONE -->|yes| ALL_CHUNKS_DONE["All 1000 chunks complete<br/>→ trigger backfill transition workflow"]
-        ALL_CHUNKS_DONE --> TRANSITION["Backfill transition workflow<br/>(RecSplit build — see doc 05)"]
+        ALL_DONE -->|yes| ALL_CHUNKS_DONE["All 1000 chunks complete"]
+        ALL_CHUNKS_DONE --> WAIT_BSB["WaitForAllBSBInstances()<br/>(Pre-RecSplit Barrier — see doc 05)"]
+        WAIT_BSB --> TRANSITION["Backfill transition workflow<br/>(RecSplit build — see doc 05)"]
         TRANSITION --> RANGE_DONE["Set range:N:state = COMPLETE"]
     end
 
@@ -61,10 +62,9 @@ flowchart TD
     CHECK -->|"no — process"| FETCH["Fetch ledgers from BSB (10K ledgers)"]
     FETCH --> PROCESS["For each ledger:<br/>1. Compress LCM (zstd) → append to open LFS file handle (YYYYYY.data)<br/>2. Extract transactions → append to open txhash file handle (YYYYYY.bin)<br/>   (txhash[32] || ledgerSeq[4], 36 bytes/entry)<br/>3. Every ~100 ledgers: OS write() to both file handles<br/>   (page cache updated; handles stay open; NO fsync)"]
     PROCESS --> LFS_FLUSH["Chunk boundary reached (10K ledgers):<br/>flush() + fsync() LFS file handles<br/>(YYYYYY.data + YYYYYY.index) → close"]
-    LFS_FLUSH --> SET_LFS["meta: lfs_done=1 for this chunk"]
-    SET_LFS --> TXHASH_FLUSH["Flush + fsync raw txhash flat file<br/>(YYYYYY.bin)"]
-    TXHASH_FLUSH --> SET_TX["meta: txhash_done=1 for this chunk"]
-    SET_TX --> DONE2(["chunk complete"])
+    LFS_FLUSH --> TXHASH_FLUSH["Flush + fsync raw txhash flat file<br/>(YYYYYY.bin)"]
+    TXHASH_FLUSH --> SET_FLAGS["Atomic WriteBatch:<br/>lfs_done='1' + txhash_done='1'"]
+    SET_FLAGS --> DONE2(["chunk complete"])
 ```
 
 ### Two-Level Write Lifecycle
@@ -84,12 +84,11 @@ This copies bytes from Go heap to OS page cache. The file handles remain open. N
 After all 10,000 ledgers in the chunk have been processed and level-1 flushes are done:
 1. `flush()` + `fsync()` on the LFS file handle (`YYYYYY.data` + `YYYYYY.index`) — forces all page cache bytes for this file to durable storage
 2. Close the LFS file handles
-3. Set `lfs_done=1` in meta store (WAL-backed write)
-4. `flush()` + `fsync()` on the txhash file handle (`YYYYYY.bin`)
-5. Close the txhash file handle
-6. Set `txhash_done=1` in meta store
+3. `flush()` + `fsync()` on the txhash file handle (`YYYYYY.bin`)
+4. Close the txhash file handle
+5. Atomic WriteBatch: set `lfs_done=1` + `txhash_done=1` in meta store (both flags in a single WriteBatch after both fsyncs complete)
 
-**Critical**: `lfs_done` and `txhash_done` are set only after the corresponding fsync completes. A crash between the last level-1 flush and the level-2 fsync leaves a partial file on disk — safe to overwrite on resume because neither flag was set. The meta store WAL guarantees flags survive a crash once written.
+**Critical**: `lfs_done` and `txhash_done` are set atomically in a single meta store WriteBatch only after both fsyncs complete (see [11-checkpointing-and-transitions.md — Chunk Write Sequence](./11-checkpointing-and-transitions.md#chunk-write-sequence)). A crash between the last level-1 flush and the level-2 fsyncs leaves a partial file on disk — safe to overwrite on resume because neither flag was set. A crash after both fsyncs but before the WriteBatch leaves durable files with no flags — also safe to overwrite. The meta store WAL guarantees both flags survive a crash once the WriteBatch commits.
 
 ---
 

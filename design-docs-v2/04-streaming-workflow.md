@@ -14,7 +14,7 @@ Streaming mode is a long-running daemon. It never exits unless there is a fatal 
 2. **Checkpoint every ledger** — `streaming:last_committed_ledger` updated after every successful write.
 3. **WAL enabled** — both active RocksDB stores (ledger and txhash) must have WAL on; crash recovery depends on it.
 4. **Background LFS flush at chunk boundary** — while ACTIVE, completed 10K-ledger chunks are flushed from the ledger store → LFS chunk files in a background goroutine. Range state stays `ACTIVE` throughout.
-5. **Transition in background at range boundary** — when range N completes (last ledger committed), the system waits for the last chunk's ledger sub-flow transition to finish, then a goroutine handles the RecSplit txhash index build. Ingestion of range N+1 starts immediately.
+5. **Transition in background at range boundary** — when range N completes (last ledger committed), the system waits for ALL in-flight chunk LFS flush goroutines to complete (not just the last chunk — if an earlier chunk's goroutine is still running, it waits for that too), then a goroutine handles the RecSplit txhash index build. Ingestion of range N+1 starts immediately.
 6. **Gap detection at startup** — all ranges before the current streaming range must be `COMPLETE` or in a recoverable transition state (`TRANSITIONING` or `RECSPLIT_BUILDING`).
 
 ---
@@ -133,13 +133,15 @@ When `ledgerSeq == rangeLastLedger(currentRange)` (e.g., ledger 10,000,001 for r
 
 1. Last ledger written to both active stores (ledger store + txhash store) with WAL
 2. `streaming:last_committed_ledger` updated to boundary ledger
-3. `waitForLedgerTransitionComplete()` — block until the last chunk's ledger sub-flow transition is done (the last chunk boundary triggers a background LFS flush that may still be in progress)
+3. `waitForLedgerTransitionComplete()` — block until ALL in-flight chunk LFS flush goroutines complete (not just the last chunk — if an earlier chunk's goroutine is still running, it waits for that too; the last chunk boundary triggers a background LFS flush that may still be in progress, but so might an earlier chunk's)
 4. Verify all 1,000 `lfs_done` flags for the range are set (safety check — all were set during ACTIVE at their individual chunk boundaries)
 5. `range:N:state` set to `TRANSITIONING`
 6. `PromoteToTransitioning(N)` — moves **only the txhash store** to `transitioningTxHashStore` (no ledger store involved — all ledger stores were already transitioned at their chunk boundaries and deleted)
 7. Background goroutine spawned for RecSplit build from transitioning txhash store (see [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md))
 8. New active ledger store + txhash store created for range N+1
 9. `range:N+1:state` set to `ACTIVE`
+
+> **Atomic WriteBatch**: Steps 5 and 9 MUST be written in a single atomic meta store WriteBatch (one WAL fsync). This ensures there is no intermediate state where one range has transitioned but the other has not. See [06-streaming-transition-workflow.md -- Atomic Range Boundary WriteBatch](./06-streaming-transition-workflow.md#atomic-range-boundary-writebatch).
 10. Ingestion continues immediately with range N+1's first ledger
 
 At the range boundary, all 1,000 ledger chunks have already been individually transitioned to LFS during the ACTIVE phase. The only remaining work is the txhash store's RecSplit index build, which runs in a background goroutine **concurrently** with ingestion of range N+1. During the TRANSITIONING state, ledger queries for range N are served from the LFS chunk files (already written), and txhash queries are served from the transitioning txhash store (still open for reads). See [08-query-routing.md](./08-query-routing.md).

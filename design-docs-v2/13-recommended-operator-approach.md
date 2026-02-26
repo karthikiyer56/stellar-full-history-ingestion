@@ -91,7 +91,7 @@ end_ledger      = 30000001       # required — adjust to your desired end; vali
 
 [backfill.bsb]
 bucket_path   = "gs://stellar-ledgers/mainnet"   # required — your GCS or S3 bucket path
-# num_bsb_instances_per_range = 20             # optional — defaults to 20; valid values: 10 or 20
+# num_bsb_instances_per_range = 20             # optional — defaults to 20; must be a divisor of 1000; common values: 10, 20, 25, 50
 # buffer_size   = 1000           # optional — defaults to 1000
 # num_workers   = 20             # optional — defaults to 20
 
@@ -215,7 +215,7 @@ block_cache_mb          = 8192   # optional — defaults to 8192; keep high for 
 ```
 
 On startup, the process:
-1. Validates that all prior ranges are `COMPLETE` in the meta store (fatal error if not)
+1. Validates that all prior ranges are `COMPLETE` or in a recoverable transition state (`TRANSITIONING` or `RECSPLIT_BUILDING`) in the meta store. Ranges in transition states are automatically resumed. Only `INGESTING`, `ACTIVE`, or absent states cause a fatal error.
 2. Reads `streaming:last_committed_ledger` to determine where to resume (or starts from the first ledger after the last complete range if no checkpoint exists)
 3. Creates new active RocksDB stores (`ledger-store-chunk-{chunkID:06d}/` + `txhash-store-range-{rangeID:04d}/`) for the current live range
 4. Begins ingesting ledgers from CaptiveStellarCore, one ledger per batch

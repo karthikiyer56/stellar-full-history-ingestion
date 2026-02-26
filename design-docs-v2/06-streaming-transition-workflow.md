@@ -81,12 +81,12 @@ ledgerSeq == rangeLastLedger(currentRange)
 
 ### Range-Boundary Coordination: Wait for Lower-Cadence Sub-flows
 
-At the range boundary, the system **must wait** for the last ledger sub-flow transition to complete before proceeding with the txhash transition. The last chunk boundary (chunk 999 of a range) triggers a ledger sub-flow transition that runs in a background goroutine. The range boundary is the very next ledger after this chunk boundary, so there is a race: the LFS flush goroutine for chunk 999 may not have finished.
+At the range boundary, the system **must wait** for ALL in-flight ledger sub-flow transitions to complete before proceeding with the txhash transition. The last chunk boundary (chunk 999 of a range) triggers a ledger sub-flow transition that runs in a background goroutine, and any earlier in-flight chunks (e.g., chunk 998) may also still be completing. The range boundary is the very next ledger after the chunk 999 boundary, so there is a race: the LFS flush goroutine for chunk 999 may not have finished, and earlier chunk transitions may also still be in flight.
 
 **The invariant**: At any transition cadence, all sub-flows with a LOWER cadence must have completed their last transition before the higher-cadence transition proceeds.
 
 **Steps before txhash promotion**:
-1. Call `waitForLedgerTransitionComplete()` — block until `transitioningLedgerStore == nil`. Because the LFS flush goroutine persists `lfs_done` BEFORE setting nil (see goroutine ordering above), all flags are guaranteed durable by the time this unblocks.
+1. Call `waitForLedgerTransitionComplete()` — block until `transitioningLedgerStore == nil`, which indicates all in-flight chunk transitions have completed. Because the goroutine ordering invariant (fsync `lfs_done` flag → close store → set nil → signal) guarantees that each goroutine persists its `lfs_done` flag BEFORE setting nil, all flags for all chunks are guaranteed durable by the time the wait unblocks.
 2. Verify all 1,000 `lfs_done` flags for the range are set (safety check — all guaranteed durable by the ordering invariant, but verified explicitly as a defense-in-depth assertion)
 3. Only then promote the txhash store and begin RecSplit
 
@@ -170,6 +170,8 @@ Unlike backfill (which reads raw flat files), the streaming transition reads dir
 6. Sets `range:N:recsplit:cf:{X:02d}:done = 1` in meta store
 
 The orchestrator waits for all 16 goroutines to complete before proceeding to verification.
+
+**Empty CFs**: If a CF has zero matching transactions for its nibble (e.g., no txhashes in the entire range start with hex character `a`), the RecSplit build for that CF produces an empty index file (`cf-a.idx` with zero entries). The `cf:XX:done` flag is set normally. An empty index is valid — lookups against it always return NOT_FOUND, which is correct since no transactions exist for that nibble in this range. The implementation must not treat an empty input set as an error.
 
 The transitioning RocksDB store is read-only during RecSplit build (ingestion has moved to range N+1's store).
 
@@ -344,6 +346,7 @@ flowchart LR
 |-------|--------|
 | Ledger store read failure during LFS write | ABORT chunk transition; do not set `lfs_done`; log; daemon restarts and resumes |
 | LFS file write/fsync failure | ABORT chunk transition; do not set `lfs_done` |
+| LFS flush failure with missing `lfs_done` flags (disk full, I/O error) | If an LFS flush fails and the `lfs_done` flag is not set for one or more chunks, the range boundary verification (`waitForLedgerTransitionComplete`) will detect the missing flags. The system MUST abort the range transition and exit with a fatal error — it must NOT proceed with a partial set of `lfs_done` flags. The operator must free disk space and restart, at which point the missing chunks' LFS flushes will be retried from the active ledger stores (recovered via RocksDB WAL replay). |
 | RecSplit build failure | ABORT txhash transition; do not set `cf:XX:done` |
 | Verification mismatch | ABORT; do NOT delete transitioning txhash store; log; operator intervention required |
 | Transitioning txhash store delete failure | LOG and continue; store will be cleaned up on next run |
