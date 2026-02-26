@@ -154,14 +154,18 @@ While a streaming range is in `ACTIVE` state, the ledger sub-flow transitions in
 
 1. `SwapActiveLedgerStore` moves the current active ledger store to `transitioningLedgerStore` (stays open for reads)
 2. A new active ledger store opens for the next chunk
-3. A background goroutine reads the 10K ledgers from the transitioning store → writes `.data` + `.index` files → fsyncs
+3. A background goroutine executes the following steps **in this exact order**:
+   1. Read 10K ledgers from the transitioning ledger store
+   2. Write `.data` + `.index` files
+   3. fsync both files
+   4. Write `lfs_done = "1"` to meta store (WAL-backed) — **MUST complete before step 5**
+      ```
+      range:{N:04d}:chunk:{chunkID:06d}:lfs_done = "1"
+      ```
+   5. Close the transitioning ledger store and delete its directory
+   6. Set `transitioningLedgerStore = nil` and signal the condition variable — `waitForLedgerTransitionComplete()` unblocks HERE
 
-**After a successful flush + fsync**:
-```
-range:{N:04d}:chunk:{chunkID:06d}:lfs_done = "1"
-```
-
-4. `CompleteLedgerTransition(chunkID)` closes + deletes the transitioning ledger store, sets `transitioningLedgerStore = nil`
+**Critical ordering invariant**: The `lfs_done` flag is the durability checkpoint; the nil-signal is just a notification. The flag MUST be durable in the meta store before the store reference is cleared and the completion signal fires. If the goroutine clears the store reference before persisting the flag, `waitForLedgerTransitionComplete()` unblocks prematurely. A crash in this window would leave the flag absent, causing the chunk to be re-ingested on recovery even though the LFS files were already written.
 
 **Range state stays `ACTIVE`** throughout — the ledger sub-flow transitions happen entirely within the ACTIVE phase. The txhash store is **not** transitioned during ACTIVE; the txhash sub-flow's RecSplit build only happens at the 10M-ledger range boundary.
 
@@ -179,8 +183,8 @@ At the range boundary (every 10M ledgers), all ledger sub-flow transitions have 
 flowchart TD
     A["Ledger rangeLastLedger(N) arrives"] --> B["Write to active ledger + txhash stores for range N"]
     B --> C["Write streaming:last_committed_ledger = rangeLastLedger(N)"]
-    C --> W["waitForLedgerTransitionComplete()\n(block until last chunk's LFS flush goroutine finishes)"]
-    W --> V["Verify all 1,000 lfs_done flags are set\n(safety check — all set during ACTIVE)"]
+    C --> W["waitForLedgerTransitionComplete()\n(block until transitioningLedgerStore == nil;\nlfs_done flags already durable — goroutine\npersists flag BEFORE clearing nil)"]
+    W --> V["Verify all 1,000 lfs_done flags are set\n(defense-in-depth assertion)"]
     V --> D["Set range:N:state = TRANSITIONING"]
     D --> P["PromoteToTransitioning(N) — moves ONLY txhash store\n(no ledger store to move — all already deleted)"]
     P --> F["Create new active ledger store + txhash store for range N+1"]
@@ -191,7 +195,7 @@ flowchart TD
 ```
 
 **Key points**:
-- The `waitForLedgerTransitionComplete()` call blocks until the last chunk boundary's LFS flush goroutine has called `CompleteLedgerTransition` and set `transitioningLedgerStore = nil`.
+- The `waitForLedgerTransitionComplete()` call blocks until ALL in-flight chunk LFS flush goroutines have set `transitioningLedgerStore = nil`. Because each goroutine enforces `lfs_done` persistence BEFORE clearing the nil-signal (see goroutine ordering above), by the time `waitForLedgerTransitionComplete` unblocks, all `lfs_done` flags for chunks 0 through 999 are guaranteed durable in the meta store. It does not only wait for the last chunk — if an earlier chunk's goroutine (e.g., chunk 998) is still running when chunk 999's boundary is hit, this call waits for both. Without this, a range transition could proceed while an earlier chunk's data is in an undefined state.
 - `PromoteToTransitioning` moves ONLY the txhash store — all ledger stores were individually transitioned and deleted at their chunk boundaries during ACTIVE.
 - The transitioning txhash store remains open for queries until `RemoveTransitioningTxHashStore` deletes it after verification.
 - The RecSplit build goroutine and the next-range ingestion run **concurrently**.
@@ -219,12 +223,11 @@ range:{rangeID:04d}:chunk:{chunkID:06d}:txhash_done = "1"  (written after fsync 
 flowchart LR
     A["Fetch 10K ledgers from BSB"] --> B["Accumulate LFS buffer + txhash buffer<br/>flush every ~100 ledgers to file"]
     B --> C["Final flush + fsync LFS .data + .index"]
-    C --> D["Set lfs_done = '1'"]
-    D --> E["Final flush + fsync txhash .bin"]
-    E --> F["Set txhash_done = '1'"]
+    C --> E["Final flush + fsync txhash .bin"]
+    E --> F["Atomic WriteBatch: set lfs_done = '1' + txhash_done = '1'"]
 ```
 
-`lfs_done` and `txhash_done` are always written in this order. An implementation may set both atomically in a single meta store WriteBatch after both fsyncs complete.
+`lfs_done` and `txhash_done` are always written in this order. An implementation MUST set both atomically in a single meta store WriteBatch after both fsyncs complete. This is mandatory — writing the flags in separate operations risks a crash leaving one flag set and the other missing, which would cause the resume logic to discard and rewrite a chunk that was actually complete (wasting work) or, worse, to treat an incomplete chunk as done (corrupting query results).
 
 ---
 
@@ -277,15 +280,18 @@ All 16 CFs done → range:0000:state = "COMPLETE"
 During ACTIVE (Range 0, ledger sub-flow transitions at each chunk boundary):
   Ledger 10,001 (= chunkLastLedger(0)):
     SwapActiveLedgerStore: move active → transitioningLedgerStore, open new active for chunk 1
-    Background goroutine: read chunk 0 from transitioning store → write LFS files → fsync
-    Set range:0000:chunk:000000:lfs_done = "1"
-    CompleteLedgerTransition(0): close + delete transitioning ledger store
+    Background goroutine (steps in strict order):
+      1. Read chunk 0 from transitioning store
+      2-3. Write LFS .data + .index files → fsync both
+      4. Set range:0000:chunk:000000:lfs_done = "1" (WAL-backed, BEFORE clearing nil)
+      5. Close + delete transitioning ledger store
+      6. Set transitioningLedgerStore = nil → signal condition variable
   Ledger 20,001 (= chunkLastLedger(1)):
-    Same lifecycle: swap → flush → lfs_done → CompleteLedgerTransition(1)
+    Same lifecycle: swap → flush → fsync → lfs_done → close → nil-signal
   ... (each chunk boundary triggers an independent ledger sub-flow transition;
        at most 1 active + 1 transitioning ledger store exist at any time)
   Ledger 9,990,001 (= chunkLastLedger(998)):
-    Same lifecycle: swap → flush → lfs_done → CompleteLedgerTransition(998)
+    Same lifecycle: swap → flush → fsync → lfs_done → close → nil-signal
   Ledger 10,000,001 (= chunkLastLedger(999) = rangeLastLedger(0)):
     SwapActiveLedgerStore for chunk 999 → triggers ledger sub-flow transition
     (chunk 999's LFS flush goroutine is now running in background)
@@ -294,8 +300,11 @@ Range boundary handling (ledger 10,000,001 = rangeLastLedger(0)):
   1. Write ledger 10,000,001 to Range 0 active ledger store + txhash store
   2. Write streaming:last_committed_ledger = 10,000,001
   3. waitForLedgerTransitionComplete()
-     → blocks until chunk 999's LFS flush finishes and CompleteLedgerTransition(999) is called
-  4. Verify all 1,000 lfs_done flags are set (safety check — all set during ACTIVE)
+     → blocks until transitioningLedgerStore == nil (not just chunk 999 —
+       if chunk 998's goroutine is still running, waits for it too)
+     → by goroutine ordering invariant, all lfs_done flags are already durable
+       in the meta store by the time nil is set
+  4. Verify all 1,000 lfs_done flags are set (defense-in-depth assertion)
   5. Set range:0000:state = "TRANSITIONING"
   6. PromoteToTransitioning(0) — moves ONLY txhash store to transitioningTxHashStore
      (no ledger store to move — all 1,000 already transitioned and deleted)
@@ -338,6 +347,95 @@ Queries during transition:
 | Last chunk of range N | `(N × 1000) + 999` |
 | Streaming resume ledger | `last_committed_ledger + 1` |
 | Transition triggers at | `((N+1) × 10,000,000) + 1` for range N |
+
+---
+
+## Store Lifecycle Contracts
+
+The four store lifecycle operations below are the building blocks of all chunk and range transitions. Each has formal preconditions (must be true before calling), postconditions (guaranteed true after the call returns), and idempotency guarantees. Violating a precondition is a programming error and should panic.
+
+---
+
+### `SwapActiveLedgerStore(rangeID, newChunkID)`
+
+Moves the current active ledger store to transitioning and creates a new empty active ledger store for the next chunk. Called at every chunk boundary during streaming ACTIVE phase.
+
+**Preconditions:**
+1. An active ledger store exists for `rangeID`
+2. `transitioningLedgerStore == nil` — the previous chunk's LFS flush goroutine has completed and called `CompleteLedgerTransition`
+3. The last ledger of the current chunk has been committed to the active ledger store
+
+**Postconditions:**
+1. The old active ledger store is now `transitioningLedgerStore` (open for reads by query router and by the background LFS flush goroutine)
+2. A new empty active ledger store exists at `ledger-store-chunk-{newChunkID:06d}/`, ready for writes
+3. A background LFS flush goroutine has been spawned for the old store
+
+**Idempotency:** NOT idempotent. Calling twice without the intervening `CompleteLedgerTransition` violates precondition 2 and must panic.
+
+**Crash safety:** If the process crashes after the new store is created but before the meta store is updated, the orphaned new store directory is cleaned up by startup reconciliation (no meta store entry → delete).
+
+---
+
+### `CompleteLedgerTransition(rangeID, chunkID)`
+
+Called by the background LFS flush goroutine after LFS files are fsynced and the `lfs_done` flag is set. Closes and deletes the transitioning ledger store.
+
+**Preconditions:**
+1. `transitioningLedgerStore != nil` — a transitioning ledger store exists
+2. `lfs_done` flag for this chunk is set in the meta store (WAL-backed) — the LFS files are durable
+3. The LFS `.data` and `.index` files for this chunk have been fsynced
+
+**Postconditions:**
+1. The transitioning ledger store is closed (all file handles released)
+2. The transitioning ledger store directory (`ledger-store-chunk-{chunkID:06d}/`) is deleted from disk
+3. `transitioningLedgerStore == nil` — unblocks `waitForLedgerTransitionComplete()` via condition variable
+
+**Idempotency:** NOT idempotent. Calling twice violates precondition 1 (the store is already nil after the first call) and must panic.
+
+**Crash safety:** If the process crashes after `lfs_done` is set but before the store directory is deleted, startup reconciliation detects the orphaned directory (active store exists but range is COMPLETE or chunk's `lfs_done` is already set) and deletes it.
+
+---
+
+### `PromoteToTransitioning(rangeID)`
+
+Promotes the active txhash store to transitioning at the range boundary. Called once per range, after all chunk transitions are verified complete. Part of the atomic range boundary WriteBatch sequence.
+
+**Preconditions:**
+1. All 1,000 `lfs_done` flags for this range are set in the meta store (verified by `waitForLedgerTransitionComplete()`)
+2. An active txhash store exists for `rangeID`
+3. No transitioning txhash store currently exists (previous range's transition is fully complete)
+4. `streaming:last_committed_ledger >= rangeLastLedger(rangeID)` — the last ledger of the range has been committed
+
+**Postconditions:**
+1. The active txhash store is now the transitioning txhash store (open for reads by query router and RecSplit build goroutines)
+2. The active txhash store slot is empty (ready for the new range's store)
+3. No more writes will go to the transitioning store — it is frozen
+
+**Idempotency:** Idempotent if the store is already in transitioning state (the physical operation is a no-op). This is required for crash recovery — the atomic WriteBatch at the range boundary may succeed but the process may crash before the RecSplit goroutine starts. On restart, `PromoteToTransitioning` is called again and must not fail.
+
+**Crash safety:** The store directory is not moved or renamed — it stays at `txhash-store-range-{rangeID:04d}/`. The "promotion" is purely a logical state change (the meta store records `range:N:state = TRANSITIONING`). If the process crashes after promotion, the store is found on disk during startup reconciliation with state TRANSITIONING, and the transition resumes normally.
+
+---
+
+### `RemoveTransitioningTxHashStore(rangeID)`
+
+Closes and deletes the transitioning txhash store after RecSplit build and verification are complete. The last step in the streaming transition workflow.
+
+**Preconditions:**
+1. A transitioning txhash store exists for `rangeID`
+2. All 16 RecSplit CF done flags are set in the meta store
+3. RecSplit verification has passed (spot-check: 1 ledger + 1 txhash per chunk minimum)
+4. `range:N:state` has been set to `COMPLETE` in the meta store
+5. The query router has been updated to serve range N from immutable stores (LFS + RecSplit) via `AddImmutableStores(rangeID)`
+
+**Postconditions:**
+1. The transitioning txhash store is closed (all file handles released)
+2. The transitioning txhash store directory (`txhash-store-range-{rangeID:04d}/`) is deleted from disk
+3. No transitioning txhash store exists — the system is fully in steady state for range N
+
+**Idempotency:** Idempotent if the store directory does not exist (deletion of a non-existent directory is a no-op). This is required for crash recovery — if the process crashes after deletion starts but before it completes (partial directory removal), the next startup's reconciliation pass deletes any remnants.
+
+**Crash safety:** If the process crashes after `COMPLETE` is set but before the store is deleted, startup reconciliation detects the orphaned transitioning store (range is COMPLETE but store directory still exists) and deletes it. Queries are already routed to immutable stores, so the orphaned store is never accessed.
 
 ---
 

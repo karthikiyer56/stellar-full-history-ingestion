@@ -29,8 +29,15 @@ ledgerSeq == chunkLastLedger(currentChunk)
 ### Workflow
 
 1. **Swap**: `SwapActiveLedgerStore(rangeID, chunkID+1)` moves the current active ledger store to `transitioningLedgerStore`. It stays **open for reads** during the LFS flush. A new active ledger store opens for the next chunk.
-2. **Background flush**: A goroutine reads 10K ledgers from the transitioning store → writes `.data` + `.index` → fsyncs → sets `lfs_done` flag → calls `CompleteLedgerTransition(chunkID)`.
-3. **Completion**: `CompleteLedgerTransition` closes the transitioning ledger store, deletes its directory, sets `transitioningLedgerStore = nil`, and signals the condition variable.
+2. **Background flush**: A goroutine runs the following steps **in this exact order**:
+   1. Read 10K ledgers from the transitioning ledger store (sequential scan by `uint32BE` key)
+   2. Write `.data` + `.index` files
+   3. fsync both files
+   4. Write `lfs_done = "1"` to meta store (WAL-backed) — **MUST complete before step 5**
+   5. Close the transitioning ledger store and delete its directory
+   6. Set `transitioningLedgerStore = nil` and signal the condition variable — `waitForLedgerTransitionComplete()` unblocks HERE
+
+**Critical ordering invariant**: The `lfs_done` flag is the durability checkpoint; the nil-signal is just a notification. The flag MUST be durable in the meta store before the store reference is cleared and the completion signal fires. If the goroutine clears the store reference before persisting the flag, `waitForLedgerTransitionComplete()` unblocks prematurely. A crash in this window would leave the flag absent, causing the chunk to be re-ingested on recovery even though the LFS files were already written.
 
 ### Workflow Diagram
 
@@ -38,11 +45,12 @@ ledgerSeq == chunkLastLedger(currentChunk)
 flowchart TD
     CHUNK_HIT(["Chunk boundary hit<br/>(every 10K ledgers)"]) --> SWAP["SwapActiveLedgerStore(rangeID, chunkID+1)<br/>old store → transitioningLedgerStore<br/>new store opens for next chunk"]
     SWAP --> BG_START["Spawn background goroutine"]
-    BG_START --> READ["Read 10K ledgers from<br/>transitioning ledger store<br/>(sequential scan by uint32BE key)"]
-    READ --> WRITE_LFS["Write LFS chunk files:<br/>{chunkID:06d}.data + .index<br/>zstd-compressed LCM records + offset table<br/>fsync"]
-    WRITE_LFS --> SET_FLAG["Set range:N:chunk:{C:06d}:lfs_done = 1"]
-    SET_FLAG --> COMPLETE_TX["CompleteLedgerTransition(chunkID)<br/>close transitioning store<br/>delete store directory<br/>set transitioningLedgerStore = nil<br/>signal condition variable"]
-    COMPLETE_TX --> DONE(["Chunk transition complete"])
+    BG_START --> READ["1. Read 10K ledgers from<br/>transitioning ledger store<br/>(sequential scan by uint32BE key)"]
+    READ --> WRITE_LFS["2-3. Write LFS chunk files:<br/>{chunkID:06d}.data + .index<br/>zstd-compressed LCM records + offset table<br/>fsync both files"]
+    WRITE_LFS --> SET_FLAG["4. Set range:N:chunk:{C:06d}:lfs_done = 1<br/>(WAL-backed — MUST be durable before step 5)"]
+    SET_FLAG --> CLOSE_STORE["5. Close transitioning store<br/>delete store directory"]
+    CLOSE_STORE --> NIL_SIGNAL["6. Set transitioningLedgerStore = nil<br/>signal condition variable<br/>(waitForLedgerTransitionComplete unblocks HERE)"]
+    NIL_SIGNAL --> DONE(["Chunk transition complete"])
 ```
 
 ### Query Routing During Ledger Transition
@@ -57,7 +65,7 @@ While the ledger sub-flow transition is in progress:
 - `.data` file: contiguous compressed LCM records (variable-length)
 - `.index` file: offset table, one `uint64` per ledger, enabling O(1) random access
 
-**Flush/fsync**: Each chunk file pair is fsynced before setting `lfs_done`. Partial writes are safe — the `lfs_done` flag is the sole indicator of completion.
+**Flush/fsync**: Each chunk file pair is fsynced before setting `lfs_done`. Partial writes are safe — the `lfs_done` flag is the sole indicator of completion. The flag must be persisted to the meta store BEFORE the transitioning store reference is cleared (see goroutine ordering above).
 
 ---
 
@@ -78,8 +86,8 @@ At the range boundary, the system **must wait** for the last ledger sub-flow tra
 **The invariant**: At any transition cadence, all sub-flows with a LOWER cadence must have completed their last transition before the higher-cadence transition proceeds.
 
 **Steps before txhash promotion**:
-1. Call `waitForLedgerTransitionComplete()` — block until `transitioningLedgerStore == nil` (last chunk's LFS flush goroutine has called `CompleteLedgerTransition` and finished)
-2. Verify all 1,000 `lfs_done` flags for the range are set (safety check — they were all set during ACTIVE at their individual chunk boundaries)
+1. Call `waitForLedgerTransitionComplete()` — block until `transitioningLedgerStore == nil`. Because the LFS flush goroutine persists `lfs_done` BEFORE setting nil (see goroutine ordering above), all flags are guaranteed durable by the time this unblocks.
+2. Verify all 1,000 `lfs_done` flags for the range are set (safety check — all guaranteed durable by the ordering invariant, but verified explicitly as a defense-in-depth assertion)
 3. Only then promote the txhash store and begin RecSplit
 
 ### Workflow
@@ -87,24 +95,41 @@ At the range boundary, the system **must wait** for the last ledger sub-flow tra
 At trigger:
 1. `waitForLedgerTransitionComplete()` — ensure last chunk's ledger transition is done
 2. Verify all 1,000 `lfs_done` flags for the range
-3. Set `range:N:state` to `TRANSITIONING`
-4. `PromoteToTransitioning(N)` — moves **only the txhash store** to `transitioningTxHashStore` (no ledger store involved — all ledger stores were already transitioned at their chunk boundaries and deleted)
-5. Create new active stores for range N+1 (new ledger store + new txhash store)
-6. Set `range:N+1:state` to `ACTIVE`
-7. Ingestion of range N+1 starts immediately
-8. Background goroutine spawned for RecSplit build from transitioning txhash store
+3. `PromoteToTransitioning(N)` — moves **only the txhash store** to `transitioningTxHashStore` (no ledger store involved — all ledger stores were already transitioned at their chunk boundaries and deleted)
+4. Create new active stores for range N+1 (new ledger store + new txhash store)
+5. Atomic WriteBatch: set `range:N:state` to `TRANSITIONING` and `range:N+1:state` to `ACTIVE` in a single meta store WriteBatch (see below)
+6. Ingestion of range N+1 starts immediately
+7. Background goroutine spawned for RecSplit build from transitioning txhash store
+
+### Atomic Range Boundary WriteBatch
+
+At the range boundary, the meta store state transitions MUST be written in a single atomic WriteBatch:
+
+```go
+// Physical operations first (all idempotent):
+PromoteToTransitioning(N)        // move txhash store — no-op if already moved
+CreateActiveStores(N+1)          // create directories — no-op if already exist
+
+// Then atomic state update:
+batch := metaStore.NewWriteBatch()
+batch.Put("range:{N:04d}:state", "TRANSITIONING")
+batch.Put("range:{N+1:04d}:state", "ACTIVE")
+batch.Write()  // single WAL fsync — atomic
+```
+
+Physical operations (file moves, directory creation) are idempotent — repeating them after a crash is safe. The WriteBatch ensures both range states transition atomically. A crash before the WriteBatch leaves both ranges in their previous states; a crash after leaves both in their new states. There is no intermediate state where one range has transitioned but the other has not.
 
 ### Workflow Diagram
 
 ```mermaid
 flowchart TD
-    RANGE_HIT(["Range boundary hit<br/>(every 10M ledgers)"]) --> WAIT["waitForLedgerTransitionComplete()<br/>block until transitioningLedgerStore == nil"]
-    WAIT --> VERIFY_LFS["Verify all 1,000 lfs_done flags<br/>for range N are set<br/>(safety check — all set during ACTIVE)"]
-    VERIFY_LFS --> SET_TRANS["range:N:state = TRANSITIONING"]
-    SET_TRANS --> PROMOTE["PromoteToTransitioning(N)<br/>moves ONLY txhash store →<br/>transitioningTxHashStore<br/>(no ledger store — already gone)"]
-    PROMOTE --> NEW_STORES["Create new active stores for range N+1<br/>new ledger-store-chunk + new txhash-store-range<br/>range:N+1:state = ACTIVE"]
-    NEW_STORES --> RESUME["Resume ingestion on range N+1"]
-    NEW_STORES --> BG_RS["Spawn background goroutine:<br/>RecSplit build from<br/>transitioning txhash store"]
+    RANGE_HIT(["Range boundary hit<br/>(every 10M ledgers)"]) --> WAIT["waitForLedgerTransitionComplete()<br/>block until transitioningLedgerStore == nil<br/>(lfs_done already durable — goroutine<br/>persists flag BEFORE clearing nil)"]
+    WAIT --> VERIFY_LFS["Verify all 1,000 lfs_done flags<br/>for range N are set<br/>(defense-in-depth assertion)"]
+    VERIFY_LFS --> PROMOTE["PromoteToTransitioning(N)<br/>moves ONLY txhash store →<br/>transitioningTxHashStore<br/>(no ledger store — already gone)<br/>(idempotent — no-op if already moved)"]
+    PROMOTE --> NEW_STORES["CreateActiveStores(N+1)<br/>new ledger-store-chunk + new txhash-store-range<br/>(idempotent — no-op if already exist)"]
+    NEW_STORES --> ATOMIC_BATCH["Atomic WriteBatch:<br/>range:N:state = TRANSITIONING<br/>range:N+1:state = ACTIVE<br/>(single WAL fsync)"]
+    ATOMIC_BATCH --> RESUME["Resume ingestion on range N+1"]
+    ATOMIC_BATCH --> BG_RS["Spawn background goroutine:<br/>RecSplit build from<br/>transitioning txhash store"]
 
     BG_RS --> SET_RS["range:N:recsplit:state = BUILDING"]
     SET_RS --> SPAWN_CFS["Spawn 16 goroutines (one per CF: 0..f)<br/>all goroutines run concurrently"]
@@ -154,12 +179,12 @@ The transitioning RocksDB store is read-only during RecSplit build (ingestion ha
 
 ## Verification Step
 
-Before deleting the transitioning txhash store, the workflow performs a spot-check:
+Before deleting the transitioning txhash store, the workflow performs a spot-check. This verification runs inline in the transition goroutine (not tracked in the meta store).
 
-1. Sample 100 random ledger sequence numbers from range N
-2. Read each from the new LFS chunk file → compare against a reference (the LFS files were written during ACTIVE at each chunk boundary)
-3. Sample 100 random txhashes from range N
-4. Look up each in the RecSplit index → verify by fetching the ledger from LFS and confirming presence
+1. **Minimum 1 ledger per chunk** (1,000 samples minimum for a 1,000-chunk range): sample at least one random ledger sequence number from each of the 1,000 chunks in range N. Read each from the LFS chunk file, verify contents match expected data.
+2. **Minimum 1 txhash per chunk** (1,000 samples minimum): sample at least one random txhash from each of the 1,000 chunks in range N. Look up each in the RecSplit index, verify by fetching the ledger from LFS and confirming presence.
+
+**Rationale**: 100 random samples out of ~3 billion transactions gives only 0.000003% coverage — far too sparse to catch systematic per-chunk corruption. With 1 sample per chunk (1,000 samples), every chunk is verified at least once, guaranteeing that per-chunk corruption is caught. 1,000 lookups complete in seconds, not minutes, so the cost is negligible.
 
 If any mismatch is detected: ABORT; do not delete transitioning txhash store; log error; set range to error state.
 
@@ -171,7 +196,8 @@ If any mismatch is detected: ABORT; do not delete transitioning txhash store; lo
 
 ```
 Chunk 0 completes (ledger 10,001):
-  range:0000:chunk:000000:lfs_done     →  "1"   (set by background LFS flush goroutine)
+  range:0000:chunk:000000:lfs_done     →  "1"   (set by background LFS flush goroutine
+                                                   BEFORE transitioningLedgerStore = nil)
 
 Chunk 1 completes (ledger 20,001):
   range:0000:chunk:000001:lfs_done     →  "1"
@@ -179,7 +205,8 @@ Chunk 1 completes (ledger 20,001):
   ... (each chunk transitions independently at its boundary) ...
 
 Chunk 999 completes (ledger 10,000,001):
-  range:0000:chunk:000999:lfs_done     →  "1"   (last chunk — set just before range boundary)
+  range:0000:chunk:000999:lfs_done     →  "1"   (last chunk — flag durable before nil-signal
+                                                   unblocks waitForLedgerTransitionComplete)
 ```
 
 ### At range boundary (range 0 → range 1):
@@ -189,9 +216,14 @@ Range boundary hit (ledger 10,000,001):
   waitForLedgerTransitionComplete()     ← block until chunk 999's LFS flush done
   Verify all 1,000 lfs_done flags       ← safety check
 
-  range:0000:state                     →  "TRANSITIONING"
+  PromoteToTransitioning(0)             ← move txhash store (idempotent)
+  CreateActiveStores(1)                 ← create directories (idempotent)
+
+  Atomic WriteBatch:
+    range:0000:state                   →  "TRANSITIONING"  \
+    range:0001:state                   →  "ACTIVE"         / single WAL fsync (atomic WriteBatch)
+
   streaming:last_committed_ledger      →  10,000,001
-  range:0001:state                     →  "ACTIVE"
 
 RecSplit build (from transitioning txhash store):
   range:0000:recsplit:state            →  "BUILDING"
@@ -216,9 +248,14 @@ During ACTIVE:
 At range boundary (ledger 50,000,001):
   waitForLedgerTransitionComplete()
   Verify all 1,000 lfs_done flags
-  range:0005:state                     →  "TRANSITIONING"
+  PromoteToTransitioning(5)             ← idempotent
+  CreateActiveStores(6)                 ← idempotent
+
+  Atomic WriteBatch:
+    range:0005:state                   →  "TRANSITIONING"  \
+    range:0006:state                   →  "ACTIVE"         / single WAL fsync (atomic WriteBatch)
+
   streaming:last_committed_ledger      →  50,000,001
-  range:0006:state                     →  "ACTIVE"
 
 RecSplit:
   range:0005:recsplit:state            →  "BUILDING"
@@ -240,7 +277,7 @@ If the daemon crashes while the background LFS flush goroutine is running for a 
 
 1. On restart: the transitioning ledger store is gone (crash cleared it), but the active ledger store is intact via WAL recovery
 2. `streaming:last_committed_ledger` tells us where we were
-3. The chunk's `lfs_done` flag is absent (fsync didn't complete or flag wasn't set)
+3. The chunk's `lfs_done` flag is absent (fsync didn't complete or flag wasn't set). Because the goroutine enforces `lfs_done` persistence BEFORE clearing `transitioningLedgerStore = nil`, a crash at any point before the flag is durable means the flag is absent — there is no window where the flag is missing but the nil-signal already fired.
 4. Recovery: re-ingest from `last_committed_ledger + 1` — the chunk boundary will be hit again, triggering a new LFS flush
 
 ### Crash During Range-Boundary Coordination
@@ -252,10 +289,10 @@ The range boundary ledger has been committed to the txhash store, but the last c
 - State: `range:N:state = "ACTIVE"`, `transitioningLedgerStore != nil` (cleared by crash), chunk 999's `lfs_done` absent
 - Recovery: resume streaming from `last_committed_ledger + 1`. Since the last committed ledger IS the range boundary ledger, the system re-enters range boundary handling. `waitForLedgerTransitionComplete` returns immediately (no transitioning store after crash). The `lfs_done` scan finds chunk 999 absent — recovery must re-trigger the chunk 999 LFS flush from the WAL-recovered ledger store before proceeding with the txhash transition.
 
-**SC2: Crash after all lfs_done verified, before TRANSITIONING written**
+**SC2: Crash after all lfs_done verified, before WriteBatch**
 
-- State: all 1,000 `lfs_done` flags = `"1"`, `range:N:state = "ACTIVE"`, `streaming:last_committed_ledger` = range boundary ledger
-- Recovery: re-enter range boundary handling. `waitForLedgerTransitionComplete` returns immediately. `lfs_done` scan passes. Write `TRANSITIONING`, promote txhash store, spawn RecSplit goroutine — proceeds normally.
+- State: all 1,000 `lfs_done` flags = `"1"`, `range:N:state = "ACTIVE"`, `range:N+1:state` absent, `streaming:last_committed_ledger` = range boundary ledger. Physical operations (PromoteToTransitioning, CreateActiveStores) may or may not have completed.
+- Recovery: re-enter range boundary handling. `waitForLedgerTransitionComplete` returns immediately. `lfs_done` scan passes. Redo physical operations (idempotent no-ops if already done). Write the atomic WriteBatch (TRANSITIONING + ACTIVE). Spawn RecSplit goroutine — proceeds normally.
 
 ### Crash During TxHash Sub-flow Transition (RecSplit Build)
 

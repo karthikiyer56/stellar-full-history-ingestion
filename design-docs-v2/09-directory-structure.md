@@ -100,6 +100,7 @@ The tree below shows a **streaming snapshot at the range 5→6 boundary**: range
 - The TRANSITIONING txhash-store-range-NNNN is deleted in-place once RecSplit build and verification pass via `RemoveTransitioningTxHashStore` — it is never moved or renamed. Ledger stores are deleted at each chunk boundary via `CompleteLedgerTransition` after the LFS flush completes.
 - `immutable/txhash/{rangeID:04d}/raw/` exists **only during backfill ingestion** (state `INGESTING` or `RECSPLIT_BUILDING`). It is deleted immediately after all 16 RecSplit CFs for that range are built and verified. A COMPLETE range has no `raw/` directory — only `index/`.
 - **Streaming mode never creates `raw/`**. RecSplit is built directly from the active txhash store (reading each of its 16 CFs by nibble); no flat files are written to disk.
+- **Directory creation**: All immutable parent directories (`immutable/ledgers/chunks/{XXXX}/`, `immutable/txhash/{XXXX}/raw/`, `immutable/txhash/{XXXX}/index/`) are created on-demand via `os.MkdirAll` (equivalent to `mkdir -p`) before the first file write to that path. This is safe for concurrent BSB instances writing to different chunk files within the same range directory — `MkdirAll` is a no-op if the directory already exists and does not race with concurrent calls for the same path. Active store directories (`ledger-store-chunk-*`, `txhash-store-range-*`) are created automatically by RocksDB when the store is opened.
 
 ---
 

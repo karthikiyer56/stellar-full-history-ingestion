@@ -15,7 +15,7 @@ Streaming mode is a long-running daemon. It never exits unless there is a fatal 
 3. **WAL enabled** — both active RocksDB stores (ledger and txhash) must have WAL on; crash recovery depends on it.
 4. **Background LFS flush at chunk boundary** — while ACTIVE, completed 10K-ledger chunks are flushed from the ledger store → LFS chunk files in a background goroutine. Range state stays `ACTIVE` throughout.
 5. **Transition in background at range boundary** — when range N completes (last ledger committed), the system waits for the last chunk's ledger sub-flow transition to finish, then a goroutine handles the RecSplit txhash index build. Ingestion of range N+1 starts immediately.
-6. **Gap detection at startup** — all ranges before the current streaming range must be `COMPLETE`.
+6. **Gap detection at startup** — all ranges before the current streaming range must be `COMPLETE` or in a recoverable transition state (`TRANSITIONING` or `RECSPLIT_BUILDING`).
 
 ---
 
@@ -69,14 +69,29 @@ flowchart TD
     B -->|yes| D["resume_ledger = last_committed + 1"]
     D --> E["current_range = ledgerToRangeID(resume_ledger)"]
     E --> F["Check all ranges 0..current_range-1"]
-    F --> G{all COMPLETE?}
-    G -->|no| H["ABORT: gap detected<br/>log missing range IDs, exit with error"]
-    G -->|yes| I["range:current_range:state = ACTIVE (if not set)"]
-    I --> J["Begin CaptiveStellarCore from resume_ledger"]
+    F --> G{"each range state?"}
+    G -->|COMPLETE| I["OK — skip"]
+    G -->|"TRANSITIONING or<br/>RECSPLIT_BUILDING"| RESUME["Resume transition workflow:<br/>spawn RecSplit build goroutine<br/>for that range"]
+    G -->|"INGESTING or ACTIVE<br/>or absent"| H["ABORT: gap detected<br/>log range ID + state, exit with error"]
+    I --> K{"all prior ranges<br/>checked?"}
+    RESUME --> K
+    K -->|no| F
+    K -->|yes| L["range:current_range:state = ACTIVE (if not set)"]
+    L --> J["Begin CaptiveStellarCore from resume_ledger"]
     C --> J
 ```
 
-**Gap detection invariant**: Every range before the current streaming range must be `COMPLETE`. If any prior range is not `COMPLETE`, the service exits. This prevents querying a range that has not been fully transitioned.
+**Gap detection invariant**: Every range before the current streaming range must be either `COMPLETE` or in a **recoverable transition state** (`TRANSITIONING` or `RECSPLIT_BUILDING`).
+
+- **COMPLETE**: No action needed — the range is fully transitioned to immutable stores.
+- **TRANSITIONING** or **RECSPLIT_BUILDING**: The system resumes the transition workflow for that range (spawns the RecSplit build goroutine or resumes it) before starting streaming ingestion for the current range. This handles the case where a previous streaming daemon crashed mid-transition.
+- **INGESTING**, **ACTIVE**, or **absent**: This indicates a gap — the range was never fully ingested or its state is missing. The service aborts with a clear error message listing the offending range IDs and their states.
+
+> **Operational continuity — crash recovery for operators**
+>
+> If the streaming daemon crashes, the operator restarts with the exact same configuration (including `--mode streaming`). The startup validation detects any prior ranges that were mid-transition and resumes them automatically. The operator does NOT need to switch back to `--mode backfill` to complete a transition that was in progress during streaming.
+>
+> Similarly, if backfill mode crashes, the operator restarts with the exact same command and configuration (including `--mode backfill`). The orchestrator scans chunk flags and resumes from the first incomplete chunk.
 
 ---
 
@@ -141,6 +156,8 @@ After ledger L is committed to both active RocksDB stores (WriteBatch + WAL flus
 ```
 
 On crash, resume from `last_committed_ledger + 1`. Re-ingested ledgers are idempotent (same key/value pairs overwrite existing entries).
+
+> **INVARIANT — Checkpoint Write Ordering**: `streaming:last_committed_ledger` MUST be written to the meta store ONLY after both the ledger store WriteBatch and the txhash store WriteBatch have succeeded. Violating this order causes silent data loss on crash recovery — the checkpoint would advance past ledgers that were never persisted to one or both stores. This ordering, combined with the idempotency of re-inserting the same `ledgerSeq → LCM` data on recovery, is the sole mechanism that provides cross-store consistency. No cross-store atomic transactions are needed.
 
 | Mode | Checkpoint interval | Resume from |
 |------|--------------------|-----------  |

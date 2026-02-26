@@ -23,6 +23,18 @@ This workflow has **no analog in the streaming transition**. There is no active 
 
 ---
 
+## Pre-RecSplit Barrier
+
+After the trigger condition is satisfied, the orchestrator **MUST** enforce a synchronization barrier before spawning any RecSplit CF goroutines:
+
+1. **Wait for all BSB goroutines to fully exit** — call `WaitForAllBSBInstances()` (or equivalent join/WaitGroup). Merely observing that `allChunksDoneForRange()` returns true is insufficient; the BSB goroutines that *set* those flags may still be running teardown logic (flushing buffers, closing files, writing trailing bytes).
+2. **Verify all file handles to raw txhash flat files are closed** — BSB instances must have released every file descriptor on `immutable/txhash/{rangeID:04d}/raw/*.bin` before proceeding. The raw txhash flat files must be in a **read-only, quiescent state** when RecSplit goroutines begin scanning them.
+3. **Only then proceed** to set `range:N:state = RECSPLIT_BUILDING` and spawn the 16 RecSplit CF goroutines.
+
+This barrier prevents a race condition where a stray BSB instance still executing teardown could write to (or hold an open fd on) a raw txhash flat file while a RecSplit CF goroutine is concurrently reading from it. Without the barrier, the RecSplit goroutine could read a partially-written trailing entry (< 36 bytes) or encounter inconsistent data.
+
+---
+
 ## Workflow Diagram
 
 ```mermaid

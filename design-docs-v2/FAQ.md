@@ -25,6 +25,8 @@
 | How much RAM does backfill use? | TBD — not yet profiled end-to-end; see memory budget section | [12](./12-metrics-and-sizing.md#memory-budget--backfill-bsb-mode) |
 | Why flush every ~100 ledgers? | Caps per-chunk RAM to <300KB regardless of throughput | [03](./03-backfill-workflow.md#memory-budget) |
 | Are range boundaries inclusive? | Yes — both ends inclusive; no gaps, no overlaps | [11](./11-checkpointing-and-transitions.md#range-boundary-formulas) |
+| What happens on crash mid-RecSplit? | Re-run same command; scans 16 CF done flags, skips built CFs, rebuilds the rest from raw flat files | [07](./07-crash-recovery.md#scenario-b3-crash-mid-recsplit-build) |
+| Can two processes use the same data_dir? | No — RocksDB flock prevents it | [07](./07-crash-recovery.md#concurrent-access-prevention) |
 
 ---
 
@@ -44,9 +46,12 @@ A BSB (BufferedStorageBackend) instance is one concurrent worker assigned a cont
 
 ### Q: What are the valid values for `num_bsb_instances_per_range`?
 
-Only `10` or `20`. Both produce BSB instance sizes that are exact multiples of the 10K chunk size:
+Any positive integer that divides 1,000 evenly (`1000 % value == 0`). Default: `20`. Common values: 5, 10, 20, 25, 50. All produce BSB instance sizes that are exact multiples of the 10K chunk size:
+- `50` → 200K ledgers per BSB instance (20 chunks/instance)
+- `25` → 400K ledgers per BSB instance (40 chunks/instance)
 - `20` → 500K ledgers per BSB instance (50 chunks/instance)
 - `10` → 1M ledgers per BSB instance (100 chunks/instance)
+- `5` → 2M ledgers per BSB instance (200 chunks/instance)
 
 All instances within a range start simultaneously and run concurrently. See [10-configuration.md — backfill.bsb](./10-configuration.md#backfillbsb).
 
@@ -96,6 +101,18 @@ No. Because BSB instances run in parallel, completed chunks at crash time are no
 
 ---
 
+### Q: What happens if backfill crashes mid-RecSplit build?
+
+Re-run the same command. The RecSplit recovery scans all 16 CF done flags. Any CF whose flag is set is skipped. Any CF whose flag is absent has its partial `.idx` file deleted and rebuilt from the raw txhash flat files (which are retained until all 16 CFs complete). Raw files are never deleted until the range reaches COMPLETE. See [07-crash-recovery.md — Scenario B3](./07-crash-recovery.md#scenario-b3-crash-mid-recsplit-build).
+
+---
+
+### Q: What is the minimum disk space required for backfill?
+
+For a single range (10M ledgers): ~1.5 TB for LFS chunks + ~120 GB for raw txhash flat files + ~15 GB for RecSplit indexes + meta store overhead. With `parallel_ranges=2`, double the active storage. Raw txhash files are deleted after RecSplit completes, so peak usage is during RECSPLIT_BUILDING. See [12-metrics-and-sizing.md — Storage Estimates](./12-metrics-and-sizing.md#storage-estimates).
+
+---
+
 ## Streaming Mode
 
 ### Q: What checkpoint granularity does streaming use?
@@ -119,6 +136,26 @@ No. Streaming mode builds RecSplit directly from the active txhash store (16 CFs
 ### Q: What validates that there are no ledger gaps before streaming starts?
 
 At startup in streaming mode, the service reads the meta store and verifies that all ranges preceding the start range are in `COMPLETE` state. Any range in a non-COMPLETE state causes a fatal startup error. See [04-streaming-workflow.md](./04-streaming-workflow.md).
+
+---
+
+## Crash Recovery
+
+### Q: What does startup reconciliation do?
+
+On every startup, before any ingestion begins, the system compares on-disk artifacts against meta store state. It deletes orphaned files from previous crashes (e.g., raw txhash files left after a range completed, orphaned transitioning stores). This runs once, is synchronous, and typically completes in under a second. See [07-crash-recovery.md — Startup Reconciliation](./07-crash-recovery.md#startup-reconciliation).
+
+---
+
+### Q: How do I know if something went wrong during crash recovery?
+
+The startup reconciliation pass logs all cleanup actions at WARN level. Look for log entries mentioning "orphaned", "deleting", or "FATAL". A FATAL log means unrecoverable inconsistency (e.g., a transitioning range whose input store is missing) — this requires operator investigation. Normal recovery (chunk rewrites, RecSplit CF rebuilds) logs at INFO level.
+
+---
+
+### Q: Can two processes accidentally run on the same data directory?
+
+No. The meta store RocksDB instance uses kernel-level `flock()` on a LOCK file. Any second process attempting to open the same data directory will fail immediately. This lock is automatically released on process exit, including `kill -9`. No manual cleanup is ever required. See [07-crash-recovery.md — Concurrent Access Prevention](./07-crash-recovery.md#concurrent-access-prevention).
 
 ---
 
@@ -201,7 +238,7 @@ No. The v2 design eliminates it. The RocksDB active store stays at `<active_stor
 
 ### Q: What TOML key controls BSB instance count?
 
-`[backfill.bsb].num_bsb_instances_per_range`. Valid values: `10` or `20`. Default: `20`. `[backfill.bsb]` and `[backfill.captive_core]` are mutually exclusive — exactly one must be present. See [10-configuration.md](./10-configuration.md#backfillbsb).
+`[backfill.bsb].num_bsb_instances_per_range`. Valid values: any positive integer that divides 1,000 evenly (`1000 % value == 0`). Default: `20`. `[backfill.bsb]` and `[backfill.captive_core]` are mutually exclusive — exactly one must be present. See [10-configuration.md](./10-configuration.md#backfillbsb).
 
 ---
 

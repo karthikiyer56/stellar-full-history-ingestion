@@ -176,13 +176,42 @@ Erigon, the most widely deployed Ethereum archive node, **fully supports transac
 
 ---
 
+## OQ-4: Streaming Backpressure and Drift Detection
+
+### Context
+
+In streaming mode, the daemon ingests ledgers from CaptiveStellarCore at the network's production rate (~1 ledger every 5-6 seconds). If downstream writes slow down (e.g., disk I/O bottleneck, RocksDB compaction stalls), the ingestion pipeline backpressures and the gap between the last committed ledger and the network tip grows.
+
+Currently, the design has **no mechanism** to detect, alert on, or respond to this drift.
+
+### What's TBD
+
+1. **Drift detection**: Should the daemon monitor the gap between `streaming:last_committed_ledger` and the network's current ledger? If so, how is the network tip obtained — from CaptiveStellarCore metadata, or an external source?
+
+2. **Alerting threshold**: Should there be a configurable `max_streaming_drift_ledgers` threshold that triggers a warning or error when exceeded? What's a reasonable default (e.g., 1,000 ledgers ≈ ~1.5 hours)?
+
+3. **Response strategy**: When drift exceeds the threshold, should the daemon:
+   - Log a warning and continue (operator monitors externally)?
+   - Expose a health endpoint that reports unhealthy (for orchestration systems like Kubernetes)?
+   - Pause ingestion and wait for writes to catch up?
+   - Abort and require operator intervention?
+
+4. **Metrics exposure**: Should drift, write latency, and ingestion rate be exposed as Prometheus metrics for external monitoring?
+
+### Design Principle
+
+The streaming pipeline is currently "fire and forget" — it processes ledgers as fast as CaptiveStellarCore produces them with no feedback loop. Adding drift detection and backpressure would make the system self-aware of its own health, but increases complexity.
+
+---
+
 ## Related Documents
 
 - [02-meta-store-design.md](./02-meta-store-design.md) — current key hierarchy and getEvents placeholder
 - [03-backfill-workflow.md](./03-backfill-workflow.md) — backfill ingestion and getEvents placeholder
-- [04-streaming-workflow.md](./04-streaming-workflow.md) — streaming ingestion and getEvents placeholder
+- [04-streaming-workflow.md](./04-streaming-workflow.md) — streaming ingestion, getEvents placeholder, and backpressure/drift context (OQ-4)
 - [05-backfill-transition-workflow.md](./05-backfill-transition-workflow.md) — backfill transition and getEvents placeholder
 - [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) — streaming transition and getEvents placeholder
 - [07-crash-recovery.md](./07-crash-recovery.md) — crash recovery and getEvents placeholder
 - [01-architecture-overview.md](./01-architecture-overview.md) — two-pipeline design and getEvents placeholder
 - [10-configuration.md](./10-configuration.md) — current TOML reference
+- [12-metrics-and-sizing.md](./12-metrics-and-sizing.md) — metrics, sizing, and monitoring reference (OQ-4)

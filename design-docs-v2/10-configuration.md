@@ -68,15 +68,25 @@ Cannot be combined with `[backfill.captive_core]`.
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
 | `bucket_path` | string | **Required** | — | GCS or S3 path, e.g. `"gs://stellar-ledgers/mainnet"` |
-| `num_bsb_instances_per_range` | int | Optional | `20` | BSB instances per range orchestrator. Valid values: `10` or `20`. All instances run in parallel within a range. |
+| `num_bsb_instances_per_range` | int | Optional | `20` | BSB instances per range orchestrator. Valid values: any positive integer that divides 1000 evenly (`1000 % value == 0`). All instances run in parallel within a range. |
 | `buffer_size` | int | Optional | `1000` | BSB internal ledger prefetch depth per BSB instance. |
 | `num_workers` | int | Optional | `20` | BSB internal download worker count per BSB instance. |
 
 **`num_bsb_instances_per_range` constraints**:
-- `20` (default) → each BSB instance spans 500K ledgers (50 chunks per instance)
-- `10` → each BSB instance spans 1M ledgers (100 chunks per instance)
-- Both values are exact multiples of the 10K chunk size
+- Must be a positive integer that divides 1000 evenly (`1000 % num_bsb_instances_per_range == 0`)
+- Startup validation: if `1000 % num_bsb_instances_per_range != 0`, reject with error: `"num_bsb_instances_per_range must be a divisor of 1000 so each instance processes complete 10K-ledger chunks"`
+- The constraint ensures each BSB instance processes a whole number of chunks (10K ledgers each). With 1,000 chunks per range, the number of instances must divide evenly into 1,000.
 - All instances within a range run concurrently — expect non-contiguous chunk completion on crash
+
+| `num_bsb_instances` | Chunks per instance | Ledgers per instance |
+|----------------------|---------------------|----------------------|
+| 5                    | 200                 | 2,000,000            |
+| 10                   | 100                 | 1,000,000            |
+| 20                   | 50                  | 500,000              |
+| 25                   | 40                  | 400,000              |
+| 50                   | 20                  | 200,000              |
+
+> **Note**: Higher instance counts increase parallelism but also increase memory usage and file descriptor pressure. 10–25 instances is recommended for most hardware configurations.
 
 ---
 
@@ -126,7 +136,7 @@ Shared RocksDB tuning. Applied to meta store and active store (streaming).
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
-| `block_cache_mb` | int | Optional | `8192` | Shared block cache in MB |
+| `block_cache_mb` | int | Optional | `8192` | Shared block cache in MB. **Streaming-only** — has no meaningful effect in backfill mode (backfill writes flat files; only the tiny meta store uses RocksDB). |
 | `write_buffer_mb` | int | Optional | `64` | Write buffer per column family in MB |
 | `max_write_buffer_number` | int | Optional | `2` | Max memtables per CF before stall |
 
@@ -183,15 +193,14 @@ end_ledger      = 30000001       # required — must be a valid range end (10000
 
 [backfill.bsb]
 bucket_path   = "gs://stellar-ledgers/mainnet"  # required
-# num_bsb_instances_per_range = 20             # optional — defaults to 20; valid values: 10 or 20
+# num_bsb_instances_per_range = 20             # optional — defaults to 20; must be a divisor of 1000
 # buffer_size   = 1000           # optional — defaults to 1000
 # num_workers   = 20             # optional — defaults to 20
 
-[rocksdb]
-# All fields optional; shown here with non-default values for backfill (lower cache is fine)
-block_cache_mb = 4096            # optional — defaults to 8192; 4096 is sufficient for backfill
-# write_buffer_mb         = 64   # optional — defaults to 64
-# max_write_buffer_number = 2    # optional — defaults to 2
+# [rocksdb]
+# block_cache_mb has no meaningful effect in backfill mode (backfill writes flat files,
+# not RocksDB data stores). Only the tiny meta store uses RocksDB during backfill.
+# write_buffer_mb and max_write_buffer_number may be left at defaults.
 ```
 
 **Run**: `ingestion-workflow --config config.toml --mode backfill`

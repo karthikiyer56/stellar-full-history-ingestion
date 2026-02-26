@@ -31,6 +31,164 @@ Crash recovery semantics differ between backfill and streaming modes. The meta s
 
 ---
 
+## Startup Reconciliation
+
+On every startup, before ingestion begins, the system performs a one-time reconciliation pass that compares on-disk artifacts against meta store state. This handles orphaned files and stores left behind by previous crashes — for example, a crash that set `range:N:state = "COMPLETE"` but died before deleting the transitioning txhash store, or a crash that left partial RocksDB store directories for a range that was never recorded in the meta store.
+
+Startup reconciliation runs **after** the meta store is opened but **before** any ingestion goroutines (backfill orchestrators or streaming workers) are spawned. This ensures the data directory is in a clean, consistent state before work begins.
+
+---
+
+### Per-Range Reconciliation
+
+For each range that has a meta store entry (`range:{N:04d}:state` is present), the reconciliation pass checks on-disk artifacts against the expected state:
+
+| Range State | Reconciliation Action |
+|------------|----------------------|
+| **COMPLETE** | Delete any leftover raw txhash flat files (`immutable/txhash/{N:04d}/raw/`). Delete any orphaned transitioning store directories (`<active_stores_base_dir>/txhash-store-range-{N:04d}/`). These artifacts may persist if a previous run crashed after setting `COMPLETE` but before cleanup finished. The immutable LFS chunks and RecSplit index files are retained — they are the serving artifacts. |
+| **TRANSITIONING** / **RECSPLIT_BUILDING** | Verify the transitioning txhash store exists on disk (for streaming `TRANSITIONING`) or that all raw txhash flat files exist (for backfill `RECSPLIT_BUILDING`). If the required input data is absent, this is an unrecoverable inconsistency — abort startup with a fatal error and log the missing artifacts. If present, no cleanup is needed; the normal resume path (described in the crash scenarios below) handles the rest. |
+| **INGESTING** (backfill) | Normal resume: the chunk flag scan (Step 2 in the backfill resume algorithm) handles all cleanup. No special reconciliation action is needed beyond what the per-chunk rewrite logic already provides. |
+| **ACTIVE** (streaming) | Normal resume: re-ingest from `streaming:last_committed_ledger + 1`. No special cleanup needed — the active stores are recovered via RocksDB WAL replay. |
+
+---
+
+### Orphaned Artifacts (No Meta Store Entry)
+
+After per-range reconciliation, the system scans the data directory for store directories and file trees that have **no corresponding meta store entry**. These are artifacts from ranges that were never fully registered or whose meta store entries were lost:
+
+- **RocksDB store directories** (`<active_stores_base_dir>/ledger-store-chunk-*`, `<active_stores_base_dir>/txhash-store-range-*`) with no matching range in `ACTIVE`, `TRANSITIONING`, or `INGESTING` state → delete the directory and all contents.
+- **Raw txhash file directories** (`immutable/txhash/{N:04d}/raw/`) where `range:{N:04d}:state` is absent → delete the directory and all contents.
+- **LFS chunk file directories** (`immutable/ledgers/chunks/{N:04d}/`) where `range:{N:04d}:state` is absent → delete the directory and all contents.
+- **RecSplit index directories** (`immutable/txhash/{N:04d}/index/`) where `range:{N:04d}:state` is absent → delete the directory and all contents.
+
+All cleanup actions are logged at **WARN** level so operators can audit what was removed. Each log entry includes the artifact path, the expected range, and the reason for deletion (e.g., "no meta store entry for range 0003; deleting orphaned raw txhash directory").
+
+---
+
+### Ordering
+
+```mermaid
+flowchart TD
+    A[Process start] --> B[Open meta store\nRocksDB WAL replay]
+    B --> C[Startup reconciliation]
+    C --> C1[Per-range reconciliation\nfor each range with a meta store entry]
+    C --> C2[Orphaned artifact scan\nfor directories with no meta store entry]
+    C1 --> D[Spawn ingestion goroutines\nbackfill orchestrators / streaming workers]
+    C2 --> D
+```
+
+The reconciliation pass is **synchronous and blocking** — no ingestion work begins until it completes. This is acceptable because the pass is O(number of ranges) with lightweight filesystem checks, not O(ledgers). For a typical deployment with tens of ranges, the pass completes in under a second.
+
+---
+
+### Pseudo-Code
+
+```go
+func startupReconciliation(metaStore *MetaStore, dataDir string, cfg Config) error {
+    // Phase 1: Per-range reconciliation
+    // Scan meta store for all range entries
+    for rangeID := range metaStore.AllRanges() {
+        state := metaStore.Get(fmt.Sprintf("range:%04d:state", rangeID))
+
+        switch state {
+        case "COMPLETE":
+            // Delete leftover raw txhash files (crash after COMPLETE but before cleanup)
+            rawDir := filepath.Join(cfg.ImmutableTxHashBase, fmt.Sprintf("%04d", rangeID), "raw")
+            if dirExists(rawDir) {
+                log.Warnf("range %04d is COMPLETE but raw/ still exists; deleting %s", rangeID, rawDir)
+                os.RemoveAll(rawDir)
+            }
+            // Delete orphaned transitioning txhash store
+            txhashStore := filepath.Join(cfg.ActiveStoresBase, fmt.Sprintf("txhash-store-range-%04d", rangeID))
+            if dirExists(txhashStore) {
+                log.Warnf("range %04d is COMPLETE but transitioning store still exists; deleting %s", rangeID, txhashStore)
+                os.RemoveAll(txhashStore)
+            }
+
+        case "TRANSITIONING", "RECSPLIT_BUILDING":
+            // Verify required input data exists
+            if state == "TRANSITIONING" {
+                txhashStore := filepath.Join(cfg.ActiveStoresBase, fmt.Sprintf("txhash-store-range-%04d", rangeID))
+                if !dirExists(txhashStore) {
+                    return fmt.Errorf("FATAL: range %04d is %s but transitioning txhash store missing at %s",
+                        rangeID, state, txhashStore)
+                }
+            }
+            if state == "RECSPLIT_BUILDING" {
+                rawDir := filepath.Join(cfg.ImmutableTxHashBase, fmt.Sprintf("%04d", rangeID), "raw")
+                if !dirExists(rawDir) {
+                    return fmt.Errorf("FATAL: range %04d is RECSPLIT_BUILDING but raw txhash dir missing at %s",
+                        rangeID, rawDir)
+                }
+            }
+            // No cleanup — normal resume path handles the rest
+
+        case "INGESTING":
+            // No special cleanup — chunk flag scan handles everything on resume
+
+        case "ACTIVE":
+            // No special cleanup — RocksDB WAL replay handles active store recovery
+        }
+    }
+
+    // Phase 2: Orphaned artifact scan
+    // Find directories on disk that have no meta store entry
+    knownRanges := metaStore.AllRangeIDs() // set of rangeIDs with state entries
+
+    // Scan active store directories
+    for _, entry := range listDirs(cfg.ActiveStoresBase) {
+        rangeID, ok := parseRangeFromStoreName(entry) // e.g., "txhash-store-range-0003" → 3
+        if !ok {
+            continue // not a recognized store directory
+        }
+        if !knownRanges.Contains(rangeID) && !isActiveOrTransitioning(metaStore, rangeID) {
+            log.Warnf("orphaned active store %s (no meta store entry for range %04d); deleting", entry, rangeID)
+            os.RemoveAll(filepath.Join(cfg.ActiveStoresBase, entry))
+        }
+    }
+
+    // Scan immutable txhash directories (raw/ and index/)
+    for _, entry := range listDirs(cfg.ImmutableTxHashBase) {
+        rangeID, ok := parseRangeID(entry) // e.g., "0003" → 3
+        if !ok {
+            continue
+        }
+        if !knownRanges.Contains(rangeID) {
+            log.Warnf("orphaned immutable txhash dir %s (no meta store entry for range %04d); deleting", entry, rangeID)
+            os.RemoveAll(filepath.Join(cfg.ImmutableTxHashBase, entry))
+        }
+    }
+
+    // Scan immutable ledger chunk directories
+    for _, entry := range listDirs(filepath.Join(cfg.ImmutableLedgersBase, "chunks")) {
+        rangeID, ok := parseRangeID(entry) // e.g., "0003" → 3
+        if !ok {
+            continue
+        }
+        if !knownRanges.Contains(rangeID) {
+            log.Warnf("orphaned immutable ledger dir %s (no meta store entry for range %04d); deleting", entry, rangeID)
+            os.RemoveAll(filepath.Join(cfg.ImmutableLedgersBase, "chunks", entry))
+        }
+    }
+
+    return nil
+}
+```
+
+---
+
+### Concurrent Access Prevention
+
+The meta store RocksDB instance enforces single-process access via the kernel-level `flock()` system call on a `LOCK` file in the database directory. This lock is:
+
+- **Automatic**: acquired when the meta store is opened, released when it is closed
+- **Kernel-managed**: released automatically on process exit, including `kill -9`, OOM kill, or segfault — no stale lock files are ever left behind
+- **Cross-process**: any second process attempting to open the same meta store will fail immediately with a lock error
+
+No custom file locking, PID files, or application-level lock management is required. The implementation should wrap the RocksDB lock error with a clear message: _"Another process is already using this data_dir. Only one ingestion process may operate on a data directory at a time."_
+
+---
+
 ## Backfill Crash Scenarios
 
 > All scenarios use `--start-ledger 2 --end-ledger 10,000,001` (range 0) with `num_bsb_instances_per_range=20` unless stated otherwise.
@@ -99,6 +257,15 @@ On restart:
   Scan per-CF done flags:
     CFs 0, 1 → skip (index files on disk, flags set)
     CF 2–15  → rebuild from raw txhash flat files (still present on disk)
+
+  On crash recovery, if a RecSplit CF done flag (range:{N:04d}:recsplit:cf:{XX}:done) is
+  absent, the corresponding cf-{XX}.idx file MUST be deleted before rebuilding. Partial
+  index files are never reused — they are always deleted and recreated from scratch.
+  This prevents corrupted partial indexes from being extended rather than replaced.
+
+  Example: cf-02.idx may exist on disk as a partial file (crash during write).
+  The absent done flag for CF 02 triggers: delete cf-02.idx → rebuild from raw flat files
+  → fsync → set recsplit:cf:02:done="1". The file is never opened for append or inspection.
 
 Cost: 14 out of 16 CFs redone.
 ```
@@ -1031,26 +1198,46 @@ On restart:
     4. After chunk 999 flush completes and lfs_done is set, proceed with range boundary handling:
        waitForLedgerTransitionComplete (immediate — no transitioning store)
        Verify all 1,000 lfs_done flags → all set
-       Set TRANSITIONING, PromoteToTransitioning (txhash only), spawn RecSplit goroutine
+       PromoteToTransitioning (txhash only, idempotent), CreateActiveStores(N+1) (idempotent)
+       Atomic WriteBatch: range:N:state = TRANSITIONING + range:N+1:state = ACTIVE
+       Spawn RecSplit goroutine
 ```
 
-### Scenario SC2: Crash After All lfs_done Verified, Before TRANSITIONING Written
+### Scenario SC2: Crash After All lfs_done Verified, Before WriteBatch
 
-This crash occurs after `waitForLedgerTransitionComplete()` returns and all 1,000 `lfs_done` flags are verified, but before the `TRANSITIONING` state is written to the meta store.
+This crash occurs after `waitForLedgerTransitionComplete()` returns and all 1,000 `lfs_done` flags are verified, but before the atomic WriteBatch (which sets both `range:N:state = TRANSITIONING` and `range:N+1:state = ACTIVE`) is written. Physical operations (PromoteToTransitioning, CreateActiveStores) may or may not have completed.
 
 ```
 State at crash:
   All 1000 lfs_done flags = "1" (verified — all set during ACTIVE at chunk boundaries)
-  range:N:state = "ACTIVE" (not yet written to TRANSITIONING)
+  range:N:state = "ACTIVE" (WriteBatch not yet written)
+  range:N+1:state = absent  (WriteBatch not yet written)
   streaming:last_committed_ledger = rangeLastLedger(N)
   No transitioning ledger store (all deleted at their chunk boundaries)
+  Physical ops may be partial: txhash store may or may not be moved, N+1 dirs may or may not exist
 
 On restart:
   Same as SC1 — re-enter range boundary handling
   waitForLedgerTransitionComplete: immediate (no transitioning store)
   lfs_done scan: all 1,000 flags present → proceed
-  Write TRANSITIONING, PromoteToTransitioning (txhash only), spawn RecSplit goroutine
+  Redo physical ops (idempotent no-ops if already done):
+    PromoteToTransitioning(N) — no-op if txhash store already moved
+    CreateActiveStores(N+1) — no-op if directories already exist
+  Atomic WriteBatch: range:N:state = TRANSITIONING + range:N+1:state = ACTIVE
+  Spawn RecSplit goroutine
 ```
+
+### Range Boundary Crash Recovery (Streaming)
+
+Because physical operations are idempotent and meta store state transitions use a single atomic WriteBatch, range boundary recovery is straightforward:
+
+| Crash Point | State on Restart | Recovery Action |
+|------------|-----------------|----------------|
+| Before physical ops | range:N = ACTIVE, range:N+1 absent | Re-enter range boundary handling from the top |
+| After physical ops, before WriteBatch | range:N = ACTIVE, range:N+1 absent (files moved but states unchanged) | Redo physical ops (idempotent no-ops), then write the WriteBatch |
+| After WriteBatch | range:N = TRANSITIONING, range:N+1 = ACTIVE | Resume: spawn RecSplit goroutine for range N, continue ingesting range N+1 |
+
+The first two rows correspond to scenarios SC1 and SC2 above. The third row is the normal post-boundary state — no special recovery logic needed beyond the standard TRANSITIONING resume path (scenario SC3 below).
 
 ### Scenario SC3: Crash During RecSplit Build (All lfs_done Already Set During ACTIVE)
 
@@ -1268,15 +1455,16 @@ ledger always produces the same key-value entries.
 
 ---
 
-### OF6: Crash Between `range:N:state=TRANSITIONING` Written and RecSplit Goroutine Starting Any Work
+### OF6: Crash Between Atomic WriteBatch and RecSplit Goroutine Starting Any Work
 
-**Where in the sequence** (streaming TRANSITIONING only): The streaming range boundary was detected. All ledger sub-flow transitions completed during ACTIVE (all 1,000 `lfs_done` flags are set). The range state key was written to `"TRANSITIONING"` and the txhash store was promoted to transitioning. The process crashed before the RecSplit goroutine wrote a single CF done flag or started any RecSplit work.
+**Where in the sequence** (streaming TRANSITIONING only): The streaming range boundary was detected. All ledger sub-flow transitions completed during ACTIVE (all 1,000 `lfs_done` flags are set). The atomic WriteBatch wrote both `range:N:state = "TRANSITIONING"` and `range:N+1:state = "ACTIVE"` (physical operations — PromoteToTransitioning and CreateActiveStores — completed before the WriteBatch). The process crashed before the RecSplit goroutine wrote a single CF done flag or started any RecSplit work.
 
-**What it means**: The state says `TRANSITIONING`, all `lfs_done` flags are set (from ACTIVE), but zero RecSplit work was done. No ledger stores exist (all deleted at their chunk boundaries during ACTIVE). Only the transitioning txhash store remains.
+**What it means**: The state says `TRANSITIONING` (and range N+1 is `ACTIVE`), all `lfs_done` flags are set (from ACTIVE), but zero RecSplit work was done. No ledger stores exist (all deleted at their chunk boundaries during ACTIVE). Only the transitioning txhash store remains.
 
 ```
 Meta store at crash:
-  range:0001:state                    = "TRANSITIONING"  ← written
+  range:0001:state                    = "TRANSITIONING"  ← written by atomic WriteBatch
+  range:0002:state                    = "ACTIVE"         ← written by same atomic WriteBatch
   range:0001:chunk:001000:lfs_done    = "1"   ┐
   range:0001:chunk:001001:lfs_done    = "1"   │ All 1000 lfs_done flags set
   ...                                         │ (set during ACTIVE at chunk boundaries)
@@ -1301,7 +1489,7 @@ Concurrently:
   using the active stores for range:0002 (or whichever range the resume ledger falls in)
 ```
 
-**Why this scenario matters**: The crash window between writing `TRANSITIONING` and doing any RecSplit work is real — a single meta store Put followed immediately by a crash is possible. The recovery path handles this correctly because all `lfs_done` flags were set during ACTIVE, so recovery only needs to build RecSplit from scratch. The transitioning txhash store is still on disk and provides all the data needed.
+**Why this scenario matters**: The crash window between the atomic WriteBatch (which writes both TRANSITIONING and ACTIVE) and the first RecSplit work is real — the WriteBatch commits followed immediately by a crash is possible. The recovery path handles this correctly because all `lfs_done` flags were set during ACTIVE, so recovery only needs to build RecSplit from scratch. The transitioning txhash store is still on disk and provides all the data needed. Because the WriteBatch is atomic, range N+1 is guaranteed to be ACTIVE whenever range N is TRANSITIONING — there is no inconsistent intermediate state.
 
 ---
 
