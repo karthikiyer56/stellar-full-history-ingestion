@@ -239,22 +239,25 @@ Query routing is range-aware: queries for completed ranges hit immutable LFS/Rec
 
 When the streaming ingestion loop commits the last ledger of a range (e.g., ledger 10,000,001 for range 0), the process **automatically**:
 
-1. Marks `range:N:state = "TRANSITIONING"` in the meta store
-2. Spawns a background goroutine to convert the active RocksDB stores for range N to immutable LFS + RecSplit
-3. Creates new active RocksDB stores for range N+1
-4. Continues ingesting range N+1 immediately
+1. Waits for the last chunk's ledger sub-flow transition to complete (`waitForLedgerTransitionComplete`)
+2. Verifies all 1,000 `lfs_done` flags are set (safety check — they were set at each chunk boundary during ACTIVE)
+3. Marks `range:N:state = "TRANSITIONING"` in the meta store
+4. Moves ONLY the txhash store to transitioning via `PromoteToTransitioning(N)` (ledger stores are already deleted)
+5. Creates new active RocksDB stores for range N+1
+6. Spawns a background goroutine to build RecSplit from the transitioning txhash store
+7. Continues ingesting range N+1 immediately
 
-The transition goroutine runs concurrently with ingestion. Queries for the transitioning range are served from the still-open active store until the transition goroutine completes and marks the range `COMPLETE`. **No operator action is needed** — transitions are fully automatic.
+The transition goroutine runs concurrently with ingestion. Queries for the transitioning range are served from LFS (ledger queries) and the transitioning txhash store (txhash queries) until the RecSplit build completes, verification passes, and `RemoveTransitioningTxHashStore` is called. **No operator action is needed** — transitions are fully automatic.
 
-Expected transition duration: Phase 1 (LFS flush of remaining chunks) is fast (most chunks were already flushed during ACTIVE). Phase 2 (RecSplit build) takes ~4 hours.
+Expected transition duration: all LFS chunks are already written at their individual chunk boundaries during ACTIVE, so the only work at the range boundary is the RecSplit build (~4 hours per range).
 
 ### 2.5 Monitor Streaming
 
 Log output during normal streaming:
 ```
 [2026-01-01T12:00:00Z] [INFO] streaming ledger=15000001 range=0001 txhash_store_cf_keys=...
-[2026-01-01T12:01:00Z] [INFO] transition:0000 phase=1 chunk=000892/001000
-[2026-01-01T12:02:00Z] [INFO] transition:0000 phase=2 cf=0a:done
+[2026-01-01T12:00:01Z] [INFO] ledger_transition:0001 chunk=001500 lfs_done=true
+[2026-01-01T12:01:00Z] [INFO] recsplit_build:0000 cf=0a:done
 ```
 
 Health endpoint always responds even during transition:
@@ -291,10 +294,10 @@ See [07-crash-recovery.md](./07-crash-recovery.md) for all crash scenarios and t
 ### Transition Goroutine Crash
 
 The streaming daemon crash recovery handles this automatically — no separate procedure. On daemon restart, any range in `TRANSITIONING` state is resumed:
-- Phase 1 (LFS chunks): scans `lfs_done` flags, skips done chunks, writes remaining
-- Phase 2 (RecSplit): scans `cf:XX:done` flags, skips done CFs, builds remaining
+- All `lfs_done` flags were set during ACTIVE at their chunk boundaries — no LFS work remains
+- RecSplit: scans `cf:XX:done` flags, skips done CFs, rebuilds remaining from the transitioning txhash store
 
-The active store is **never deleted** until verification passes and all flags are set. It is always safe to restart the daemon.
+The transitioning txhash store is **never deleted** until verification passes and all RecSplit CF flags are set. It is always safe to restart the daemon.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The backfill transition workflow builds the RecSplit minimal perfect hash index for a range after all 1,000 chunk sub-workflows (both `lfs_done` and `txhash_done`) are complete. It is triggered by the range orchestrator, runs synchronously in the orchestrator goroutine, and takes approximately 4 hours per range.
+The backfill transition workflow builds the RecSplit minimal perfect hash index for a range after all 1,000 chunk sub-workflows (both `lfs_done` and `txhash_done`) are complete. It is triggered by the range orchestrator, blocks the orchestrator goroutine until complete, and takes approximately 4 hours per range.
 
 All 16 CF index files are built **in parallel** — 16 goroutines run concurrently, one per CF (`0`–`f`). Each goroutine reads all 1,000 raw txhash flat files for the range, filters by its CF (first hex character of the txhash), builds its RecSplit index, fsyncs, and sets its done flag. The orchestrator waits for all 16 goroutines to complete before setting state to COMPLETE.
 

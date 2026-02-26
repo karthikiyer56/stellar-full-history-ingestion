@@ -35,9 +35,9 @@ The v2 backfill pipeline is a parallel bulk loader that writes directly to the i
 
 The v2 streaming pipeline retains RocksDB as the active store (necessary for concurrent reads during live ingestion), but the transition workflow is now completely separate from backfill.
 
-- **Active store cadence is split.** In v1, the ledger store and txhash store were treated as a unified pair. In v2 they have different swap cadences: the **ledger store** rotates at every chunk boundary (~every 10K ledgers, ~1,000 swaps per range via `SwapActiveLedgerStore`), while the **txhash store** rotates only at range boundaries (~every 10M ledgers, ~1 swap per range via `AddActiveStore`). These are independent operations on independent RocksDB instances.
+- **Active store cadence is split.** In v1, the ledger store and txhash store were treated as a unified pair. In v2 they have different transition cadences: the **ledger store** transitions at every chunk boundary (~every 10K ledgers, ~1,000 transitions per range via `SwapActiveLedgerStore` — active → transitioning → LFS flush → close + delete; max 1 active + 1 transitioning at any time), while the **txhash store** transitions only at range boundaries (~every 10M ledgers, ~1 transition per range via `PromoteToTransitioning`). These are independent sub-flows on independent RocksDB instances.
 
-- **Streaming transition is a background goroutine, not a shared workflow.** When a range boundary is hit, the active stores are promoted to `TRANSITIONING` state and a background goroutine takes over conversion: Phase 1 writes LFS chunk files, Phase 2 builds the RecSplit index. Ingestion of the next range proceeds concurrently on new active stores. There is no query gap — the transitioning RocksDB stores remain open and queryable until `COMPLETE`.
+- **Streaming transition is a background goroutine, not a shared workflow.** The ledger sub-flow transitions independently at every chunk boundary during ACTIVE — `SwapActiveLedgerStore` moves the old store to transitioning, a background goroutine flushes it to LFS, then `CompleteLedgerTransition` closes and deletes it. By the range boundary, all LFS chunk files are already written. At the range boundary, the only remaining work is the txhash sub-flow: `PromoteToTransitioning` moves only the txhash store, and a background goroutine builds the RecSplit index. Ingestion of the next range proceeds concurrently on new active stores. There is no query gap — the transitioning txhash store remains open and queryable until `RemoveTransitioningTxHashStore` is called after verification.
 
 - **`transitioning/` directory is eliminated.** v1 created a `transitioning/` directory on the filesystem during the transition phase. v2 tracks all transition state in the meta store only. The filesystem only ever contains the final immutable output.
 
@@ -64,7 +64,7 @@ flowchart LR
     subgraph STREAMING
         CORE["CaptiveStellarCore<br/>1 ledger per batch"]
         ACTIVE["Active RocksDB Stores<br/>ledger-store-chunk + txhash-store-range"]
-        TRANS["Streaming Transition<br/>background goroutine<br/>Phase 1: LFS chunks, Phase 2: RecSplit"]
+        TRANS["Streaming Transition<br/>Ledger: LFS flush at each chunk boundary (during ACTIVE)<br/>TxHash: RecSplit build at range boundary (TRANSITIONING)"]
         IMM["Immutable Stores<br/>LFS chunks + RecSplit indexes"]
         CORE --> ACTIVE
         ACTIVE -->|range boundary hit| TRANS

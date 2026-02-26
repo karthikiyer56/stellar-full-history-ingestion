@@ -72,10 +72,17 @@ flowchart TB
 
 **Two separate RocksDB instances** per range being ingested in streaming mode:
 
-- **Ledger store** (`<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/`) — default CF only. Key: `uint32BE(ledgerSeq)`, Value: `zstd(LedgerCloseMeta)`. One RocksDB instance per 10K-ledger chunk; transitions at every chunk boundary.
-- **TxHash store** (`<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/`) — 16 column families, one per first hex character of the txhash (`0`–`f`). Key: `txhash[32]`, Value: `uint32BE(ledgerSeq)`. CF routing: first hex char of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes). One RocksDB instance per 10M-ledger range.
+- **Ledger store** (`<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/`) — default CF only. Key: `uint32BE(ledgerSeq)`, Value: `zstd(LedgerCloseMeta)`. One RocksDB instance per 10K-ledger chunk; transitions independently at every chunk boundary (active → transitioning → LFS flush → close + delete).
+- **TxHash store** (`<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/`) — 16 column families, one per first hex character of the txhash (`0`–`f`). Key: `txhash[32]`, Value: `uint32BE(ledgerSeq)`. CF routing: first hex char of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes). One RocksDB instance per 10M-ledger range; transitions at range boundary.
 
-At most one pair of active stores exists at a time. The ledger store is replaced at every 10K-ledger chunk boundary; the txhash store is replaced at every 10M-ledger range boundary. **The ledger store has no column families** — it uses only the default CF.
+**Each sub-flow can have at most 1 active store and 1 transitioning store at any point in time:**
+
+| Sub-flow | Transition cadence | Max active | Max transitioning | Max total |
+|----------|-------------------|------------|-------------------|-----------|
+| Ledger | Every 10K ledgers (chunk boundary) | 1 | 1 | 2 |
+| TxHash | Every 10M ledgers (range boundary) | 1 | 1 | 2 |
+
+The ledger store transitions at every 10K-ledger chunk boundary: `SwapActiveLedgerStore` moves the old store to `transitioningLedgerStore`, a background goroutine flushes it to LFS, then `CompleteLedgerTransition` closes and deletes it. The txhash store transitions at every 10M-ledger range boundary via `PromoteToTransitioning`. **The ledger store has no column families** — it uses only the default CF.
 
 ### Immutable Stores (both modes)
 
@@ -149,10 +156,11 @@ flowchart LR
 ```mermaid
 flowchart LR
     A["CaptiveStellarCore"] --> B["1 ledger"]
-    B --> C["RocksDB active store<br/>checkpoint every ledger"]
-    C -->|"range boundary hit"| D["Transition workflow<br/>(background goroutine)"]
-    D --> E["LFS chunk files<br/>(read from RocksDB,<br/>write to LFS)"]
-    D --> F["RecSplit index files<br/>(build from RocksDB txhash data)"]
+    B --> C["RocksDB active stores<br/>checkpoint every ledger"]
+    C -->|"chunk boundary<br/>(every 10K ledgers)"| D["Ledger sub-flow transition<br/>(background goroutine per chunk)<br/>SwapActiveLedgerStore → LFS flush → CompleteLedgerTransition"]
+    D --> E["LFS chunk files<br/>(10K ledgers each)"]
+    C -->|"range boundary<br/>(every 10M ledgers)"| F["TxHash sub-flow transition<br/>(background goroutine per range)<br/>PromoteToTransitioning → RecSplit build → RemoveTransitioningTxHashStore"]
+    F --> G["RecSplit index files<br/>(16 CFs per range)"]
 ```
 
 ---
@@ -206,27 +214,33 @@ See [05-backfill-transition-workflow.md](./05-backfill-transition-workflow.md) f
 
 ## Streaming Transition (Summary)
 
-The streaming transition is an **active RocksDB → immutable storage conversion**. The active store remains open for live queries throughout the transition; it is never deleted until all phases complete and verification passes.
+The streaming transition operates as **two independent sub-flow transitions at different cadences**, not a single combined workflow at the range boundary.
+
+**Ledger sub-flow** (every 10K ledgers — chunk boundary): During ACTIVE, at each chunk boundary `SwapActiveLedgerStore` moves the old ledger store to `transitioningLedgerStore`. A background goroutine reads 10K ledgers from it, writes LFS `.data` + `.index` files, fsyncs, sets `lfs_done`, then calls `CompleteLedgerTransition` to close and delete it. By the time the range boundary is reached, all 1,000 ledger stores have been individually transitioned to LFS and deleted.
+
+**TxHash sub-flow** (every 10M ledgers — range boundary): At the range boundary, the system waits for the last chunk's ledger transition to complete (`waitForLedgerTransitionComplete`), verifies all 1,000 `lfs_done` flags, then promotes the txhash store to `transitioningTxHashStore` via `PromoteToTransitioning`. A background goroutine builds 16 RecSplit CFs from the transitioning txhash store, verifies, sets `COMPLETE`, and calls `RemoveTransitioningTxHashStore` to close and delete it.
 
 ```mermaid
 flowchart TD
-    BOUNDARY(["Range N last ledger committed\nledger == rangeLastLedger(N)"]) --> SPAWN["Spawn background transition goroutine\nSet range:N:state = TRANSITIONING\nCreate active store for range N+1"]
-    SPAWN --> INGEST_NEXT["Range N+1 ingestion continues\n(main goroutine)"]
-    SPAWN --> PHASE1["Phase 1: LFS chunk writes\nRead 10K ledgers from ledger store (default CF) → write .data + .index → fsync → set lfs_done\n(most chunks already flushed during ACTIVE; only remaining chunks written here)"]
-    PHASE1 --> PHASE2["Phase 2: RecSplit build\nScan txhash store per nibble CF (0–f)\n→ build MPH → write cf-N.idx → fsync → set cf:XX:done\n(16 CFs; no raw flat files)"]
-    PHASE2 --> VERIFY["Verify: spot-check 100 random ledgers + 100 txhashes\nagainst new immutable files"]
-    VERIFY -->|pass| DELETE["Delete active RocksDB store for range N\nSet range:N:state = COMPLETE"]
-    VERIFY -->|fail| ABORT["ABORT — do NOT delete active store\nLog error; operator intervention"]
+    BOUNDARY(["Range N last ledger committed\nledger == rangeLastLedger(N)"]) --> WAIT["waitForLedgerTransitionComplete()\nEnsure last chunk's LFS flush is done"]
+    WAIT --> VERIFY_LFS["Verify all 1000 lfs_done flags\n(safety check — set during ACTIVE)"]
+    VERIFY_LFS --> PROMOTE["PromoteToTransitioning(N)\n(moves ONLY txhash store)"]
+    PROMOTE --> SPAWN["AddActiveStore(N+1)\nSpawn RecSplit build goroutine"]
+    SPAWN --> INGEST_NEXT["Range N+1 ingestion continues\n(main goroutine)\nLedger sub-flow transitions at chunk boundaries"]
+    SPAWN --> RECSPLIT["RecSplit build\nScan transitioning txhash store per nibble CF (0–f)\n→ build MPH → write cf-N.idx → fsync → set cf:XX:done\n(16 CFs; no raw flat files)"]
+    RECSPLIT --> VERIFY_RS["Verify: spot-check 100 random ledgers + 100 txhashes\nagainst immutable files"]
+    VERIFY_RS -->|pass| DELETE["RemoveTransitioningTxHashStore(N)\nSet range:N:state = COMPLETE"]
+    VERIFY_RS -->|fail| ABORT["ABORT — do NOT delete txhash store\nLog error; operator intervention"]
 
-    BOUNDARY -.->|"range N queries\nserved from active store\nuntil state = COMPLETE"| PHASE1
+    BOUNDARY -.->|"range N ledger queries\nserved from LFS\n(all chunks already flushed)"| WAIT
+    BOUNDARY -.->|"range N txhash queries\nserved from transitioning\ntxhash store until COMPLETE"| PROMOTE
 ```
 
 **Key facts**:
-- Input: two active RocksDB stores — ledger store (default CF) + txhash store (16 CFs, one per nibble)
-- Background LFS flush during ACTIVE: a background goroutine flushes completed 10K-ledger chunks from the ledger store to LFS chunk files at each chunk boundary; sets `lfs_done="1"` after fsync. Most chunks are flushed before the transition goroutine starts.
-- At TRANSITIONING: Phase 1 handles remaining unflushed chunks; Phase 2 builds RecSplit directly from txhash store (no raw flat files produced)
-- Active stores kept open for queries throughout; not deleted until verification passes
-- Crash recovery: `lfs_done` + `cf:XX:done` flags; WAL ensures both RocksDB stores survive crash
+- **No "Phase 1" at range boundary** — all LFS chunk files are written at their individual chunk boundaries during ACTIVE, not at transition time
+- RecSplit is built directly from the transitioning txhash store (no raw flat files produced)
+- The transitioning txhash store remains open for queries throughout the RecSplit build; not deleted until verification passes
+- Crash recovery: `lfs_done` flags (set during ACTIVE) + `cf:XX:done` flags; WAL ensures txhash store survives crash
 
 See [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) for full details.
 
@@ -239,13 +253,13 @@ See [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md)
 | Trigger | All 1000 chunks complete (`lfs_done` + `txhash_done` set for all) | Range boundary ledger committed to active store |
 | Input | Raw txhash flat files (`immutable/txhash/{N}/raw/`) | Two active RocksDB stores: ledger store (default CF) + txhash store (16 CFs) |
 | Execution context | Orchestrator goroutine (sequential per range, then frees slot) | Background goroutine (concurrent with next range ingestion) |
-| LFS chunks | Written by chunk sub-workflow during ingestion | Flushed by background goroutine during ACTIVE at chunk cadence; remaining chunks flushed in Phase 1 of transition |
-| RecSplit input | 1000 raw flat files scanned per nibble | Txhash store CF scan per nibble (no raw flat files) |
+| LFS chunks | Written by chunk sub-workflow during ingestion | Flushed individually at each chunk boundary during ACTIVE (via `SwapActiveLedgerStore` + background LFS flush + `CompleteLedgerTransition`); all 1,000 chunks complete before range boundary |
+| RecSplit input | 1000 raw flat files scanned per nibble | Transitioning txhash store CF scan per nibble (no raw flat files) |
 | Raw txhash flat files | Produced, consumed, then deleted post-RecSplit | Not produced |
-| Active store teardown | Not applicable (no active store in backfill) | Deleted after verification passes |
-| Live queries during transition | Not applicable (no query layer in backfill) | Served from active store until `state = COMPLETE` |
+| Active store teardown | Not applicable (no active store in backfill) | Only txhash store deleted after RecSplit verification passes (ledger stores already deleted at chunk boundaries) |
+| Live queries during transition | Not applicable (no query layer in backfill) | Ledger queries → LFS; txhash queries → transitioning txhash store until `state = COMPLETE` |
 | Crash recovery granularity | Per-CF (`cf:XX:done` flags) | Per-chunk + per-CF (`lfs_done` + `cf:XX:done` flags) |
-| Duration | ~4 hours (RecSplit build only) | Longer: LFS chunk writes + RecSplit build + verification |
+| Duration | ~4 hours (RecSplit build only) | RecSplit build (~4 hours) + verification; LFS chunk writes happen during ACTIVE, not at transition time |
 
 ---
 
@@ -281,7 +295,7 @@ flowchart TD
     CHECK_TRANS -->|no| ERROR["No active state found\n— operator intervention"]
 ```
 
-**Resume rule**: streaming always resumes from `last_committed_ledger + 1`. Both active RocksDB stores (ledger store + txhash store) are WAL-backed — all committed ledgers survive a crash. The transition workflow resumes mid-flight using per-chunk and per-CF flags; neither active store is deleted until verification passes.
+**Resume rule**: streaming always resumes from `last_committed_ledger + 1`. The active RocksDB stores are WAL-backed — all committed ledgers survive a crash. During ACTIVE, ledger stores are individually transitioned and deleted at chunk boundaries; the txhash store remains. During TRANSITIONING, only the txhash store exists (all ledger stores already deleted). The transition workflow resumes mid-flight using `lfs_done` + `cf:XX:done` flags; the transitioning txhash store is not deleted until RecSplit verification passes.
 
 **Expectations**:
 - Backfill: operator re-runs same command; idempotent by design. Expect ≤1 chunk (~100 ledgers) lost per BSB instance on crash.
@@ -300,12 +314,12 @@ See [07-crash-recovery.md](./07-crash-recovery.md) for all 6 crash scenarios wit
 | [03-backfill-workflow.md](./03-backfill-workflow.md) | `## getEvents Immutable Store — Placeholder` | Events flat file write per chunk during ingestion |
 | [04-streaming-workflow.md](./04-streaming-workflow.md) | `## getEvents Immutable Store — Placeholder` | Per-ledger event writes to separate active events RocksDB store |
 | [05-backfill-transition-workflow.md](./05-backfill-transition-workflow.md) | `## getEvents Immutable Store — Placeholder` | Phase 3: events index build from per-chunk event files |
-| [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) | `## getEvents Immutable Store — Placeholder` | Phase 3: events index build from active events RocksDB store |
+| [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) | `## getEvents Immutable Store — Placeholder` | Events sub-flow as independent transition at chunk cadence during ACTIVE |
 | [07-crash-recovery.md](./07-crash-recovery.md) | `## getEvents Immutable Store — Placeholder` | Recovery cases for events index build |
 
 **When `getEvents` is implemented**:
 - Range state machine extends: `INGESTING → RECSPLIT_BUILDING → EVENTS_INDEX_BUILDING → COMPLETE`
-- Active stores (streaming) are NOT deleted until LFS + RecSplit + events index all complete
+- Transitioning txhash store (streaming) is NOT deleted until RecSplit + events index all complete
 - Raw events files (backfill) are NOT deleted until events index is complete
 - New meta store keys: `range:N:events_index:state` and per-partition done flags
 
@@ -323,5 +337,5 @@ See [07-crash-recovery.md](./07-crash-recovery.md) for all 6 crash scenarios wit
 8. **Chunk boundaries align to ranges** — Range N spans exactly chunks `N×1000` through `(N×1000)+999`.
 9. **BSB instances run in parallel** — all 20 BSB instances within a range start concurrently; completed chunks are non-contiguous at crash time; recovery scans all 1,000 chunk flag pairs.
 10. **WAL is never disabled for meta store writes** — the meta store WAL is required for crash recovery; `DisableWAL(true)` is forbidden for any meta store operation in either mode.
-11. **Active stores are never deleted until verification passes** — both active RocksDB stores (ledger store + txhash store) for the transitioning range remain open for queries and as recovery sources until all `lfs_done` + `cf:XX:done` flags are set and spot-check verification succeeds.
+11. **Transitioning stores are never deleted until verification passes** — the transitioning txhash store remains open for queries and as a recovery source until all `cf:XX:done` flags are set and spot-check verification succeeds. Ledger stores are deleted individually at chunk boundaries during ACTIVE after their LFS flush completes and `lfs_done` is set.
 12. **`getEvents` is a placeholder everywhere** — no events indexing is implemented; all workflow docs carry an explicit placeholder section to track where implementation will hook in.

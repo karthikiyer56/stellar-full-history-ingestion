@@ -17,12 +17,12 @@ The QueryRouter dispatches `getLedgerBySequence` and `getTransactionByHash` requ
 
 | Range State | `getLedgerBySequence` | `getTransactionByHash` |
 |-------------|----------------------|----------------------|
-| `ACTIVE` | Active ledger store (default CF) | Active txhash store (CF for nibble) |
-| `TRANSITIONING` | Active ledger store (still open) | Active txhash store (still open) |
+| `ACTIVE` | Active ledger store (or transitioning ledger store during chunk transition, or LFS for already-transitioned chunks) | Active txhash store (CF for nibble) |
+| `TRANSITIONING` | LFS chunk files (all ledger stores already transitioned and deleted during ACTIVE) | Transitioning txhash store (still open) |
 | `COMPLETE` | Immutable LFS store | Immutable RecSplit index |
 | Not yet started | Not available — range not ingested | Not available |
 
-The active ledger and txhash RocksDB stores for a transitioning range remain open and queryable until `state == COMPLETE` and the stores are explicitly deleted. There is no query gap during transition.
+**Each sub-flow can have at most 1 active store and 1 transitioning store at any point in time.** The ledger sub-flow transitions at every chunk boundary (10K ledgers); the txhash sub-flow transitions at every range boundary (10M ledgers). By the time a range reaches `TRANSITIONING`, all ledger stores have been individually transitioned to LFS and deleted — only the txhash store remains open for reads.
 
 ---
 
@@ -69,8 +69,8 @@ The two active stores have **different transition frequencies**. This is the mos
 | Frequency | ~1000× per range | ~1× per range |
 | Path key | `chunkID` (e.g. `006111`) | `rangeID` (e.g. `0006`) |
 | Path pattern | `ledger-store-chunk-{chunkID:06d}/` | `txhash-store-range-{rangeID:04d}/` |
-| Router method | `SwapActiveLedgerStore(newChunkID, newDB)` | `AddActiveStore(rangeID, chunkID, ...)` |
-| Promoted at range boundary? | Yes — `transitioningLedgerStore` = last chunk's DB | Yes — `transitioningTxHashStore` = range's DB |
+| Router method (transition) | `SwapActiveLedgerStore` → `CompleteLedgerTransition` | `PromoteToTransitioning` → `RemoveTransitioningTxHashStore` |
+| Promoted at range boundary? | No — all ledger stores already transitioned to LFS and deleted during ACTIVE at their chunk boundaries | Yes — `transitioningTxHashStore` = range's DB (via `PromoteToTransitioning`) |
 | Struct field tracking | `activeChunkID`, `transitioningChunkID` | `activeRangeID`, `transitioningRangeID` |
 
 **Concrete example at `last_committed_ledger = 61,111,222`**:
@@ -116,14 +116,16 @@ type QueryRouter struct {
     activeChunkID     uint32       // current chunk (10K-ledger granularity); updated by SwapActiveLedgerStore
     activeRangeID     uint32       // current range (10M-ledger granularity); updated by AddActiveStore
 
-    // Transitioning stores (being converted to immutable) — at most one pair at a time.
-    // These remain open for reads until AddImmutableStores + RemoveTransitioningStores completes.
-    // transitioningChunkID is the LAST chunkID of the transitioning range
-    // (e.g. chunk 005999 for range 5, which spans global chunks 005000–005999).
-    transitioningLedgerStore *rocksdb.DB  // ledger-store-chunk-{transitioningChunkID:06d}/ (read-only)
-    transitioningTxHashStore *rocksdb.DB  // txhash-store-range-{transitioningRangeID:04d}/ (read-only)
-    transitioningChunkID     uint32       // last chunkID of the transitioning range
-    transitioningRangeID     uint32       // rangeID of the transitioning range
+    // Transitioning stores — at most one per sub-flow at a time.
+    // Ledger: transitioningLedgerStore holds the chunk currently being flushed to LFS
+    // (set by SwapActiveLedgerStore at each chunk boundary; cleared by CompleteLedgerTransition).
+    // TxHash: transitioningTxHashStore holds the range's txhash store during RecSplit build
+    // (set by PromoteToTransitioning at range boundary; cleared by RemoveTransitioningTxHashStore).
+    // Both remain open for reads until explicitly closed.
+    transitioningLedgerStore *rocksdb.DB  // ledger-store-chunk-{transitioningChunkID:06d}/ (read-only, during LFS flush)
+    transitioningTxHashStore *rocksdb.DB  // txhash-store-range-{transitioningRangeID:04d}/ (read-only, during RecSplit build)
+    transitioningChunkID     uint32       // chunkID currently being flushed to LFS (set at chunk boundary)
+    transitioningRangeID     uint32       // rangeID of the transitioning range (set at range boundary)
 
     // Immutable stores (COMPLETE ranges) — indexed by range ID
     immutableLedgerStores map[uint32]*LFSStore       // rangeID → LFS store handle
@@ -146,7 +148,7 @@ On streaming mode startup, the router initializes its registry from the meta sto
 1. Read all `range:{rangeID:04d}:state` keys from meta store
 2. For each `COMPLETE` range: open and cache RecSplit index handles for all 16 CFs + LFS store handle; insert rangeID into `completeRangeIDs` using `insertDescending` so the slice stays sorted descending (newest first)
 3. For each `ACTIVE` range: derive `chunkID` from `streaming:last_committed_ledger` to open the correct `ledger-store-chunk-{chunkID:06d}/`; open both RocksDB stores
-4. For each `TRANSITIONING` range: derive the last `chunkID` of that range from `(rangeLastLedger - 2) / 10000`; open both RocksDB stores
+4. For each `TRANSITIONING` range: open only the txhash RocksDB store (all ledger stores were already transitioned to LFS and deleted during ACTIVE)
 
 > **`insertDescending` note**: Maintains `completeRangeIDs` as a sorted-descending slice. After inserting ranges 0, 1, 2, 3, 4, 5 (in any order), the result is `[5, 4, 3, 2, 1, 0]`. This ordering ensures `getTransactionByHash` probes newest ranges first — the most common access pattern for recent transactions.
 
@@ -186,15 +188,12 @@ func NewQueryRouter(metaStore *MetaStore, basePath string) (*QueryRouter, error)
             qr.activeRangeID = rangeID
 
         case "TRANSITIONING":
-            // The transitioning ledger store is the LAST chunk of the transitioning range.
-            // Last ledger of range N = rangeN * 10_000_000 + 10_000_001
-            // transitioningChunkID = (rangeLastLedger - 2) / 10_000
-            // e.g. range 5 last ledger = 60,000,001 → chunkID = 5999 → ledger-store-chunk-005999/
-            rangeLastLedger := rangeID*10_000_000 + 10_000_001
-            transitioningChunkID := (rangeLastLedger - 2) / 10_000
-            qr.transitioningLedgerStore = openRocksDB(basePath, chunkPath(transitioningChunkID))
+            // By the time a range reaches TRANSITIONING, ALL ledger stores have been
+            // individually transitioned to LFS and deleted during ACTIVE (at their chunk
+            // boundaries via SwapActiveLedgerStore + CompleteLedgerTransition).
+            // Only the txhash store remains open for reads during RecSplit build.
+            // There is NO transitioning ledger store to open.
             qr.transitioningTxHashStore = openRocksDB(basePath, txHashPath(rangeID))
-            qr.transitioningChunkID = transitioningChunkID
             qr.transitioningRangeID = rangeID
         }
     }
@@ -209,40 +208,84 @@ func NewQueryRouter(metaStore *MetaStore, basePath string) (*QueryRouter, error)
 The streaming ingestion loop and transition goroutine call these methods as ranges progress through the `ACTIVE → TRANSITIONING → COMPLETE` lifecycle.
 
 **Two distinct update triggers**:
-- **Chunk boundary** (every 10K ledgers, ~1000× per range): Only the ledger store is replaced. `SwapActiveLedgerStore` opens a new `ledger-store-chunk-{newChunkID:06d}/` and closes the old one. The txhash store is unchanged.
-- **Range boundary** (every 10M ledgers, ~1× per range): Both stores transition. `PromoteToTransitioning` moves the current pair to the transitioning slots; `AddActiveStore` opens a new pair for range N+1.
+- **Chunk boundary** (every 10K ledgers, ~1000× per range): Only the ledger store transitions. `SwapActiveLedgerStore` opens a new `ledger-store-chunk-{newChunkID:06d}/` and moves the old store to `transitioningLedgerStore` (it stays open for reads during LFS flush). A background goroutine flushes the chunk to LFS, then calls `CompleteLedgerTransition` to close and delete the transitioning store. The txhash store is unchanged.
+- **Range boundary** (every 10M ledgers, ~1× per range): Only the txhash store transitions. By this point, all ledger stores have been individually transitioned at their chunk boundaries and deleted. `PromoteToTransitioning` moves only the txhash store to `transitioningTxHashStore`; `AddActiveStore` opens a new pair for range N+1.
 
 ### 1. SwapActiveLedgerStore
 
 ```go
 // SwapActiveLedgerStore replaces the active ledger store at a chunk boundary.
 // Called when: a chunk boundary is crossed (every 10K ledgers, ~1000 times per range).
-// Effect: Old ledger store is closed and replaced with the new one.
+// Effect: Old ledger store is MOVED to transitioningLedgerStore (stays open for reads
+//         during background LFS flush). The new store becomes the active ledger store.
 //         The txhash store is NOT touched — it spans the full range.
+// IMPORTANT: The caller MUST ensure transitioningLedgerStore is nil before calling.
+//            If a previous chunk's LFS flush hasn't completed yet, the caller must
+//            wait (via waitForLedgerTransitionComplete) before swapping again.
 // Locking: Acquires WRITE lock (brief — pointer swap only).
 func (qr *QueryRouter) SwapActiveLedgerStore(newChunkID uint32, newDB *rocksdb.DB) {
     qr.mu.Lock()
     defer qr.mu.Unlock()
 
-    // Close old store before replacing the pointer
-    if qr.activeLedgerStore != nil {
-        qr.activeLedgerStore.Close()
-    }
+    // Move old active store to transitioning — it stays open for reads
+    // while the background goroutine flushes it to LFS.
+    qr.transitioningLedgerStore = qr.activeLedgerStore
+    qr.transitioningChunkID = qr.activeChunkID
+
+    // Install new active store
     qr.activeLedgerStore = newDB
     qr.activeChunkID = newChunkID
     // qr.activeTxHashStore and qr.activeRangeID are unchanged
 }
 ```
 
-**When called**: Immediately after the new `ledger-store-chunk-{newChunkID:06d}/` is opened and the first ledger of the new chunk is committed. The streaming ingestion loop calls this for every chunk boundary — approximately 1000 times per 10M-ledger range.
+**When called**: Immediately after the new `ledger-store-chunk-{newChunkID:06d}/` is opened and the first ledger of the new chunk is committed. The streaming ingestion loop calls this for every chunk boundary — approximately 1000 times per 10M-ledger range. The caller must ensure the previous transitioning ledger store has been fully flushed and deleted (via `CompleteLedgerTransition`) before calling again.
 
 **Example at ledger 60,010,002** (first ledger of range 6, chunk 6000):
 ```
 SwapActiveLedgerStore(6000, openRocksDB("ledger-store-chunk-006000/"))
 ```
-Old store `ledger-store-chunk-005999/` is closed; new store `ledger-store-chunk-006000/` is registered.
+Old store `ledger-store-chunk-005999/` is moved to `transitioningLedgerStore`; new store `ledger-store-chunk-006000/` becomes the active ledger store. A background goroutine flushes chunk 5999 to LFS, then calls `CompleteLedgerTransition(5999)` to close and delete the transitioning store.
 
-### 2. AddActiveStore
+### 2. CompleteLedgerTransition
+
+```go
+// CompleteLedgerTransition closes and deletes the transitioning ledger store after LFS flush.
+// Called when: the background goroutine has finished flushing a chunk to LFS
+//              (.data + .index written, fsync'd, lfs_done flag set in meta store).
+// Effect: Transitioning ledger store is closed, its RocksDB directory is deleted,
+//         and the transitioningLedgerStore pointer is set to nil.
+// CRITICAL: This is the point at which the transitioning ledger RocksDB is DELETED from disk.
+//           After this call, queries for ledgers in this chunk route to LFS.
+// Locking: Acquires WRITE lock (brief — close + nil).
+func (qr *QueryRouter) CompleteLedgerTransition(chunkID uint32) {
+    qr.mu.Lock()
+    defer qr.mu.Unlock()
+
+    if qr.transitioningChunkID == chunkID && qr.transitioningLedgerStore != nil {
+        qr.transitioningLedgerStore.Close()
+        os.RemoveAll(ledgerStoreChunkPath(chunkID))
+        qr.transitioningLedgerStore = nil
+        qr.transitioningChunkID = 0
+    }
+    // Signal any goroutine waiting in waitForLedgerTransitionComplete()
+    // (needed at range boundaries to ensure all LFS flushes are done)
+}
+```
+
+**When called**: By the background LFS flush goroutine, after it has:
+1. Read all 10K ledgers from the transitioning ledger store
+2. Written `.data` + `.index` files to `immutable/ledgers/chunks/`
+3. Fsync'd the output
+4. Set `range:{rangeID:04d}:chunk:{chunkID:06d}:lfs_done = "1"` in the meta store
+
+**Example**: After chunk 5999 is flushed to LFS:
+```
+CompleteLedgerTransition(5999)
+```
+Closes `ledger-store-chunk-005999/`, deletes the directory, sets `transitioningLedgerStore = nil`. Queries for ledgers in chunk 5999 now route to `immutable/ledgers/chunks/0005/005999.data`.
+
+### 3. AddActiveStore
 
 ```go
 // AddActiveStore registers new active stores for a range.
@@ -263,54 +306,61 @@ func (qr *QueryRouter) AddActiveStore(rangeID uint32, chunkID uint32, ledgerDB, 
 **When called**: At range boundary, immediately after `PromoteToTransitioning`. The new range's first chunk is chunk `rangeID * 1000` (e.g. range 6 → first chunk = 6000).
 
 **Caller sequence at range boundary**:
-1. `PromoteToTransitioning(rangeN, lastChunkID)` — move range N pair to transitioning
-2. `AddActiveStore(rangeN+1, firstChunkOfN+1, newLedgerDB, newTxHashDB)` — register new pair
-3. Spawn background transition goroutine for range N
+1. `waitForLedgerTransitionComplete()` — ensure last chunk's LFS flush is done
+2. `PromoteToTransitioning(rangeN)` — move range N's txhash store to transitioning (no ledger store involved — already transitioned and deleted)
+3. `AddActiveStore(rangeN+1, firstChunkOfN+1, newLedgerDB, newTxHashDB)` — register new pair
+4. Spawn background RecSplit build goroutine for range N
 
-### 3. PromoteToTransitioning
+### 4. PromoteToTransitioning
 
 ```go
-// PromoteToTransitioning moves active stores to transitioning status.
-// Called when: range boundary reached, BEFORE spawning the background transition goroutine.
-// Takes the last chunkID of the range being promoted (used for path tracking in cleanup).
-// Effect: Active range becomes TRANSITIONING; active slots become nil.
-//         Queries for the transitioning range continue to hit the same RocksDB stores.
-// Locking: Acquires WRITE lock (brief — pointer swaps only).
-func (qr *QueryRouter) PromoteToTransitioning(rangeID uint32, lastChunkID uint32) {
+// PromoteToTransitioning moves ONLY the active txhash store to transitioning status.
+// Called when: range boundary reached, AFTER waitForLedgerTransitionComplete() confirms
+//              all ledger sub-flow transitions are done, BEFORE spawning the RecSplit goroutine.
+// Effect: Active txhash store becomes transitioningTxHashStore; active txhash slot becomes nil.
+//         The ledger store is NOT involved — all ledger stores were individually transitioned
+//         to LFS and deleted at their chunk boundaries during ACTIVE.
+//         Queries for the transitioning range's transactions continue to hit the same RocksDB txhash store.
+// Locking: Acquires WRITE lock (brief — pointer swap only).
+func (qr *QueryRouter) PromoteToTransitioning(rangeID uint32) {
     qr.mu.Lock()
     defer qr.mu.Unlock()
 
-    // Move active handles → transitioning slots
-    qr.transitioningLedgerStore = qr.activeLedgerStore
+    // Move ONLY the txhash store to transitioning.
+    // The ledger store is already gone — all chunks were individually transitioned
+    // to LFS at their chunk boundaries and deleted via CompleteLedgerTransition.
     qr.transitioningTxHashStore = qr.activeTxHashStore
-    qr.transitioningChunkID = lastChunkID  // e.g. 5999 for range 5 (last chunk of range 5)
     qr.transitioningRangeID = rangeID
 
-    // Clear active slots (AddActiveStore will fill them for the new range)
-    qr.activeLedgerStore = nil
+    // Clear active txhash slot (AddActiveStore will fill it for the new range)
     qr.activeTxHashStore = nil
-    qr.activeChunkID = 0
     qr.activeRangeID = 0
+    // NOTE: activeLedgerStore is already nil at this point — the last chunk's
+    // CompleteLedgerTransition cleared it. activeChunkID is stale but harmless.
 }
 ```
 
 **When called**: At the range boundary, in this sequence:
-1. `PromoteToTransitioning(rangeN, lastChunkID)` — move range N handles to transitioning
-2. `AddActiveStore(rangeN+1, firstChunkID, ...)` — register new pair for range N+1
-3. Spawn background transition goroutine for range N
+1. `waitForLedgerTransitionComplete()` — block until `transitioningLedgerStore == nil`
+2. Verify all 1,000 `lfs_done` flags are set (safety check — they were set during ACTIVE)
+3. `PromoteToTransitioning(rangeN)` — move range N's txhash store to transitioning
+4. `AddActiveStore(rangeN+1, firstChunkID, ...)` — register new pair for range N+1
+5. Spawn background RecSplit build goroutine for range N
 
-Queries for range N continue to route to the transitioning RocksDB stores without interruption.
+Queries for range N's transactions continue to route to the transitioning txhash RocksDB store without interruption. Queries for range N's ledgers route to LFS (all chunks already flushed).
 
 **Example at range 5→6 boundary** (last ledger of range 5 = 60,000,001):
-- `lastChunkID = (60000001 - 2) / 10000 = 5999` → `transitioningLedgerStore = ledger-store-chunk-005999/`
-- `firstChunkIDofRange6 = 6000` → `AddActiveStore(6, 6000, ...)`
+- All 1,000 ledger stores for range 5 (chunks 5000–5999) were individually transitioned to LFS and deleted during ACTIVE
+- `PromoteToTransitioning(5)` moves only `txhash-store-range-0005/` to `transitioningTxHashStore`
+- `AddActiveStore(6, 6000, ...)` opens new ledger + txhash stores for range 6
 
-### 4. AddImmutableStores
+### 5. AddImmutableStores
 
 ```go
 // AddImmutableStores registers immutable stores after transition completes.
-// Called when: background transition goroutine has completed Phase 1 (LFS) + Phase 2 (RecSplit)
-//              AND spot-check verification has passed.
+// Called when: background RecSplit build goroutine has completed building the RecSplit index
+//              AND spot-check verification has passed. All LFS chunks were already written
+//              during ACTIVE at their individual chunk boundaries.
 // Effect: Range moves from TRANSITIONING to COMPLETE in the router's in-memory state.
 //         Queries for the range now route to LFS + RecSplit instead of RocksDB.
 // Locking: Acquires WRITE lock (brief).
@@ -326,46 +376,40 @@ func (qr *QueryRouter) AddImmutableStores(rangeID uint32, lfs *LFSStore, recspli
 }
 ```
 
-**When called**: After the transition goroutine sets `range:{rangeID:04d}:state = COMPLETE` in the meta store. `AddImmutableStores` and `RemoveTransitioningStores` are called in sequence (see ordering below).
+**When called**: After the transition goroutine sets `range:{rangeID:04d}:state = COMPLETE` in the meta store. `AddImmutableStores` and `RemoveTransitioningTxHashStore` are called in sequence (see ordering below).
 
-### 5. RemoveTransitioningStores
+### 6. RemoveTransitioningTxHashStore
 
 ```go
-// RemoveTransitioningStores closes and deletes the transitioning RocksDB stores.
+// RemoveTransitioningTxHashStore closes and deletes the transitioning txhash RocksDB store.
 // Called when: AddImmutableStores has completed AND queries are now routed to immutable stores.
-// CRITICAL: This is the point at which RocksDB stores are DELETED from disk.
-// Uses transitioningChunkID (not rangeID) for the ledger store path, because the ledger
-// store is keyed by chunkID (the last chunk of the transitioning range).
+// CRITICAL: This is the point at which the transitioning txhash RocksDB store is DELETED from disk.
+//           The ledger stores were already deleted individually by CompleteLedgerTransition
+//           at each chunk boundary during ACTIVE — there is no ledger store to delete here.
 // Locking: Acquires WRITE lock (brief).
-func (qr *QueryRouter) RemoveTransitioningStores(rangeID uint32) {
+func (qr *QueryRouter) RemoveTransitioningTxHashStore(rangeID uint32) {
     qr.mu.Lock()
     defer qr.mu.Unlock()
 
     if qr.transitioningRangeID == rangeID {
-        qr.transitioningLedgerStore.Close()
         qr.transitioningTxHashStore.Close()
-        // Delete the RocksDB directories from disk.
-        // NOTE: ledger store path uses transitioningChunkID, NOT rangeID.
-        // e.g. range 5 → ledger path = ledger-store-chunk-005999/ (last chunk of range 5)
-        os.RemoveAll(ledgerStoreChunkPath(qr.transitioningChunkID))
+        // Delete only the txhash RocksDB directory from disk.
         os.RemoveAll(txHashStorePath(rangeID))
 
-        qr.transitioningLedgerStore = nil
         qr.transitioningTxHashStore = nil
-        qr.transitioningChunkID = 0
         qr.transitioningRangeID = 0
     }
 }
 ```
 
-**When called**: Immediately after `AddImmutableStores`. The caller sequence in the transition goroutine:
+**When called**: Immediately after `AddImmutableStores`. The caller sequence in the RecSplit build goroutine:
 
 ```go
-// Transition goroutine — final steps (pseudocode)
+// RecSplit build goroutine — final steps (pseudocode)
 verifyImmutableStores(rangeID)    // spot-check 100 ledgers + 100 txhashes
 metaStore.Set(rangeNState, "COMPLETE")
-router.AddImmutableStores(rangeID, lfs, recsplit)    // swap routing
-router.RemoveTransitioningStores(rangeID)            // delete RocksDB (safe: routing already swapped)
+router.AddImmutableStores(rangeID, lfs, recsplit)       // swap routing
+router.RemoveTransitioningTxHashStore(rangeID)           // delete txhash RocksDB (safe: routing already swapped)
 ```
 
 ---
@@ -377,14 +421,14 @@ The following diagram shows how the router's internal state evolves as a range m
 ```mermaid
 flowchart TD
     START(["range created"])
-    ACTIVE["ACTIVE<br/>Queries → active RocksDB stores:<br/>active/ledger-store-chunk-YYYYYY/<br/>active/txhash-store-range-XXXX/"]
-    TRANSITIONING["TRANSITIONING<br/>Queries still → same RocksDB stores<br/>Transition goroutine runs concurrently<br/>No query gap. No lock held during I/O."]
-    COMPLETE["COMPLETE<br/>Queries → immutable stores:<br/>immutable/ledgers/chunks/ (LFS)<br/>immutable/txhash/XXXX/index/ (RecSplit)<br/>RocksDB stores deleted from disk."]
+    ACTIVE["ACTIVE<br/>Queries → active RocksDB stores:<br/>active/ledger-store-chunk-YYYYYY/<br/>active/txhash-store-range-XXXX/<br/>Ledger stores transition at each chunk boundary<br/>(active → transitioning → LFS → delete)"]
+    TRANSITIONING["TRANSITIONING<br/>Ledger queries → LFS (all chunks already flushed)<br/>TxHash queries → transitioning txhash RocksDB store<br/>RecSplit build runs concurrently<br/>No query gap. No lock held during I/O."]
+    COMPLETE["COMPLETE<br/>Queries → immutable stores:<br/>immutable/ledgers/chunks/ (LFS)<br/>immutable/txhash/XXXX/index/ (RecSplit)<br/>Txhash RocksDB store deleted from disk."]
     END(["immutable forever"])
 
     START -->|"AddActiveStore(rangeN)"| ACTIVE
     ACTIVE -->|"PromoteToTransitioning(rangeN)<br/>then AddActiveStore(rangeN+1)"| TRANSITIONING
-    TRANSITIONING -->|"AddImmutableStores(rangeN)<br/>then RemoveTransitioningStores(rangeN)"| COMPLETE
+    TRANSITIONING -->|"AddImmutableStores(rangeN)<br/>then RemoveTransitioningTxHashStore(rangeN)"| COMPLETE
     COMPLETE --> END
 ```
 
@@ -393,14 +437,16 @@ flowchart TD
 ```mermaid
 flowchart LR
     T0(["Range N last ledger committed"])
+    W["waitForLedgerTransitionComplete()<br/>All LFS chunks already done"]
     P["PromoteToTransitioning(N)<br/>AddActiveStore(N+1)"]
 
     subgraph CONCURRENT
-        TG["Transition goroutine (range N)<br/>Phase 1: LFS chunk writes<br/>Phase 2: RecSplit build<br/>Verify → AddImmutableStores(N)<br/>RemoveTransitioningStores(N)"]
-        IG["Ingestion loop (range N+1)<br/>CaptiveStellarCore → active stores<br/>Checkpoint every ledger"]
+        TG["RecSplit build goroutine (range N)<br/>Build 16 RecSplit CFs from transitioning txhash store<br/>Verify → AddImmutableStores(N)<br/>RemoveTransitioningTxHashStore(N)"]
+        IG["Ingestion loop (range N+1)<br/>CaptiveStellarCore → active stores<br/>Checkpoint every ledger<br/>Ledger sub-flow transitions at each chunk boundary"]
     end
 
-    T0 --> P
+    T0 --> W
+    W --> P
     P --> CONCURRENT
 ```
 
@@ -413,12 +459,13 @@ flowchart LR
 | `getLedgerBySequence` | Read Lock | Non-blocking — concurrent reads allowed |
 | `getTransactionByHash` | Read Lock (snapshot only) | Non-blocking — lock released before I/O |
 | `SwapActiveLedgerStore` | Write Lock | Blocks all reads briefly (pointer swap); called every chunk boundary (~10K ledgers) |
+| `CompleteLedgerTransition` | Write Lock | Blocks all reads briefly (close + nil); called every chunk boundary after LFS flush |
 | `AddActiveStore` | Write Lock | Blocks all reads briefly (pointer assignments); called at range boundary (~10M ledgers) |
-| `PromoteToTransitioning` | Write Lock | Blocks all reads briefly (pointer swaps); called at range boundary |
+| `PromoteToTransitioning` | Write Lock | Blocks all reads briefly (pointer swap); called at range boundary |
 | `AddImmutableStores` | Write Lock | Blocks all reads briefly (map insert); called at range boundary |
-| `RemoveTransitioningStores` | Write Lock | Blocks all reads briefly (close + nil); called at range boundary |
+| `RemoveTransitioningTxHashStore` | Write Lock | Blocks all reads briefly (close + nil); called at range boundary |
 
-**Key Insight**: `SwapActiveLedgerStore` fires at every chunk boundary (~every 10K ledgers, ~1000× per range) — but it holds the write lock only for a pointer swap, typically sub-microsecond. The heavier range-boundary operations (`PromoteToTransitioning`, `AddActiveStore`) fire ~every 10M ledgers. The write lock is **never** held during disk I/O. Queries experience negligible contention.
+**Key Insight**: `SwapActiveLedgerStore` and `CompleteLedgerTransition` fire at every chunk boundary (~every 10K ledgers, ~1000× per range) — but they hold the write lock only for pointer swaps or close+nil, typically sub-microsecond. The heavier range-boundary operations (`PromoteToTransitioning`, `AddActiveStore`) fire ~every 10M ledgers. The write lock is **never** held during disk I/O (the actual LFS flush and RecSplit build happen outside the lock). Queries experience negligible contention.
 
 **getTransactionByHash locking pattern**: The read lock is acquired only to snapshot store references into local variables, then released. All disk I/O (RecSplit lookups, LFS reads, RocksDB reads) happens without holding any lock. This prevents one slow query from blocking registry updates.
 
@@ -433,7 +480,7 @@ The `QueryRouter` uses a single `sync.RWMutex` to protect its in-memory store re
 | Mode | Acquired By | Behavior |
 |------|-------------|----------|
 | **Read lock** (`RLock` / `RUnlock`) | Query handlers (`getLedgerBySequence`, `getTransactionByHash`) | Multiple goroutines can hold it simultaneously. Used to safely read store pointers before any I/O. |
-| **Write lock** (`Lock` / `Unlock`) | Registry update methods (`SwapActiveLedgerStore`, `AddActiveStore`, `PromoteToTransitioning`, `AddImmutableStores`, `RemoveTransitioningStores`) | Exclusive — blocks all readers. Held only for in-memory pointer/map assignments. **Never held during disk I/O.** |
+| **Write lock** (`Lock` / `Unlock`) | Registry update methods (`SwapActiveLedgerStore`, `CompleteLedgerTransition`, `AddActiveStore`, `PromoteToTransitioning`, `AddImmutableStores`, `RemoveTransitioningTxHashStore`) | Exclusive — blocks all readers. Held only for in-memory pointer/map assignments. **Never held during disk I/O.** |
 
 ### The Snapshot Pattern
 
@@ -468,16 +515,26 @@ flowchart TD
     IN(["getLedgerBySequence(ledgerSeq)"])
     IN --> RANGE["Compute rangeID<br/>rangeID = (ledgerSeq - 2) / 10,000,000"]
     RANGE --> RLOCK["Acquire READ lock"]
-    RLOCK --> SNAP["Copy rangeState + store handle<br/>for this rangeID into local vars"]
+    RLOCK --> SNAP["Copy rangeState + store handles<br/>for this rangeID into local vars"]
     SNAP --> RUNLOCK["Release READ lock"]
     RUNLOCK --> SW{"What is rangeState?"}
 
-    SW -->|"ACTIVE or TRANSITIONING"| KEY["key = uint32BE(ledgerSeq)"]
-    KEY --> RDB["RocksDB GET<br/>active/transitioning ledger store<br/>default CF"]
-    RDB --> FOUND1{"record found?"}
+    SW -->|"ACTIVE"| ACHK["Compute chunkID<br/>chunkID = (ledgerSeq - 2) / 10,000"]
+    ACHK --> AWHICH{"Which chunk store<br/>has this ledger?"}
+    AWHICH -->|"chunkID == activeChunkID"| ARDB["RocksDB GET<br/>activeLedgerStore<br/>key = uint32BE(ledgerSeq)"]
+    AWHICH -->|"chunkID == transitioningChunkID<br/>(LFS flush in progress)"| TRDB["RocksDB GET<br/>transitioningLedgerStore<br/>key = uint32BE(ledgerSeq)"]
+    AWHICH -->|"chunk already flushed to LFS<br/>(lfs_done = 1)"| ALFS["LFS lookup<br/>immutable/ledgers/chunks/chunkDir/chunkID.data"]
+    ARDB --> FOUND1{"record found?"}
+    TRDB --> FOUND1
     FOUND1 -->|no| NF1(["return NOT_FOUND"])
     FOUND1 -->|yes| DEC1["zstd decompress"]
     DEC1 --> RET1(["return LedgerCloseMeta"])
+    ALFS --> DEC1
+
+    SW -->|"TRANSITIONING"| TLFS["All ledger stores already flushed to LFS<br/>Compute chunkID = (ledgerSeq - 2) / 10,000"]
+    TLFS --> CID2["LFS lookup<br/>immutable/ledgers/chunks/chunkDir/chunkID.data"]
+    CID2 --> DEC2["zstd decompress"]
+    DEC2 --> RET2(["return LedgerCloseMeta"])
 
     SW -->|"COMPLETE"| CID["Compute chunkID<br/>chunkID = (ledgerSeq - 2) / 10,000"]
     CID --> CDIR["Compute chunkDir<br/>chunkDir = chunkID / 1000 (4-digit zero-padded)"]
@@ -485,8 +542,8 @@ flowchart TD
     IDX --> OFF["Read uint64 at offset<br/>(ledgerSeq - chunkFirstLedger) x 8<br/>= byteOffset into .data file"]
     OFF --> DAT["Open .data file<br/>immutable/ledgers/chunks/chunkDir/chunkID.data"]
     DAT --> SEEK["Seek to byteOffset<br/>Read variable-length record"]
-    SEEK --> DEC2["zstd decompress"]
-    DEC2 --> RET2(["return LedgerCloseMeta"])
+    SEEK --> DEC3["zstd decompress"]
+    DEC3 --> RET3(["return LedgerCloseMeta"])
 
     SW -->|"not present / not ingested"| NF2(["return NOT_FOUND"])
 ```
@@ -592,7 +649,7 @@ This is O(1) per range probe (RecSplit lookup + one ledger read + one LCM scan),
 The QueryRouter does not know a priori which range a txhash belongs to. It probes in this fixed order:
 
 1. **Active store** (`ACTIVE` state) — most likely for recent transactions; direct RocksDB CF lookup
-2. **Transitioning store** (`TRANSITIONING` state) — same RocksDB stores, still alive during transition
+2. **Transitioning store** (`TRANSITIONING` state) — txhash RocksDB store still alive during RecSplit build
 3. **Complete ranges** (`COMPLETE` state) — newest first via `completeRangeIDs` descending slice
 
 **Optimization**: the router holds pre-loaded `RecSplitStore` handles (all 16 CF indexes per range), loaded at startup and cached forever. No file opens per query.
@@ -603,8 +660,8 @@ The QueryRouter does not know a priori which range a txhash belongs to. It probe
 
 | Range State | `getLedgerBySequence(N)` store | `getTransactionByHash` store |
 |-------------|-------------------------------|------------------------------|
-| `ACTIVE` | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` (default CF) | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` (CF for nibble) |
-| `TRANSITIONING` | `<active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/` (default CF) | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` (CF for nibble) |
+| `ACTIVE` | Active ledger store, transitioning ledger store (during chunk flush), or LFS (already-flushed chunks) | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` (CF for nibble) |
+| `TRANSITIONING` | LFS chunks in `immutable/ledgers/chunks/` (all ledger stores already transitioned and deleted during ACTIVE) | `<active_stores_base_dir>/txhash-store-range-{rangeID:04d}/` (transitioning txhash store, CF for nibble) |
 | `COMPLETE` | `immutable/ledgers/chunks/{XXXX}/{YYYYYY}.data` | `immutable/txhash/{rangeID:04d}/index/cf-{nibble}.idx` |
 
 ---
@@ -636,30 +693,31 @@ The QueryRouter does not know a priori which range a txhash belongs to. It probe
 3. `key = uint32BE(65000000)`
 4. RocksDB get from `<active_stores_base_dir>/ledger-store-chunk-006111/` (default CF) → decompress → return
 
-> **Why chunk 006111?** The active ledger store opened at startup is determined by `streaming:last_committed_ledger = 61,111,222`, not by the queried ledger sequence. At startup: `chunkID = (61111222 - 2) / 10000 = 6111`. This is the chunk currently being written. Ledger 65,000,000 (chunk 6499) will live in a future chunk that hasn't been opened yet — but since range 6 is `ACTIVE`, ALL ledgers for range 6 have been committed to whatever chunk store is currently active. This query hits ledger 65,000,000 which was committed earlier (to whatever chunk store was active when that ledger was ingested and is now the current active store at time of the query).
->
-> **Note**: In a real system, this query would only succeed if ledger 65,000,000 has already been ingested (i.e. `last_committed_ledger ≥ 65,000,000`). With `last_committed_ledger = 61,111,222`, this query would return NOT_FOUND because range 6 has only reached ledger 61,111,222.
+> **Why chunk 006111?** The active ledger store opened at startup is determined by `streaming:last_committed_ledger = 61,111,222`, not by the queried ledger sequence. At startup: `chunkID = (61111222 - 2) / 10000 = 6111`. This is the chunk currently being written. Ledger 65,000,000 (chunk 6499) has not been ingested yet — `last_committed_ledger = 61,111,222 < 65,000,000` — so this query returns NOT_FOUND. In general, any `getLedgerBySequence` for a ledger beyond `last_committed_ledger` in the ACTIVE range returns NOT_FOUND.
 
-**Response**: 200 OK (if ledger has been ingested), 404 Not Found otherwise
+**Response**: 404 Not Found (ledger 65,000,000 has not been ingested yet)
 
 ---
 
 ### Example 3: getLedgerBySequence(35,000,000) — Transitioning Range
 
-**System state variation**: range 3 is `TRANSITIONING` (background goroutine is converting it to immutable).
+**System state variation**: range 3 is `TRANSITIONING` (background RecSplit build goroutine is constructing the immutable txhash index).
 
 **Request**: `getLedgerBySequence(35000000)`
 
 **Routing**:
 1. `rangeID = (35000000 - 2) / 10000000 = 3`
-2. `range:0003:state = "TRANSITIONING"` → route to transitioning ledger store
-3. `key = uint32BE(35000000)`
-4. The transitioning ledger store for range 3 is its **last chunk**: `transitioningChunkID = (40000001 - 2) / 10000 = 3999` → `ledger-store-chunk-003999/`
-5. RocksDB get from `<active_stores_base_dir>/ledger-store-chunk-003999/` (default CF) → decompress → return
+2. `range:0003:state = "TRANSITIONING"` → route to LFS for ledger data
+3. `chunkID = (35000000 - 2) / 10000 = 3499`
+4. Chunk 3499 was flushed to LFS during the ACTIVE phase — at chunk boundary 3499→3500, `SwapActiveLedgerStore` moved the old store to `transitioningLedgerStore`, a background goroutine flushed it to LFS, then `CompleteLedgerTransition(3499)` closed and deleted it, setting `range:0003:chunk:3499:lfs_done = "1"`. Route to LFS:
+   - path: `immutable/ledgers/chunks/0003/003499.data`
+   - Seek via `.index` → decompress → return `LedgerCloseMeta`
 
 **Response**: 200 OK
 
-**Key insight**: The transitioning ledger store is the **last chunk store** of range 3 (`ledger-store-chunk-003999/`), held open in `transitioningLedgerStore`. All ledgers of range 3 (including ledger 35,000,000, which lived in chunk 3499) are accessible via the transitioning store — RocksDB stores all range 3 ledgers regardless of chunk ID. The transitioning pointer points to the last chunk's DB handle, which remains open and readable for the full range. The `TRANSITIONING` state is purely logical — no data movement until the goroutine completes.
+**Key insight**: During streaming, each ledger store transitions independently at its chunk boundary (every 10K ledgers). `SwapActiveLedgerStore` moves the old store to `transitioningLedgerStore` (it stays open for reads during LFS flush). A background goroutine reads the 10K ledgers, writes LFS `.data` + `.index` files, sets `lfs_done`, then calls `CompleteLedgerTransition` to close and delete the transitioning store. By the time range 3 reaches `TRANSITIONING`, **all 1,000 ledger stores have been individually transitioned to LFS and deleted** — there are no ledger RocksDB stores left. Only the txhash RocksDB store (`txhash-store-range-0003/`) remains open as `transitioningTxHashStore` while RecSplit builds.
+
+> **Routing for TRANSITIONING ranges**: All ledger queries route to LFS (every chunk was flushed during ACTIVE). Transaction hash queries route to the `transitioningTxHashStore` (still open during RecSplit build). This is different from the ACTIVE path, where ledger queries may hit either the active ledger store (current chunk) or the transitioning ledger store (previous chunk being flushed), or LFS (already-flushed chunks).
 
 ---
 
@@ -796,6 +854,6 @@ The existing routing infrastructure (range state reads, store handle caching, `A
 - [02-meta-store-design.md](./02-meta-store-design.md) — range state keys read by query router at startup
 - [04-streaming-workflow.md](./04-streaming-workflow.md) — gap detection; when `AddActiveStore` is called
 - [05-backfill-transition-workflow.md](./05-backfill-transition-workflow.md) — RecSplit index construction
-- [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) — when `PromoteToTransitioning`, `AddImmutableStores`, `RemoveTransitioningStores` are called
+- [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) — when `PromoteToTransitioning`, `AddImmutableStores`, `RemoveTransitioningTxHashStore` are called; ledger sub-flow transitions at chunk boundaries via `SwapActiveLedgerStore` + `CompleteLedgerTransition`
 - [07-crash-recovery.md](./07-crash-recovery.md) — router re-initializes from meta store on restart
 - [11-checkpointing-and-transitions.md](./11-checkpointing-and-transitions.md) — `ledgerToChunkID` and `ledgerToRangeID` formulas

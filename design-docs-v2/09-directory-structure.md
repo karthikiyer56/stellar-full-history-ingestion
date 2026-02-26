@@ -8,7 +8,7 @@ The service organizes all data under a single configurable `data_dir`. Backfill 
 
 ## Full File Tree
 
-The tree below shows a **streaming snapshot at the range 5→6 boundary**: range 5 is `TRANSITIONING` (both its stores remain open for queries while the background goroutine converts them to immutable), and range 6 is the newly `ACTIVE` range. Ranges 0–4 are `COMPLETE` and shown only by their immutable artifacts.
+The tree below shows a **streaming snapshot at the range 5→6 boundary**: range 5 is `TRANSITIONING` (only the transitioning txhash store remains open for queries — all ledger stores were individually transitioned and deleted at their chunk boundaries during ACTIVE — while the background RecSplit build goroutine converts the txhash store to immutable), and range 6 is the newly `ACTIVE` range. Ranges 0–4 are `COMPLETE` and shown only by their immutable artifacts.
 
 ```
 {data_dir}/
@@ -23,15 +23,11 @@ The tree below shows a **streaming snapshot at the range 5→6 boundary**: range
 ├── active/                                   ← [active_stores].base_path (default: {data_dir}/active)
 │   │                                           STREAMING MODE ONLY
 │   │
-│   │   ── TRANSITIONING: range 5 stores (open read-only; being converted to immutable) ──
-│   ├── ledger-store-chunk-005999/            ← Last ledger store of range 5 (chunk 5999,
-│   │   ├── MANIFEST-*                          ledgers 59,990,002–60,000,001); stays open
-│   │   ├── *.sst                               until transition goroutine completes
-│   │   ├── *.log
-│   │   └── OPTIONS-*
+│   │   ── TRANSITIONING: range 5 txhash store (open read-only; RecSplit being built) ──
+│   │   (no ledger store — all ledger stores for range 5 were deleted at their chunk boundaries)
 │   ├── txhash-store-range-0005/              ← TxHash store for range 5 (10M-ledger range);
-│   │   ├── MANIFEST-*                          stays open until transition goroutine completes
-│   │   ├── *.sst
+│   │   ├── MANIFEST-*                          stays open until RecSplit build completes
+│   │   ├── *.sst                               and RemoveTransitioningTxHashStore is called
 │   │   ├── *.log
 │   │   └── OPTIONS-*
 │   │
@@ -68,7 +64,7 @@ The tree below shows a **streaming snapshot at the range 5→6 boundary**: range
     │       │   └── ...
     │       ├── 0004/                         ← range 4: chunks 4000–4999
     │       │   └── ...
-    │       └── 0005/                         ← range 5: chunks 5000–5999 (written by transition goroutine)
+    │       └── 0005/                         ← range 5: chunks 5000–5999 (written at each chunk boundary during ACTIVE by per-chunk ledger transition goroutines)
     │           ├── 005000.data               ← chunk 5000: ledgers 50,000,002–50,010,001
     │           ├── 005000.index
     │           ├── ...
@@ -100,8 +96,8 @@ The tree below shows a **streaming snapshot at the range 5→6 boundary**: range
 ```
 
 **Notes**:
-- `active/` is created when streaming mode starts. At most **4 RocksDB stores** can exist simultaneously at a range boundary: the two TRANSITIONING stores (range N's ledger-store + txhash-store) plus the two ACTIVE stores (range N+1's ledger-store + txhash-store). All 4 stay open for queries until the transition goroutine completes and sets the range to `COMPLETE`.
-- The TRANSITIONING ledger-store-chunk-NNNNN and txhash-store-range-NNNN are deleted in-place once verification passes — they are never moved or renamed.
+- `active/` is created when streaming mode starts. At most **3 RocksDB stores** can exist simultaneously at a range boundary: the TRANSITIONING txhash store (range N — ledger stores already deleted at chunk boundaries) plus the two ACTIVE stores (range N+1's ledger-store + txhash-store). Briefly during a chunk boundary within the ACTIVE phase, a 4th store may exist: the transitioning ledger store (being flushed to LFS). Each sub-flow has at most 1 active + 1 transitioning store at any time.
+- The TRANSITIONING txhash-store-range-NNNN is deleted in-place once RecSplit build and verification pass via `RemoveTransitioningTxHashStore` — it is never moved or renamed. Ledger stores are deleted at each chunk boundary via `CompleteLedgerTransition` after the LFS flush completes.
 - `immutable/txhash/{rangeID:04d}/raw/` exists **only during backfill ingestion** (state `INGESTING` or `RECSPLIT_BUILDING`). It is deleted immediately after all 16 RecSplit CFs for that range are built and verified. A COMPLETE range has no `raw/` directory — only `index/`.
 - **Streaming mode never creates `raw/`**. RecSplit is built directly from the active txhash store (reading each of its 16 CFs by nibble); no flat files are written to disk.
 
@@ -227,10 +223,10 @@ func recSplitPath(dataDir string, rangeID uint32, nibble string) string {
 ```
 
 **Two separate RocksDB instances per active range:**
-- **Ledger store** (`ledger-store-chunk-{chunkID:06d}/`): default CF only. `key = uint32BE(ledgerSeq)`, `value = zstd(LedgerCloseMeta)`. One instance per 10K-ledger chunk; replaced at every chunk boundary.
-- **TxHash store** (`txhash-store-range-{rangeID:04d}/`): 16 column families, one per first hex character of the txhash (`0`–`f`). CF routing: first hex char of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes). `key = txhash[32]`, `value = uint32BE(ledgerSeq)`. One instance per 10M-ledger range; replaced at every range boundary.
+- **Ledger store** (`ledger-store-chunk-{chunkID:06d}/`): default CF only. `key = uint32BE(ledgerSeq)`, `value = zstd(LedgerCloseMeta)`. One instance per 10K-ledger chunk; transitions at every chunk boundary (active → transitioning → LFS flush → close + delete via `CompleteLedgerTransition`; max 1 active + 1 transitioning per sub-flow).
+- **TxHash store** (`txhash-store-range-{rangeID:04d}/`): 16 column families, one per first hex character of the txhash (`0`–`f`). CF routing: first hex char of the 64-char hash string (equivalently `txhash[0] >> 4` on raw bytes). `key = txhash[32]`, `value = uint32BE(ledgerSeq)`. One instance per 10M-ledger range; transitions at every range boundary (active → transitioning via `PromoteToTransitioning` → RecSplit build → close + delete via `RemoveTransitioningTxHashStore`; max 1 active + 1 transitioning).
 
-At most one active range exists at a time. During streaming transition, both stores are kept alive for queries until the transition completes and is verified, then both are deleted.
+At most one active range exists at a time. During streaming transition (TRANSITIONING state), only the transitioning txhash store remains open for queries — all ledger stores have already been deleted at their chunk boundaries. Ledger queries are served from LFS. The transitioning txhash store is deleted after RecSplit build and verification complete.
 
 ---
 

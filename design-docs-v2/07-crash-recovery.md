@@ -306,10 +306,10 @@ Key observations:
   2. Within range 1, all 20 BSB instances resume in parallel.
      Each checks its own chunk slice and skips already-done chunks.
      Non-contiguous gaps are handled by the flat per-chunk scan.
-   3. Raw txhash flat files for range 0 survived intact — safe RecSplit input.
-   4. Chunk 1020: lfs_done="1" but txhash_done absent → full rewrite of both files.
+  3. Raw txhash flat files for range 0 survived intact — safe RecSplit input.
+  4. Chunk 1020: lfs_done="1" but txhash_done absent → full rewrite of both files.
 
-   5. BSB instance 3 (chunks 1150–1199: fully complete) does zero work on resume.
+  5. BSB instance 3 (chunks 1150–1199: fully complete) does zero work on resume.
 ```
 
 ---
@@ -943,68 +943,132 @@ On restart:
   Ledgers already in both active stores via WAL replay: safe, writes are idempotent
 ```
 
-### Scenario S2: Crash During Phase 1 (LFS Chunk Writes) of Streaming Transition
+### Scenario S2: Crash During Ledger Sub-flow Transition (at Chunk Boundary)
 
 ```
 State at crash:
-  range:0000:state                = "TRANSITIONING"
-  range:0000:chunk:000050:lfs_done = "1"   ← chunks 0–50 complete
-  range:0000:chunk:000051:lfs_done = absent ← crash writing chunk 51
-  range:0001:state                = "ACTIVE"
-  streaming:last_committed_ledger = 20,000,000
+  range:0000:state                = "ACTIVE"
+  range:0000:chunk:000050:lfs_done = "1"   ← chunks 0–50 transitioned at their chunk boundaries
+  range:0000:chunk:000051:lfs_done = absent ← crash during chunk 51's LFS flush goroutine
+  transitioningLedgerStore != nil (chunk 51's store still being flushed)
+  streaming:last_committed_ledger = some ledger within chunk 52 (ingestion continues)
 
 On restart:
-  range 0: TRANSITIONING → resume transition goroutine in background
-  range 1: ACTIVE → resume streaming from 20,000,001
-  Transition goroutine:
-    Scan lfs_done flags: chunks 0–50 skip, chunk 51+ rewrite from active ledger store
-    (Note: many of chunks 0–50 may have been flushed during ACTIVE by the background
-     LFS flush goroutine before transition was triggered; those lfs_done flags are
-     equally valid — no distinction between ACTIVE-phase and TRANSITIONING-phase flushes)
-  Active ledger store and txhash store for range 0 stay open; queries served from them throughout
+  range 0: ACTIVE → resume streaming from last_committed_ledger + 1
+  WAL recovery restores the active ledger store (current chunk) and the txhash store
+  The transitioning ledger store for chunk 51 is gone (crash cleared it)
+  Chunk 51's data is still in the WAL-recovered state from the active store at crash time
+  → Re-trigger chunk 51's LFS flush: read from the re-opened store → write LFS → set lfs_done
+  → Resume normal ingestion; future chunk boundaries trigger their own transitions
+  Active txhash store is unaffected — it spans the entire range
 ```
 
-### Scenario S3: Crash During Phase 2 (RecSplit Build) of Streaming Transition
+### Scenario S3: Crash During TxHash Sub-flow Transition (RecSplit Build)
 
 ```
 State at crash:
   range:0000:state               = "TRANSITIONING"
-  (all 1000 lfs_done = "1")
+  (all 1000 lfs_done = "1" — set during ACTIVE at each chunk boundary)
   range:0000:recsplit:state      = "BUILDING"
   range:0000:recsplit:cf:00:done = "1"
   range:0000:recsplit:cf:01:done = absent
 
 On restart:
-  Transition goroutine: Phase 1 complete (all lfs_done="1") → skip to Phase 2
-  Scan CF flags: CF 0 done, CFs 1–15 rebuild from active txhash store (reading each CF by nibble)
-  Active txhash store for range 0 still on disk — transition does not delete it until COMPLETE
+  Transition goroutine: all lfs_done flags already set during ACTIVE → only RecSplit recovery needed
+  Scan CF flags: CF 0 done, CFs 1–15 rebuild from transitioning txhash store (reading each CF by nibble)
+  Transitioning txhash store for range 0 still on disk — not deleted until COMPLETE
 ```
 
-### Scenario S4: Crash After Verification, Before Active Store Delete
+### Scenario S4: Crash After Verification, Before Transitioning TxHash Store Deleted
 
 ```
 State at crash:
   range:0000:state = "TRANSITIONING"
   (all lfs_done, all recsplit:cf:XX:done = "1")
-  Active ledger store and txhash store still on disk
+  Transitioning txhash store still on disk (no ledger stores — all deleted at chunk boundaries)
 
 On restart:
   All flags set → infer transition complete
   Re-run verification (spot-check)
-  Delete both active stores (ledger store + txhash store)
+  RemoveTransitioningTxHashStore — close + delete transitioning txhash store
   Set range:0000:state = "COMPLETE"
 ```
 
-### Scenario S5: Crash After COMPLETE Written, Before Active Store Deleted
+### Scenario S5: Crash After COMPLETE Written, Before Transitioning TxHash Store Deleted
 
 ```
   range:0000:state = "COMPLETE"
-  Active ledger store and/or txhash store still on disk
+  Transitioning txhash store still on disk (orphaned)
 
 On restart:
   state = COMPLETE → no transition needed
-  Both active stores are orphaned → safe to delete on startup
-  Query routing uses immutable stores for range 0
+  Orphaned transitioning txhash store → safe to delete on startup
+  Query routing uses immutable stores (LFS + RecSplit) for range 0
+```
+
+### Scenario SC1: Crash While Waiting for Last Chunk's LFS Flush at Range Boundary
+
+This crash occurs in the narrow window at the range boundary where `waitForLedgerTransitionComplete()` is blocking, waiting for the last chunk's (chunk 999) LFS flush goroutine to finish.
+
+```
+State at crash:
+  The range boundary ledger has been committed to the txhash store.
+  The last chunk (999) LFS flush goroutine is running but hasn't finished.
+  transitioningLedgerStore != nil (last chunk's store still transitioning)
+  range:N:state = "ACTIVE" (not yet set to TRANSITIONING — crashed during the wait)
+  range:N:chunk:000999:lfs_done = absent
+  streaming:last_committed_ledger = rangeLastLedger(N)
+
+On restart:
+  range:N:state = "ACTIVE" → resume streaming from last_committed_ledger + 1
+  last_committed_ledger IS the range boundary ledger, so:
+    current_range = N+1 (computed from the resume ledger)
+    range N: still ACTIVE with chunk 999's lfs_done absent
+  Recovery must:
+    1. Detect that range N is ACTIVE but all chunks except 999 have lfs_done set
+    2. WAL recovery restores the active ledger store data for chunk 999
+    3. Re-trigger chunk 999's LFS flush from the WAL-recovered store
+    4. After chunk 999 flush completes and lfs_done is set, proceed with range boundary handling:
+       waitForLedgerTransitionComplete (immediate — no transitioning store)
+       Verify all 1,000 lfs_done flags → all set
+       Set TRANSITIONING, PromoteToTransitioning (txhash only), spawn RecSplit goroutine
+```
+
+### Scenario SC2: Crash After All lfs_done Verified, Before TRANSITIONING Written
+
+This crash occurs after `waitForLedgerTransitionComplete()` returns and all 1,000 `lfs_done` flags are verified, but before the `TRANSITIONING` state is written to the meta store.
+
+```
+State at crash:
+  All 1000 lfs_done flags = "1" (verified — all set during ACTIVE at chunk boundaries)
+  range:N:state = "ACTIVE" (not yet written to TRANSITIONING)
+  streaming:last_committed_ledger = rangeLastLedger(N)
+  No transitioning ledger store (all deleted at their chunk boundaries)
+
+On restart:
+  Same as SC1 — re-enter range boundary handling
+  waitForLedgerTransitionComplete: immediate (no transitioning store)
+  lfs_done scan: all 1,000 flags present → proceed
+  Write TRANSITIONING, PromoteToTransitioning (txhash only), spawn RecSplit goroutine
+```
+
+### Scenario SC3: Crash During RecSplit Build (All lfs_done Already Set During ACTIVE)
+
+This is Scenario S3 restated to emphasize the correct model: there is no "Phase 1" to resume. All `lfs_done` flags were set during ACTIVE at their respective chunk boundaries. Recovery only needs to handle incomplete RecSplit CFs.
+
+```
+State at crash:
+  range:N:state = "TRANSITIONING"
+  All 1,000 lfs_done flags = "1" (set during ACTIVE — not at transition time)
+  range:N:recsplit:state = "BUILDING"
+  Some recsplit:cf:XX:done flags set, others absent
+
+On restart:
+  Transition goroutine: all lfs_done flags set → no LFS work needed
+  Scan CF done flags:
+    CFs with done="1" → skip (use existing .idx files)
+    CFs with done=absent → delete partial .idx file (if any), rebuild from transitioning txhash store
+  Continue RecSplit build → verify → COMPLETE → RemoveTransitioningTxHashStore
 ```
 
 ---
@@ -1204,43 +1268,40 @@ ledger always produces the same key-value entries.
 
 ---
 
-### OF6: Crash Between `range:N:state=TRANSITIONING` Written and Transition Goroutine Starting Any Work
+### OF6: Crash Between `range:N:state=TRANSITIONING` Written and RecSplit Goroutine Starting Any Work
 
-**Where in the sequence** (streaming TRANSITIONING only): The streaming range boundary was detected. The range state key was written to `"TRANSITIONING"`. The process crashed before the transition goroutine wrote a single `lfs_done` flag or started any RecSplit work.
+**Where in the sequence** (streaming TRANSITIONING only): The streaming range boundary was detected. All ledger sub-flow transitions completed during ACTIVE (all 1,000 `lfs_done` flags are set). The range state key was written to `"TRANSITIONING"` and the txhash store was promoted to transitioning. The process crashed before the RecSplit goroutine wrote a single CF done flag or started any RecSplit work.
 
-**What it means**: The state says `TRANSITIONING` but the disk is completely empty of LFS chunk files and RecSplit index files for this range. Zero transition work was done.
+**What it means**: The state says `TRANSITIONING`, all `lfs_done` flags are set (from ACTIVE), but zero RecSplit work was done. No ledger stores exist (all deleted at their chunk boundaries during ACTIVE). Only the transitioning txhash store remains.
 
 ```
 Meta store at crash:
   range:0001:state                    = "TRANSITIONING"  ← written
-  range:0001:chunk:001000:lfs_done    = absent            ← no chunks written yet
-  range:0001:chunk:001001:lfs_done    = absent
-  ... (all 1000 lfs_done flags: absent)
+  range:0001:chunk:001000:lfs_done    = "1"   ┐
+  range:0001:chunk:001001:lfs_done    = "1"   │ All 1000 lfs_done flags set
+  ...                                         │ (set during ACTIVE at chunk boundaries)
+  range:0001:chunk:001999:lfs_done    = "1"   ┘
   range:0001:recsplit:state           = absent
   streaming:last_committed_ledger     = 19,999,995
 
 Disk state:
-  <active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/  ← still intact (not deleted)
-  <active_stores_base_dir>/txhash-store-range-0001/  ← still intact (not deleted)
-  immutable/ledgers/chunks/0001/     ← empty (no LFS chunks written yet)
+  <active_stores_base_dir>/txhash-store-range-0001/  ← transitioning txhash store, still intact
+  (no ledger stores — all deleted at chunk boundaries during ACTIVE)
+  immutable/ledgers/chunks/0001/     ← all 1000 LFS chunk files present (written during ACTIVE)
   immutable/txhash/0001/index/       ← empty (no CF files written yet)
 
 Recovery:
   Step 1: range:0001:state = "TRANSITIONING" → spawn transition goroutine
-  Step 2: Transition goroutine scans lfs_done flags:
-            All 1000 flags absent → all 1000 chunks must be written from active store
-            skipSet = {}, workSet = {000..999} (all 1000 chunks)
-  Step 3: Phase 1 — flush all 1000 chunks from active ledger store to LFS
-            (same path as a fresh transition start)
-  Step 4: Phase 2 — build all 16 RecSplit CFs from active txhash store
-  Step 5: Verify, delete active stores, set range:0001:state = "COMPLETE"
+  Step 2: All lfs_done flags are set → no LFS work needed
+  Step 3: Build all 16 RecSplit CFs from transitioning txhash store
+  Step 4: Verify → RemoveTransitioningTxHashStore → set range:0001:state = "COMPLETE"
 
 Concurrently:
   Streaming resumes from last_committed_ledger + 1 = 19,999,996
-  using the active store for range:0001 (still intact throughout the transition)
+  using the active stores for range:0002 (or whichever range the resume ledger falls in)
 ```
 
-**Why this scenario matters**: The crash window between writing `TRANSITIONING` and doing any transition work is real — a single meta store Put followed immediately by a crash is possible. The recovery path handles this correctly because it starts from scratch (all flags absent), but this needs to be stated explicitly so the reader understands that a completely empty transition is safe to resume.
+**Why this scenario matters**: The crash window between writing `TRANSITIONING` and doing any RecSplit work is real — a single meta store Put followed immediately by a crash is possible. The recovery path handles this correctly because all `lfs_done` flags were set during ACTIVE, so recovery only needs to build RecSplit from scratch. The transitioning txhash store is still on disk and provides all the data needed.
 
 ---
 
@@ -1255,31 +1316,33 @@ Meta store at crash:
   range:0001:recsplit:cf:00:done = "1"  ┐
   ...                                   │ All 16 CFs done
   range:0001:recsplit:cf:0f:done = "1"  ┘
-  (all 1000 lfs_done flags = "1")
+  (all 1000 lfs_done flags = "1" — set during ACTIVE at chunk boundaries)
 
 Disk state:
   immutable/ledgers/chunks/0001/: all 1000 LFS chunk files present
   immutable/txhash/0001/index/cf-0.idx … cf-f.idx: all 16 present, complete
-  <active_stores_base_dir>/ledger-store-chunk-{chunkID:06d}/: still on disk (not yet deleted)
-  <active_stores_base_dir>/txhash-store-range-0001/: still on disk (not yet deleted)
+  <active_stores_base_dir>/txhash-store-range-0001/: transitioning txhash store still on disk (not yet deleted)
+  (no ledger stores — all deleted at chunk boundaries during ACTIVE)
 
 Recovery:
   Step 1: range:0001:state = "TRANSITIONING" → spawn transition goroutine
   Step 2: Goroutine reads recsplit:state = "COMPLETE"
-            → Phase 1 and Phase 2 are both done; skip directly to verification
+            → all lfs_done set and RecSplit done; skip directly to verification
   Step 3: Re-run spot-check verification on immutable stores
-  Step 4: Delete active ledger store and active txhash store
+  Step 4: RemoveTransitioningTxHashStore — close + delete transitioning txhash store
   Step 5: Set range:0001:state = "COMPLETE"
 
 Query routing during recovery:
   While the transition goroutine is running steps 2–4 (re-verification + store delete),
-  the active stores are still on disk. Queries for range 1 continue to be served from
-  the active stores. Store deletion (step 4) is atomic at the filesystem level;
-  queries in-flight at that instant are not affected because the active store handles
-  are closed only after all queries complete (graceful drain).
+  the transitioning txhash store is still on disk. Queries for range 1 txhash lookups
+  continue to be served from the transitioning txhash store. Ledger queries for range 1
+  are served from LFS (ledger stores were deleted at chunk boundaries during ACTIVE).
+  Store deletion (step 4) is atomic at the filesystem level; queries in-flight at that
+  instant are not affected because the store handle is closed only after all queries
+  complete (graceful drain).
 ```
 
-**Why this scenario matters**: Without handling `recsplit:state="COMPLETE"` + `range:state="TRANSITIONING"`, a naive recovery might re-run Phase 1 and Phase 2 from scratch, which is unnecessary and expensive (hours of work). Checking `recsplit:state` first short-circuits to verification immediately.
+**Why this scenario matters**: Without handling `recsplit:state="COMPLETE"` + `range:state="TRANSITIONING"`, a naive recovery might rescan all CF flags and rebuild from scratch, which is unnecessary and expensive. Checking `recsplit:state` first short-circuits to verification immediately.
 
 ---
 
@@ -1294,7 +1357,7 @@ flowchart TD
     RS -->|INGESTING| BACKFILL_RESUME["Backfill: scan ALL 1000 chunk flag pairs<br/>per chunk: both flags = skip<br/>any flag absent = full rewrite of both files<br/>(gaps are expected, not exceptional)"]
     RS -->|RECSPLIT_BUILDING| RECSPLIT_RESUME["Backfill: scan CF done flags<br/>resume from first incomplete CF"]
     RS -->|ACTIVE| STREAMING_RESUME["Streaming: resume from<br/>last_committed_ledger + 1"]
-    RS -->|TRANSITIONING| TRANS_RESUME["Streaming: spawn transition goroutine<br/>scan lfs_done + CF done flags<br/>Phase 1: flush remaining chunks from ledger store<br/>Phase 2: rebuild incomplete RecSplit CFs from txhash store<br/>resume streaming from last_committed_ledger + 1"]
+    RS -->|TRANSITIONING| TRANS_RESUME["Streaming: spawn transition goroutine<br/>all lfs_done flags already set during ACTIVE<br/>scan CF done flags → rebuild incomplete RecSplit CFs<br/>from transitioning txhash store<br/>resume streaming from last_committed_ledger + 1"]
     SKIP --> NEXT{more ranges?}
     SKIP2 --> NEXT
     BACKFILL_RESUME --> NEXT

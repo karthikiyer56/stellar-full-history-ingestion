@@ -139,42 +139,62 @@ Pattern: `((N+1) × 10,000,000) + 1` for range N.
 
 ---
 
-## Background LFS Flush During ACTIVE (Streaming)
+## Ledger Sub-flow Transition at Chunk Boundaries (Streaming)
 
-While a streaming range is in `ACTIVE` state, a background goroutine flushes completed chunks from the **ledger store** to LFS at each chunk boundary. This is independent of the transition trigger.
+While a streaming range is in `ACTIVE` state, the ledger sub-flow transitions independently at every chunk boundary (every 10K ledgers). This is NOT a background optimization — it IS the ledger store's transition lifecycle.
 
-**When**: After ledger `chunkLastLedger(C)` is committed to the ledger store (i.e., every 10,000 ledgers), the background goroutine reads that chunk's ledgers from the ledger store and writes the corresponding LFS `.data` + `.index` files.
+**Each sub-flow can have at most 1 active store and 1 transitioning store at any point in time.**
+
+| Sub-flow | Transition cadence | Max active | Max transitioning | Max total |
+|----------|-------------------|------------|-------------------|-----------|
+| Ledger | Every 10K ledgers (chunk boundary) | **1** | **1** | **2** |
+| TxHash | Every 10M ledgers (range boundary) | **1** | **1** | **2** |
+
+**When**: After ledger `chunkLastLedger(C)` is committed to the ledger store (i.e., every 10,000 ledgers):
+
+1. `SwapActiveLedgerStore` moves the current active ledger store to `transitioningLedgerStore` (stays open for reads)
+2. A new active ledger store opens for the next chunk
+3. A background goroutine reads the 10K ledgers from the transitioning store → writes `.data` + `.index` files → fsyncs
 
 **After a successful flush + fsync**:
 ```
 range:{N:04d}:chunk:{chunkID:06d}:lfs_done = "1"
 ```
 
-**Range state stays `ACTIVE`** throughout — this is not a transition. The txhash store is **not** flushed during ACTIVE; RecSplit build from the txhash store only happens during the transition goroutine at the 10M-ledger boundary.
+4. `CompleteLedgerTransition(chunkID)` closes + deletes the transitioning ledger store, sets `transitioningLedgerStore = nil`
 
-**Benefit**: By the time transition is triggered, most LFS chunks are already written. Phase 1 of the transition goroutine only needs to flush the remaining incomplete chunks (those whose `lfs_done` flag is absent).
+**Range state stays `ACTIVE`** throughout — the ledger sub-flow transitions happen entirely within the ACTIVE phase. The txhash store is **not** transitioned during ACTIVE; the txhash sub-flow's RecSplit build only happens at the 10M-ledger range boundary.
 
-**Key invariant**: `lfs_done` for streaming ranges is set during ACTIVE (by the background flush goroutine) or during TRANSITIONING Phase 1 (for any remaining unflushed chunks). `txhash_done` is **never** written for streaming ranges — it is backfill-only.
+**Result**: By the time the range boundary is reached, ALL 1,000 `lfs_done` flags are already set. There are no "remaining" chunks to flush at transition time — only the txhash store's RecSplit build remains.
+
+**Key invariant**: `lfs_done` for streaming ranges is set during ACTIVE at each chunk boundary as the ledger sub-flow transitions. There is no deferred "Phase 1" flush at transition time. `txhash_done` is **never** written for streaming ranges — it is backfill-only.
 
 ---
 
-### What Happens at Transition
+### What Happens at Range Boundary (TxHash Sub-flow Transition)
+
+At the range boundary (every 10M ledgers), all ledger sub-flow transitions have already completed during ACTIVE. The range boundary triggers only the txhash sub-flow transition:
 
 ```mermaid
 flowchart TD
-    A["Ledger rangeLastLedger(N) arrives"] --> B["Write to active ledger store for range N"]
+    A["Ledger rangeLastLedger(N) arrives"] --> B["Write to active ledger + txhash stores for range N"]
     B --> C["Write streaming:last_committed_ledger = rangeLastLedger(N)"]
-    C --> D["Set range:N:state = TRANSITIONING in meta store"]
-    D --> E["Spawn background goroutine: streaming transition workflow for range N"]
-    E --> F["Create new active ledger store + txhash store for range N+1"]
+    C --> W["waitForLedgerTransitionComplete()\n(block until last chunk's LFS flush goroutine finishes)"]
+    W --> V["Verify all 1,000 lfs_done flags are set\n(safety check — all set during ACTIVE)"]
+    V --> D["Set range:N:state = TRANSITIONING"]
+    D --> P["PromoteToTransitioning(N) — moves ONLY txhash store\n(no ledger store to move — all already deleted)"]
+    P --> F["Create new active ledger store + txhash store for range N+1"]
     F --> G["Set range:N+1:state = ACTIVE"]
     G --> H["Continue ingesting range N+1"]
-    E --> I["(background) Phase 1: Flush remaining LFS chunks from range N ledger store\n(chunks already flushed during ACTIVE are skipped via lfs_done flags)"]
-    I --> J["(background) Phase 2: Build RecSplit from range N txhash store (16 CFs by nibble)"]
-    J --> K["(background) Verify → delete both active stores → set range:N:state = COMPLETE"]
+    P --> R["(background) Build RecSplit from transitioning txhash store\n(16 CFs in parallel)"]
+    R --> K["(background) Verify → RemoveTransitioningTxHashStore → set range:N:state = COMPLETE"]
 ```
 
-The transition goroutine and the next-range ingestion goroutine run **concurrently**. The active store for range N remains open for queries until the transition goroutine deletes it.
+**Key points**:
+- The `waitForLedgerTransitionComplete()` call blocks until the last chunk boundary's LFS flush goroutine has called `CompleteLedgerTransition` and set `transitioningLedgerStore = nil`.
+- `PromoteToTransitioning` moves ONLY the txhash store — all ledger stores were individually transitioned and deleted at their chunk boundaries during ACTIVE.
+- The transitioning txhash store remains open for queries until `RemoveTransitioningTxHashStore` deletes it after verification.
+- The RecSplit build goroutine and the next-range ingestion run **concurrently**.
 
 ---
 
@@ -254,42 +274,50 @@ All 16 CFs done → range:0000:state = "COMPLETE"
 ## Complete Walk-Through: Range 0 → Range 1 Transition (Streaming)
 
 ```
-During ACTIVE (Range 0, background goroutine):
+During ACTIVE (Range 0, ledger sub-flow transitions at each chunk boundary):
   Ledger 10,001 (= chunkLastLedger(0)):
-    Background flush: read chunk 0 from ledger store → write LFS files → fsync
+    SwapActiveLedgerStore: move active → transitioningLedgerStore, open new active for chunk 1
+    Background goroutine: read chunk 0 from transitioning store → write LFS files → fsync
     Set range:0000:chunk:000000:lfs_done = "1"
+    CompleteLedgerTransition(0): close + delete transitioning ledger store
   Ledger 20,001 (= chunkLastLedger(1)):
-    Background flush: chunk 1 → LFS → lfs_done = "1"
-  ... (repeats every 10,000 ledgers for all 1000 chunks)
+    Same lifecycle: swap → flush → lfs_done → CompleteLedgerTransition(1)
+  ... (each chunk boundary triggers an independent ledger sub-flow transition;
+       at most 1 active + 1 transitioning ledger store exist at any time)
   Ledger 9,990,001 (= chunkLastLedger(998)):
-    Background flush: chunk 998 → LFS → lfs_done = "1"
-  (chunk 999 will still be in-progress when the transition trigger fires)
+    Same lifecycle: swap → flush → lfs_done → CompleteLedgerTransition(998)
+  Ledger 10,000,001 (= chunkLastLedger(999) = rangeLastLedger(0)):
+    SwapActiveLedgerStore for chunk 999 → triggers ledger sub-flow transition
+    (chunk 999's LFS flush goroutine is now running in background)
 
-Ledger 10,000,001 (= rangeLastLedger(0)):
-  1. Write ledger 10,000,001 to Range 0 ledger store
-  2. Write ledger 10,000,001 to Range 0 txhash store (CF for nibble)
-  3. Write streaming:last_committed_ledger = 10,000,001
-  4. Set range:0000:state = "TRANSITIONING"
-  5. Spawn transition goroutine for range 0
-  6. Create Range 1 ledger store + txhash store
-  7. Set range:0001:state = "ACTIVE"
+Range boundary handling (ledger 10,000,001 = rangeLastLedger(0)):
+  1. Write ledger 10,000,001 to Range 0 active ledger store + txhash store
+  2. Write streaming:last_committed_ledger = 10,000,001
+  3. waitForLedgerTransitionComplete()
+     → blocks until chunk 999's LFS flush finishes and CompleteLedgerTransition(999) is called
+  4. Verify all 1,000 lfs_done flags are set (safety check — all set during ACTIVE)
+  5. Set range:0000:state = "TRANSITIONING"
+  6. PromoteToTransitioning(0) — moves ONLY txhash store to transitioningTxHashStore
+     (no ledger store to move — all 1,000 already transitioned and deleted)
+  7. Create Range 1 ledger store + txhash store
+  8. Set range:0001:state = "ACTIVE"
 
 Ledger 10,000,002:
-  Written to Range 1 ledger store + txhash store
+  Written to Range 1 active ledger store + txhash store
 
-Transition goroutine (running concurrently):
-  Phase 1: Scan lfs_done flags for all 1000 chunks of Range 0
-           Chunks 0–998: lfs_done="1" already → skip (flushed during ACTIVE)
-           Chunk 999: lfs_done absent → read from Range 0 ledger store → write LFS → set lfs_done="1"
-  Phase 2: Build 16 RecSplit CFs from Range 0 txhash store (read each CF by nibble)
-           After each CF: set recsplit:cf:XX:done = "1"
-  Phase 3: Spot-check verify LFS + RecSplit
-  Phase 4: Set range:0000:state = "COMPLETE"
-  Phase 5: Delete Range 0 ledger store and txhash store directories
+RecSplit build goroutine (running concurrently with Range 1 ingestion):
+  Build 16 RecSplit CFs from transitioning txhash store (read each CF by nibble)
+  After each CF: set recsplit:cf:XX:done = "1"
+  Spot-check verify LFS + RecSplit
+  Set range:0000:state = "COMPLETE"
+  AddImmutableStores(0, lfsStore, recsplitStore)
+  RemoveTransitioningTxHashStore(0) — close + delete transitioning txhash store
 
 Queries during transition:
-  Range 0 ledger queries: route to active ledger store (still present) until COMPLETE
-  Range 0 txhash queries: route to active txhash store (still present) until COMPLETE
+  Range 0 ledger queries: route to LFS (all ledger stores already deleted;
+    LFS files written at each chunk boundary during ACTIVE)
+  Range 0 txhash queries: route to transitioning txhash store (still open) until COMPLETE,
+    then route to RecSplit index
   Range 1: route to active ledger store / txhash store
 ```
 

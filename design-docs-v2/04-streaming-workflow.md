@@ -14,18 +14,25 @@ Streaming mode is a long-running daemon. It never exits unless there is a fatal 
 2. **Checkpoint every ledger** — `streaming:last_committed_ledger` updated after every successful write.
 3. **WAL enabled** — both active RocksDB stores (ledger and txhash) must have WAL on; crash recovery depends on it.
 4. **Background LFS flush at chunk boundary** — while ACTIVE, completed 10K-ledger chunks are flushed from the ledger store → LFS chunk files in a background goroutine. Range state stays `ACTIVE` throughout.
-5. **Transition in background at range boundary** — when range N completes (last ledger committed), a goroutine handles: final LFS chunk flush (if not yet done) + RecSplit txhash index build. Ingestion of range N+1 starts immediately.
+5. **Transition in background at range boundary** — when range N completes (last ledger committed), the system waits for the last chunk's ledger sub-flow transition to finish, then a goroutine handles the RecSplit txhash index build. Ingestion of range N+1 starts immediately.
 6. **Gap detection at startup** — all ranges before the current streaming range must be `COMPLETE`.
 
 ---
 
 ## Active Store Architecture
 
-Each streaming range has **two separate RocksDB instances**:
+Each streaming range has **two separate RocksDB instances** that operate as independent sub-flows with different transition cadences:
+
+| Sub-flow | Store | Transition cadence | Max active | Max transitioning | Max total |
+|----------|-------|--------------------|------------|-------------------|-----------|
+| Ledger | `ledger-store-chunk-{chunkID:06d}/` | Every 10K ledgers (chunk boundary) | **1** | **1** | **2** |
+| TxHash | `txhash-store-range-{rangeID:04d}/` | Every 10M ledgers (range boundary) | **1** | **1** | **2** |
+
+**Each sub-flow can have at most 1 active store and 1 transitioning store at any point in time.** At each chunk boundary, the active ledger store transitions (active → transitioning → LFS flush → close + delete) while a new active ledger store opens for the next chunk. The txhash store spans the entire range and only transitions at the range boundary.
 
 ### Ledger Store
 
-Stores full ledger data for the range. No column families — default CF only.
+Stores full ledger data for the current chunk. No column families — default CF only.
 
 | Key | Value | Notes |
 |-----|-------|-------|
@@ -37,7 +44,7 @@ WAL is **required** (never `DisableWAL`).
 
 ### TxHash Store
 
-Stores transaction hash → ledger sequence mappings, sharded into 16 column families by the first hex character of the txhash (`0`–`f`).
+Stores transaction hash → ledger sequence mappings for the entire range, sharded into 16 column families by the first hex character of the txhash (`0`–`f`).
 
 | CF Name | Key | Value | Notes |
 |---------|-----|-------|-------|
@@ -82,7 +89,7 @@ flowchart TD
     INGEST_TX --> CHECKPOINT["Update: streaming:last_committed_ledger = ledgerSeq"]
     CHECKPOINT --> CHUNK_BOUNDARY{ledgerSeq == chunkLastLedger?}
     CHUNK_BOUNDARY -->|no| RANGE_BOUNDARY
-    CHUNK_BOUNDARY -->|yes| FLUSH_LFS["Background goroutine: flush chunk to LFS<br/>read 10K ledgers from ledger store → write .data + .index<br/>fsync → set range:N:chunk:C:lfs_done = '1'<br/>(range state stays ACTIVE)"]
+    CHUNK_BOUNDARY -->|yes| FLUSH_LFS["Ledger sub-flow transition:<br/>SwapActiveLedgerStore → old store becomes transitioningLedgerStore<br/>background goroutine: read 10K ledgers → write .data + .index<br/>fsync → set lfs_done → CompleteLedgerTransition (close + delete)<br/>(range state stays ACTIVE)"]
     FLUSH_LFS --> RANGE_BOUNDARY{ledgerSeq == rangeLastLedger?}
     RANGE_BOUNDARY -->|no| LOOP
     RANGE_BOUNDARY -->|yes| SPAWN["Spawn background goroutine:<br/>streaming transition workflow for range N<br/>(see doc 06)"]
@@ -95,11 +102,13 @@ flowchart TD
 - For each transaction in ledger: write `txhash[32] → uint32BE(ledgerSeq)` to txhash store, routing to CF by first hex character of the txhash string (equivalently `txhash[0] >> 4` on raw bytes), in a single `WriteBatch` (WAL enabled)
 - After both WriteBatches succeed: update `streaming:last_committed_ledger` in meta store
 
-**Chunk boundary behavior** (every 10K ledgers, while ACTIVE):
-- A background goroutine reads the completed chunk's 10K ledgers from the ledger store
+**Chunk boundary behavior** (every 10K ledgers, while ACTIVE — this is the ledger sub-flow transition):
+- `SwapActiveLedgerStore(rangeID, chunkID+1)` moves the current active ledger store to `transitioningLedgerStore` (stays open for reads); a new active ledger store opens for the next chunk
+- A background goroutine reads the completed chunk's 10K ledgers from the transitioning ledger store
 - Writes the LFS `.data` + `.index` chunk files; fsyncs both
 - Sets `range:N:chunk:C:lfs_done = "1"` in meta store (WAL-backed)
-- The range state remains `ACTIVE` — this flush is a background optimization to reduce LFS conversion work at range boundary
+- Calls `CompleteLedgerTransition(chunkID)` — closes the transitioning ledger store, deletes its directory, sets `transitioningLedgerStore = nil`, and signals the condition variable
+- The range state remains `ACTIVE` — each chunk transitions independently at its boundary
 
 ---
 
@@ -109,13 +118,16 @@ When `ledgerSeq == rangeLastLedger(currentRange)` (e.g., ledger 10,000,001 for r
 
 1. Last ledger written to both active stores (ledger store + txhash store) with WAL
 2. `streaming:last_committed_ledger` updated to boundary ledger
-3. `range:N:state` set to `TRANSITIONING`
-4. Background goroutine spawned for range N transition (see [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md))
-5. New active ledger store + txhash store created for range N+1
-6. `range:N+1:state` set to `ACTIVE`
-7. Ingestion continues immediately with range N+1's first ledger
+3. `waitForLedgerTransitionComplete()` — block until the last chunk's ledger sub-flow transition is done (the last chunk boundary triggers a background LFS flush that may still be in progress)
+4. Verify all 1,000 `lfs_done` flags for the range are set (safety check — all were set during ACTIVE at their individual chunk boundaries)
+5. `range:N:state` set to `TRANSITIONING`
+6. `PromoteToTransitioning(N)` — moves **only the txhash store** to `transitioningTxHashStore` (no ledger store involved — all ledger stores were already transitioned at their chunk boundaries and deleted)
+7. Background goroutine spawned for RecSplit build from transitioning txhash store (see [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md))
+8. New active ledger store + txhash store created for range N+1
+9. `range:N+1:state` set to `ACTIVE`
+10. Ingestion continues immediately with range N+1's first ledger
 
-The transition goroutine handles: any remaining LFS chunks not yet flushed during ACTIVE + full RecSplit txhash index build from the range N txhash store. The background transition runs **concurrently** with ingestion of range N+1. Queries for range N during transition are served from the still-open range N active stores (see [08-query-routing.md](./08-query-routing.md)).
+At the range boundary, all 1,000 ledger chunks have already been individually transitioned to LFS during the ACTIVE phase. The only remaining work is the txhash store's RecSplit index build, which runs in a background goroutine **concurrently** with ingestion of range N+1. During the TRANSITIONING state, ledger queries for range N are served from the LFS chunk files (already written), and txhash queries are served from the transitioning txhash store (still open for reads). See [08-query-routing.md](./08-query-routing.md).
 
 ---
 
@@ -135,7 +147,7 @@ On crash, resume from `last_committed_ledger + 1`. Re-ingested ledgers are idemp
 | Backfill | per-chunk (10K ledgers) | first incomplete chunk |
 | Streaming | per-ledger (1 ledger) | `last_committed_ledger + 1` |
 
-LFS chunk flush checkpoints (separate from ledger checkpoints): `range:N:chunk:C:lfs_done = "1"` after each chunk fsync during ACTIVE. These accumulate independently and are preserved across crashes — on resume, the transition goroutine skips already-flushed chunks.
+LFS chunk flush checkpoints (separate from ledger checkpoints): `range:N:chunk:C:lfs_done = "1"` after each chunk fsync during ACTIVE. These accumulate independently and are preserved across crashes — on resume, already-flushed chunks are skipped.
 
 ---
 
@@ -143,13 +155,13 @@ LFS chunk flush checkpoints (separate from ledger checkpoints): `range:N:chunk:C
 
 | Range State | getLedgerBySequence | getTransactionByHash |
 |-------------|--------------------|--------------------|
-| `ACTIVE` | Active ledger RocksDB store | Active txhash RocksDB store |
-| `TRANSITIONING` | Active ledger RocksDB store (still open) | Active txhash RocksDB store (still open) |
+| `ACTIVE` | Active ledger RocksDB store (or transitioning ledger store during chunk transition, or LFS for already-transitioned chunks) | Active txhash RocksDB store |
+| `TRANSITIONING` | Immutable LFS chunk files (all ledger stores already transitioned during ACTIVE) | Transitioning txhash RocksDB store (still open) |
 | `COMPLETE` | Immutable LFS store | Immutable RecSplit index |
 
-Queries are never blocked. Both active stores remain open and queryable throughout the transition.
+Queries are never blocked. During ACTIVE, ledger queries route to the active or transitioning ledger store (or LFS for completed chunks). During TRANSITIONING, the transitioning txhash store remains open and queryable until the RecSplit build completes and the router swaps to immutable stores.
 
-> **getEvents placeholder**: When `getEvents` support is added, it will require a **separate active events RocksDB store** for event data, with per-chunk flush to an immutable events index. The events store's rotation cadence is TBD (the ledger store rotates every 10K ledgers at chunk boundaries; the txhash store rotates every 10M ledgers at range boundaries). Query routing for `getEvents` will follow the same ACTIVE→TRANSITIONING→COMPLETE pattern.
+> **getEvents placeholder**: When `getEvents` support is added, it will require a **separate active events RocksDB store** for event data, with per-chunk flush to an immutable events index. The events store transitions at every chunk boundary (active → transitioning → events index build → close + delete; max 1 active + 1 transitioning at any time), same cadence as the ledger store. The txhash store transitions every 10M ledgers at range boundaries. Query routing for `getEvents` will follow the same ACTIVE→TRANSITIONING→COMPLETE pattern.
 
 ---
 
@@ -161,8 +173,8 @@ When `getEvents` support is added to the streaming workflow, it will require:
 
 - A **separate active events RocksDB store** — its own RocksDB instance, independent of the ledger store and txhash store (rotation cadence TBD)
 - Per-ledger event data written alongside existing ledger and txhash writes
-- Background chunk-level flush to an immutable events index (same cadence as LFS: per 10K ledgers, while ACTIVE)
-- A Phase 3 events index build in the streaming transition workflow (after LFS and RecSplit complete)
+- Background chunk-level flush to an immutable events index (same cadence as ledger sub-flow: per 10K ledgers, while ACTIVE)
+- An events sub-flow transition in the streaming transition workflow (independent sub-flow at chunk cadence; at range boundary, all events sub-flow transitions must complete before the txhash transition proceeds)
 - Query availability: served from active events store during ACTIVE/TRANSITIONING, from immutable events index once COMPLETE
 
 ---

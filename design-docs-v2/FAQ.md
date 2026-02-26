@@ -106,7 +106,7 @@ Every single ledger. After each ledger is committed to the active RocksDB WriteB
 
 ### Q: Can I query during a streaming transition?
 
-Yes. The active RocksDB store for the transitioning range remains open for query routing until the background transition goroutine completes verification and deletes it. The meta store key `range:{N}:state = "TRANSITIONING"` tells the query router to use the active store. Once `COMPLETE`, queries route to the immutable LFS + RecSplit stores. See [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) and [08-query-routing.md](./08-query-routing.md).
+Yes. During TRANSITIONING, ledger queries are served from LFS (all chunks were transitioned during ACTIVE), and txhash queries are served from the transitioning txhash store, which remains open until RecSplit completes and `RemoveTransitioningTxHashStore` is called. Once `COMPLETE`, all queries route to the immutable LFS + RecSplit stores. See [06-streaming-transition-workflow.md](./06-streaming-transition-workflow.md) and [08-query-routing.md](./08-query-routing.md).
 
 ---
 
@@ -178,8 +178,8 @@ See [02-meta-store-design.md](./02-meta-store-design.md).
 
 - `range:{rangeID:04d}:state` — ACTIVE → TRANSITIONING → COMPLETE
 - `streaming:last_committed_ledger` — updated every ledger
-- `range:{rangeID:04d}:chunk:{chunkID:06d}:lfs_done` — during streaming transition Phase 1
-- `range:{rangeID:04d}:recsplit:cf:{cfIndex:02d}:done` — during streaming transition Phase 2
+- `range:{rangeID:04d}:chunk:{chunkID:06d}:lfs_done` — set at each chunk boundary during ACTIVE (ledger sub-flow transition)
+- `range:{rangeID:04d}:recsplit:cf:{cfIndex:02d}:done` — set during TRANSITIONING (RecSplit build from transitioning txhash store)
 
 See [02-meta-store-design.md](./02-meta-store-design.md).
 

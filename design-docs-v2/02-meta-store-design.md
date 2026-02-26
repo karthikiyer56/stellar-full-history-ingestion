@@ -56,12 +56,12 @@ Two keys per chunk. Written independently after each respective file fsync. Ther
 
 | Key Pattern | Value Type | Written By | Written When |
 |-------------|-----------|-----------|-------------|
-| `range:{N:04d}:chunk:{C:06d}:lfs_done` | `"1"` or absent | BSB instance (backfill) or background LFS goroutine (streaming ACTIVE) or transition goroutine (streaming TRANSITIONING) | After LFS `.data` + `.index` files for chunk C are fsynced to disk |
+| `range:{N:04d}:chunk:{C:06d}:lfs_done` | `"1"` or absent | BSB instance (backfill) or per-chunk ledger transition goroutine (streaming, at each chunk boundary during ACTIVE) | After LFS `.data` + `.index` files for chunk C are fsynced to disk |
 | `range:{N:04d}:chunk:{C:06d}:txhash_done` | `"1"` or absent | BSB instance (backfill only) | After txhash `.bin` flat file for chunk C is fsynced to disk |
 
 **`txhash_done` is backfill-only.** In streaming mode, txhash data goes directly into the txhash store (RocksDB, 16 CFs) — no raw flat files are produced, and `txhash_done` is never set for streaming ranges.
 
-**`lfs_done` in streaming mode**: a background goroutine flushes completed 10K-ledger chunks from the ledger store to LFS chunk files at each chunk boundary while the range is ACTIVE. The flag is set after fsync. By the time the range transitions to TRANSITIONING, most `lfs_done` flags are already set.
+**`lfs_done` in streaming mode**: at each chunk boundary (every 10K ledgers), the ledger sub-flow transitions the active ledger store: the old store moves to `transitioningLedgerStore`, a background goroutine flushes its 10K ledgers to LFS chunk files, fsyncs, sets the `lfs_done` flag, then closes and deletes the transitioning store via `CompleteLedgerTransition`. This is the mandatory transition step, not a background optimization. By the time the range transitions to TRANSITIONING, **all** 1,000 `lfs_done` flags are set (the system verifies this at the range boundary before proceeding).
 
 **Constraints**:
 - Absent means either not started or incomplete — treated identically on resume (full rewrite of both files).
@@ -89,15 +89,15 @@ range:0005:chunk:005999:lfs_done     →  absent    ← last chunk of range 5 (g
 range:0005:chunk:005999:txhash_done  →  absent
 ```
 
-**Examples** (Streaming ACTIVE phase — background LFS flush; note: no txhash_done keys for streaming ranges):
+**Examples** (Streaming ACTIVE phase — ledger sub-flow transitions at each chunk boundary; note: no txhash_done keys for streaming ranges):
 ```
 range:0000:chunk:000000:lfs_done  →  "1"   ← first chunk of range 0, flushed at chunk boundary
-range:0000:chunk:000234:lfs_done  →  "1"   ← mid-range, accumulates over time
-range:0000:chunk:000235:lfs_done  →  absent ← not yet flushed (ledger still < chunk boundary)
-range:0000:chunk:000999:lfs_done  →  absent ← last chunk of range 0, not yet flushed
+range:0000:chunk:000234:lfs_done  →  "1"   ← mid-range, set at chunk 234's boundary
+range:0000:chunk:000235:lfs_done  →  absent ← not yet transitioned (current chunk still filling)
+range:0000:chunk:000999:lfs_done  →  absent ← last chunk of range 0, not yet transitioned
 range:0005:chunk:005000:lfs_done  →  "1"   ← first chunk of range 5 (global ID 5000)
-range:0005:chunk:005234:lfs_done  →  "1"   ← mid-range 5, accumulates over time
-range:0005:chunk:005999:lfs_done  →  absent ← last chunk of range 5 (global ID 5999), not yet flushed
+range:0005:chunk:005234:lfs_done  →  "1"   ← mid-range 5, set at chunk 5234's boundary
+range:0005:chunk:005999:lfs_done  →  absent ← last chunk of range 5 (global ID 5999), not yet transitioned
   (no txhash_done keys exist for streaming ranges)
 ```
 
@@ -200,11 +200,11 @@ For a streaming range at steady state (ACTIVE):
 | Sub-workflow | Keys |
 |-------------|------|
 | Range state | 1 (`range:N:state = "ACTIVE"`) |
-| Chunk flags | 0–1,000 `lfs_done` keys (accumulate as background goroutine flushes chunks); no `txhash_done` keys in streaming |
+| Chunk flags | 0–1,000 `lfs_done` keys (set at each chunk boundary as the ledger sub-flow transitions — this is the mandatory transition step, not a background optimization); no `txhash_done` keys in streaming |
 | Streaming checkpoint | 1 (`streaming:last_committed_ledger`) |
-| **Total active range** | **2 to 1,002** (grows as chunks are flushed) |
+| **Total active range** | **2 to 1,002** (grows as chunks transition at their boundaries) |
 
-
+---
 
 ## Range State Enum
 
@@ -218,9 +218,9 @@ For a streaming range at steady state (ACTIVE):
 
 | State | Description | Next State |
 |-------|-------------|------------|
-| `ACTIVE` | Range being ingested into RocksDB active store | `TRANSITIONING` (at range boundary) |
-| `TRANSITIONING` | Active RocksDB store being converted to LFS + RecSplit | `COMPLETE` |
-| `COMPLETE` | LFS + RecSplit written; active store deleted | Terminal |
+| `ACTIVE` | Range being ingested into RocksDB active stores; ledger sub-flow transitions at each chunk boundary (LFS flush + `lfs_done` set) | `TRANSITIONING` (at range boundary, after all `lfs_done` flags verified) |
+| `TRANSITIONING` | All LFS chunks already written during ACTIVE; transitioning txhash store used for RecSplit build | `COMPLETE` |
+| `COMPLETE` | LFS + RecSplit written; transitioning txhash store deleted via `RemoveTransitioningTxHashStore` | Terminal |
 
 ---
 
@@ -299,8 +299,8 @@ flowchart LR
 ```mermaid
 flowchart LR
     A([absent]) -->|"first ledger of range arrives"| B[ACTIVE]
-    B -->|"last ledger of range committed"| C[TRANSITIONING]
-    C -->|"LFS + RecSplit written, RocksDB deleted"| D[COMPLETE]
+    B -->|"last ledger of range committed +<br/>all lfs_done verified"| C[TRANSITIONING]
+    C -->|"RecSplit built from transitioning txhash store,<br/>txhash store deleted"| D[COMPLETE]
 ```
 
 ---
@@ -396,7 +396,7 @@ Streaming is in range 1 (ledgers 10,000,002–20,000,001):
   range:0001:state  →  "ACTIVE"
   streaming:last_committed_ledger  →  15,000,001
 
-  Background LFS goroutine has flushed some chunks during ACTIVE:
+  Ledger sub-flow has transitioned some chunks at their boundaries during ACTIVE:
   range:0001:chunk:001000:lfs_done  →  "1"   ← chunk 0 of range 1
   range:0001:chunk:001001:lfs_done  →  "1"
   range:0001:chunk:001499:lfs_done  →  "1"
@@ -404,20 +404,29 @@ Streaming is in range 1 (ledgers 10,000,002–20,000,001):
   (no txhash_done keys — streaming only)
 
 Ledger 20,000,001 arrives (last ledger of range 1):
-  Write to ledger store (default CF) for range 1
-  Write to txhash store (CF for nibble) for range 1
+  Write to active ledger store (default CF) for range 1
+  Write to active txhash store (CF for nibble) for range 1
   Update: streaming:last_committed_ledger  →  20,000,001
-  Update: range:0001:state  →  "TRANSITIONING"
-  Spawn background goroutine: transition workflow for range 1
-  Create new ledger store + txhash store for range 2
-  Update: range:0002:state  →  "ACTIVE"
+
+  Range boundary handling:
+  1. waitForLedgerTransitionComplete() — wait for last chunk's LFS flush to finish
+  2. Verify all 1,000 lfs_done flags for range 1 are set (safety check)
+  3. Update: range:0001:state  →  "TRANSITIONING"
+  4. PromoteToTransitioning(1) — moves ONLY txhash store to transitioning
+  5. Create new active ledger store + txhash store for range 2
+  6. Update: range:0002:state  →  "ACTIVE"
+  7. Spawn background goroutine: RecSplit build from transitioning txhash store
 
 Background goroutine completes range 1 transition:
-  Phase 1: flushes remaining unflushed chunks (chunk 1500 onward)
-           sets lfs_done for all 1000 chunks
-  Phase 2: builds RecSplit from txhash store
+  All 1,000 lfs_done flags were already set during ACTIVE
+  (each chunk boundary triggered its own ledger sub-flow transition).
+  Only RecSplit build remains: builds 16 CFs from transitioning txhash store.
+  range:0001:recsplit:state  →  "BUILDING"
+  ... (16 CF done flags set as each CF completes) ...
+  range:0001:recsplit:state  →  "COMPLETE"
   range:0001:state  →  "COMPLETE"
-  (Range 1 active stores deleted)
+  (Transitioning txhash store deleted via RemoveTransitioningTxHashStore;
+   ledger stores were already deleted at their chunk boundaries during ACTIVE)
 ```
 
 ### Scenario 4: Streaming — Crash Recovery

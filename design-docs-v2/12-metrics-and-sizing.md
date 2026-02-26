@@ -15,7 +15,7 @@
 | RecSplit column families                                          | 16                 | Sharded by first hex nibble of txhash (`0`–`f`)                                         |
 | Default Buffered Storage Backend (BSB) instances per orchestrator | 20                 | `[backfill.bsb].num_bsb_instances_per_range`                                                          |
 | Max parallel range orchestrators                                  | 2                  | `[backfill].parallel_ranges`                                                            |
-| Max BSB instances in flight                                       | 40                 | 2 orchestrators × 20 BSB instances per orcheastrator                                    |
+| Max BSB instances in flight                                       | 40                 | 2 orchestrators × 20 BSB instances per orchestrator                                    |
 | Ledgers per BSB instance (`num_bsb_instances_per_range=20`)                     | 500,000            | = RangeSize ÷ 20                                                                        |
 | Ledgers per BSB instance (`num_bsb_instances_per_range=10`)                     | 1,000,000          | = RangeSize ÷ 10                                                                        |
 | Chunks per BSB instance (`num_bsb_instances_per_range=20`)                      | 50                 | = 500K ÷ 10K                                                                            |
