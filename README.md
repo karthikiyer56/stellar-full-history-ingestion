@@ -2,39 +2,6 @@
 
 Tools for ingesting and querying Stellar blockchain full history data using various storage backends.
 
-## Architecture
-
-This project provides multiple approaches for storing and querying Stellar's LedgerCloseMeta (LCM) data:
-
-### Storage Backends
-
-**RocksDB** (`rocksdb/`) - Primary storage backend using Facebook's embedded key-value store. Supports three database types:
-- **DB1**: ledgerSeq → zstd-compressed LedgerCloseMeta
-- **DB2**: txHash → zstd-compressed TxData (protobuf)
-- **DB3**: txHash → ledgerSeq (for two-step lookups)
-
-**Local FS** (`local-fs/`) - Alternative file-based storage using chunked files (10,000 ledgers per chunk) with zstd compression and index files for random access. Simpler than RocksDB but with different performance characteristics.
-
-**RecSplit** (`recsplit/`) - Minimal Perfect Hash Function (MPHF) index for O(1) txHash → ledgerSeq lookups with ~2 bits/key overhead. Used in combination with RocksDB DB1 for memory-efficient transaction lookups.
-
-### Query Strategies
-
-1. **One-step lookup**: txHash → TxData directly from DB2
-2. **Two-step lookup**: txHash → ledgerSeq (via RecSplit or DB3) → LCM (from DB1)
-
-The two-step approach with RecSplit is more memory-efficient for large datasets but requires decompressing the full LCM to extract transaction data.
-
-## Modules
-
-| Directory | Description |
-|-----------|-------------|
-| `rocksdb/` | RocksDB ingestion (`ingestion/`, `ingestion-v2/`, `ingestion-v3/`) and query tools |
-| `recsplit/` | MPHF index builder and query tools |
-| `local-fs/` | Chunk-based file storage ingestion and query |
-| `benchmarking/` | Performance testing for local-fs and recsplit+rocksdb lookups |
-| `helpers/` | Shared utility code |
-| `protos/` | Protobuf definitions (TxData message) |
-
 ## Prerequisites
 
 ### RocksDB Build (Linux)
@@ -67,6 +34,68 @@ export CGO_LDFLAGS="-lstdc++ -ldl -lz -lbz2 -lsnappy -llz4 -lzstd \
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/workspace/rocksdb-dev"
 ```
 
-## Building
+## Building ingestion-workflow
+
+The ingestion-workflow uses RocksDB for storage. Use the Makefile targets to build and test:
+
+### Prerequisites
+
+**macOS (Homebrew):**
+```bash
+brew install rocksdb snappy lz4 zstd
+```
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt install -y librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev
+```
+
+**Build from source** (if needed): See [RocksDB installation guide](https://github.com/facebook/rocksdb/blob/main/INSTALL.md)
+
+### Makefile Targets
+
+```bash
+# Verify dependencies are installed
+make check-rocksdb-env
+
+# Build the ingestion-workflow binary
+make build-workflow
+
+# Run all workflow tests
+make test-workflow
+
+# Run store tests only
+make test-stores
+```
+
+**Note**: The `build-workflow` target creates `bin/ingestion-workflow`. Delete the binary after verification per project convention.
+
+## Building Other Modules
 
 Each module has its own `go build` command. See the README in each directory for details.
+
+---
+
+## Design Documentation
+
+Two generations of design docs live in this repo:
+
+| Version | Directory | Tag | Status |
+|---------|-----------|-----|--------|
+| v1 | [`design-docs/`](./design-docs/) | `v8.0.0` | Superseded |
+| v2 | [`design-docs-v2/`](./design-docs-v2/) | `v11.0.0` | **Current** |
+
+### What changed from v1 → v2
+
+| Dimension | v1 (`design-docs/`) | v2 (`design-docs-v2/`) |
+|-----------|---------------------|------------------------|
+| Backfill storage | RocksDB active stores during ingestion | **No RocksDB** — direct write to LFS chunks + raw txhash flat files |
+| Backfill transition | Unified transition workflow shared with streaming | **Separate** per-range RecSplit build, triggered after all 1,000 chunks complete |
+| WAL requirement during backfill | Required concern | **Not applicable** — no RocksDB in backfill path |
+| `transitioning/` directory | Created on filesystem | **Eliminated** — transition state tracked in meta store only |
+| `global:mode` meta key | Tracked in meta store | **Eliminated** — mode determined by `--mode` startup flag |
+| BSB parallelism | Vague | **Explicit**: 20 BSB instances per orchestrator, max 2 orchestrators |
+| Flush discipline | Unspecified | **Every ~100 ledgers** — no unbounded RAM accumulation |
+| Transition workflows | One unified workflow for both modes | **Two separate workflows** — backfill transition and streaming transition |
+| Operator runbook | Scattered across docs | **Dedicated doc** (`13-recommended-operator-approach.md`) |
+| Metrics and sizing | Inline in architecture doc | **Dedicated doc** (`12-metrics-and-sizing.md`) with storage estimates and memory budgets |

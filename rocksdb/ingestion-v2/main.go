@@ -50,7 +50,6 @@ func main() {
 		startLedger, endLedger  uint
 		startTime, endTime      string
 		enableLedgerSeqToLcm    bool
-		enableTxHashToTxData    bool
 		enableTxHashToLedgerSeq bool
 	)
 
@@ -61,7 +60,6 @@ func main() {
 	flag.StringVar(&startTime, "start-time", "", "Start time for logging (optional, from shell script)")
 	flag.StringVar(&endTime, "end-time", "", "End time for logging (optional, from shell script)")
 	flag.BoolVar(&enableLedgerSeqToLcm, "enable-ledger-seq-to-lcm", false, "Enable ledger_seq_to_lcm store")
-	flag.BoolVar(&enableTxHashToTxData, "enable-tx-hash-to-tx-data", false, "Enable tx_hash_to_tx_data store")
 	flag.BoolVar(&enableTxHashToLedgerSeq, "enable-tx-hash-to-ledger-seq", false, "Enable tx_hash_to_ledger_seq store")
 
 	flag.Parse()
@@ -78,8 +76,8 @@ func main() {
 	if startLedger == 0 || endLedger == 0 {
 		log.Fatal("ERROR: --start-ledger and --end-ledger are required")
 	}
-	if !enableLedgerSeqToLcm && !enableTxHashToTxData && !enableTxHashToLedgerSeq {
-		log.Fatal("ERROR: At least one store must be enabled (--enable-ledger-seq-to-lcm, --enable-tx-hash-to-tx-data, or --enable-tx-hash-to-ledger-seq)")
+	if !enableLedgerSeqToLcm && !enableTxHashToLedgerSeq {
+		log.Fatal("ERROR: At least one store must be enabled (--enable-ledger-seq-to-lcm or --enable-tx-hash-to-ledger-seq)")
 	}
 
 	// =========================================================================
@@ -100,7 +98,6 @@ func main() {
 		StartTime:               startTime,
 		EndTime:                 endTime,
 		EnableLedgerSeqToLcm:    enableLedgerSeqToLcm,
-		EnableTxHashToTxData:    enableTxHashToTxData,
 		EnableTxHashToLedgerSeq: enableTxHashToLedgerSeq,
 	}
 
@@ -255,14 +252,13 @@ func main() {
 	compactTiming := stores.CompactAll(config, globalMinLedger, globalMaxLedger)
 	globalStats.mu.Lock()
 	globalStats.Timing.LcmCompactTime = compactTiming.LcmCompactTime
-	globalStats.Timing.TxDataCompactTime = compactTiming.TxDataCompactTime
 	globalStats.Timing.HashSeqCompactTime = compactTiming.HashSeqCompactTime
 	globalStats.mu.Unlock()
 
 	// =========================================================================
 	// Final Summary
 	// =========================================================================
-	LogFinalSummary(globalStats, config, stores.LcmDB, stores.TxDataDB, stores.HashSeqDB, numWorkers)
+	LogFinalSummary(globalStats, config, stores.LcmDB, stores.HashSeqDB, numWorkers)
 
 	log.Printf("Ingestion completed successfully!")
 }
@@ -371,7 +367,7 @@ func processRocksDBSource(
 
 		// Log extended stats every 10 batches
 		if currentBatch.BatchNum%10 == 0 {
-			LogExtendedStats(globalStats, config, chunkEnd, stores.LcmDB, stores.TxDataDB, stores.HashSeqDB, numWorkers)
+			LogExtendedStats(globalStats, config, chunkEnd, stores.LcmDB, stores.HashSeqDB, numWorkers)
 		}
 
 		// Prepare for next batch
@@ -472,7 +468,7 @@ func processGCSSource(
 
 			// Log extended stats every 10 batches
 			if currentBatch.BatchNum%10 == 0 {
-				LogExtendedStats(globalStats, config, ledgerSeq, stores.LcmDB, stores.TxDataDB, stores.HashSeqDB, numWorkers)
+				LogExtendedStats(globalStats, config, ledgerSeq, stores.LcmDB, stores.HashSeqDB, numWorkers)
 			}
 
 			// Prepare for next batch
@@ -508,16 +504,11 @@ func processBatchData(
 
 	// Update batch timing
 	batch.LcmCompressionTime = processResult.LcmCompressionTime
-	batch.TxDataCompressionTime = processResult.TxDataCompressionTime
 
 	// Update batch stats
 	batch.LcmStats.UncompressedBytes = processResult.LcmUncompressed
 	batch.LcmStats.CompressedBytes = processResult.LcmCompressed
 	batch.LcmStats.EntryCount = processResult.LcmCount
-
-	batch.TxDataStats.UncompressedBytes = processResult.TxDataUncompressed
-	batch.TxDataStats.CompressedBytes = processResult.TxDataCompressed
-	batch.TxDataStats.EntryCount = processResult.TxDataCount
 
 	batch.HashSeqCount = processResult.HashSeqCount
 
@@ -525,7 +516,6 @@ func processBatchData(
 	writeTiming, err := stores.WriteBatch(
 		config,
 		processResult.LcmData,
-		processResult.TxDataMap,
 		processResult.HashSeqMap,
 		processResult.RawFileData,
 	)
@@ -535,7 +525,6 @@ func processBatchData(
 
 	// Update batch timing
 	batch.LcmWriteTime = writeTiming.LcmWriteTime
-	batch.TxDataWriteTime = writeTiming.TxDataWriteTime
 	batch.HashSeqWriteTime = writeTiming.HashSeqWriteTime
 	batch.RawFileWriteTime = writeTiming.RawFileWriteTime
 
@@ -552,13 +541,10 @@ func resetBatchStats(batch *BatchStats) {
 	batch.TransactionCount = 0
 	batch.GetLedgerTime = 0
 	batch.LcmCompressionTime = 0
-	batch.TxDataCompressionTime = 0
 	batch.LcmWriteTime = 0
-	batch.TxDataWriteTime = 0
 	batch.HashSeqWriteTime = 0
 	batch.RawFileWriteTime = 0
 	batch.LcmStats = CompressionStats{}
-	batch.TxDataStats = CompressionStats{}
 	batch.HashSeqCount = 0
 	batch.RocksDBReadTiming = RocksDBReadTiming{}
 }

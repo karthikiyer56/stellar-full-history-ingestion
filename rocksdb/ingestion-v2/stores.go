@@ -50,9 +50,6 @@ type Stores struct {
 	LcmDB   *grocksdb.DB
 	LcmOpts *grocksdb.Options
 
-	TxDataDB   *grocksdb.DB
-	TxDataOpts *grocksdb.Options
-
 	HashSeqDB   *grocksdb.DB
 	HashSeqOpts *grocksdb.Options
 
@@ -107,31 +104,6 @@ func OpenStores(config *IngestionConfig) (*Stores, error) {
 			return nil, fmt.Errorf("failed to open ledger_seq_to_lcm store: %w", err)
 		}
 		log.Printf("✓ Opened ledger_seq_to_lcm store: %s", absPath)
-	}
-
-	// Open tx_hash_to_tx_data store
-	if config.EnableTxHashToTxData {
-		absPath, err := filepath.Abs(config.TxHashToTxData.OutputPath)
-		if err != nil {
-			stores.Close()
-			return nil, fmt.Errorf("failed to get absolute path for tx_hash_to_tx_data: %w", err)
-		}
-
-		if err := os.MkdirAll(absPath, 0755); err != nil {
-			stores.Close()
-			return nil, fmt.Errorf("failed to create directory for tx_hash_to_tx_data: %w", err)
-		}
-
-		stores.TxDataDB, stores.TxDataOpts, err = openRocksDBWithSettings(
-			absPath,
-			"tx_hash_to_tx_data",
-			&config.TxHashToTxData.RocksDB,
-		)
-		if err != nil {
-			stores.Close()
-			return nil, fmt.Errorf("failed to open tx_hash_to_tx_data store: %w", err)
-		}
-		log.Printf("✓ Opened tx_hash_to_tx_data store: %s", absPath)
 	}
 
 	// Open tx_hash_to_ledger_seq store
@@ -215,13 +187,6 @@ func (s *Stores) Close() {
 	}
 	if s.LcmOpts != nil {
 		s.LcmOpts.Destroy()
-	}
-
-	if s.TxDataDB != nil {
-		s.TxDataDB.Close()
-	}
-	if s.TxDataOpts != nil {
-		s.TxDataOpts.Destroy()
 	}
 
 	if s.HashSeqDB != nil {
@@ -396,7 +361,6 @@ func openRocksDBReader(path string) (*grocksdb.DB, *grocksdb.Options, *grocksdb.
 // WriteBatchTiming tracks timing for batch write operations.
 type WriteBatchTiming struct {
 	LcmWriteTime     time.Duration
-	TxDataWriteTime  time.Duration
 	HashSeqWriteTime time.Duration
 	RawFileWriteTime time.Duration
 }
@@ -407,7 +371,6 @@ type WriteBatchTiming struct {
 func (s *Stores) WriteBatch(
 	config *IngestionConfig,
 	lcmData map[uint32][]byte, // ledgerSeq -> compressed LCM
-	txData map[string][]byte, // txHash (hex) -> compressed TxData
 	hashSeqData map[string]uint32, // txHash (hex) -> ledgerSeq
 	rawFileData []byte, // Raw binary data for file (36 bytes per entry)
 ) (*WriteBatchTiming, error) {
@@ -462,43 +425,7 @@ func (s *Stores) WriteBatch(
 	}
 
 	// =========================================================================
-	// Write to tx_hash_to_tx_data store (goroutine 2)
-	// =========================================================================
-	if config.EnableTxHashToTxData && s.TxDataDB != nil && len(txData) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			start := time.Now()
-
-			// Each goroutine needs its own WriteOptions
-			wo := grocksdb.NewDefaultWriteOptions()
-			wo.DisableWAL(true)
-			defer wo.Destroy()
-
-			batch := grocksdb.NewWriteBatch()
-			defer batch.Destroy()
-
-			for txHashHex, compressedTxData := range txData {
-				txHashBytes, err := helpers.HexStringToBytes(txHashHex)
-				if err != nil {
-					recordError(errors.Wrapf(err, "failed to convert tx hash: %s", txHashHex))
-					return
-				}
-				batch.Put(txHashBytes, compressedTxData)
-			}
-
-			if err := s.TxDataDB.Write(wo, batch); err != nil {
-				recordError(errors.Wrap(err, "failed to write batch to tx_hash_to_tx_data"))
-				return
-			}
-
-			timing.TxDataWriteTime = time.Since(start)
-		}()
-	}
-
-	// =========================================================================
-	// Write to tx_hash_to_ledger_seq store (goroutine 3)
+	// Write to tx_hash_to_ledger_seq store (goroutine 2)
 	// =========================================================================
 	if config.EnableTxHashToLedgerSeq && s.HashSeqDB != nil && len(hashSeqData) > 0 {
 		wg.Add(1)
@@ -535,7 +462,7 @@ func (s *Stores) WriteBatch(
 	}
 
 	// =========================================================================
-	// Write to raw data file (goroutine 4)
+	// Write to raw data file (goroutine 3)
 	// =========================================================================
 	if s.RawDataWriter != nil && len(rawFileData) > 0 {
 		wg.Add(1)
@@ -579,7 +506,6 @@ func (s *Stores) WriteBatch(
 // CompactTiming tracks timing for compaction operations.
 type CompactTiming struct {
 	LcmCompactTime     time.Duration
-	TxDataCompactTime  time.Duration
 	HashSeqCompactTime time.Duration
 }
 
@@ -608,18 +534,6 @@ func (s *Stores) CompactAll(config *IngestionConfig, minLedger, maxLedger uint32
 		log.Printf("  ✓ ledger_seq_to_lcm compacted in %s", helpers.FormatDuration(timing.LcmCompactTime))
 	}
 
-	// Compact tx_hash_to_tx_data store
-	// For random keys (hashes), we compact the entire range
-	if config.EnableTxHashToTxData && s.TxDataDB != nil {
-		log.Printf("Compacting tx_hash_to_tx_data...")
-		start := time.Now()
-
-		s.TxDataDB.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
-
-		timing.TxDataCompactTime = time.Since(start)
-		log.Printf("  ✓ tx_hash_to_tx_data compacted in %s", helpers.FormatDuration(timing.TxDataCompactTime))
-	}
-
 	// Compact tx_hash_to_ledger_seq store
 	if config.EnableTxHashToLedgerSeq && s.HashSeqDB != nil {
 		log.Printf("Compacting tx_hash_to_ledger_seq...")
@@ -643,12 +557,9 @@ func (s *Stores) CompactAll(config *IngestionConfig, minLedger, maxLedger uint32
 // =============================================================================
 
 // GetDBSizes returns the current SST file sizes for all stores.
-func (s *Stores) GetDBSizes() (lcmSize, txDataSize, hashSeqSize int64) {
+func (s *Stores) GetDBSizes() (lcmSize, hashSeqSize int64) {
 	if s.LcmDB != nil {
 		lcmSize = getRocksDBSSTSize(s.LcmDB)
-	}
-	if s.TxDataDB != nil {
-		txDataSize = getRocksDBSSTSize(s.TxDataDB)
 	}
 	if s.HashSeqDB != nil {
 		hashSeqSize = getRocksDBSSTSize(s.HashSeqDB)

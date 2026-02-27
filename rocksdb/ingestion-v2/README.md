@@ -4,7 +4,7 @@ Batch-based ingestion from GCS with TOML configuration file support and selectiv
 
 ## What It Does
 
-Fetches ledger data from GCS and writes to RocksDB. Uses a TOML config file for database paths and settings. You can selectively enable which of the three stores to populate (ledger_seq_to_lcm, tx_hash_to_tx_data, tx_hash_to_ledger_seq).
+Fetches ledger data from GCS and writes to RocksDB. Uses a TOML config file for database paths and settings. You can selectively enable which of the two stores to populate (ledger_seq_to_lcm, tx_hash_to_ledger_seq).
 
 ## Building
 
@@ -15,7 +15,7 @@ go build -o rocksdb-ingestion-v2 stellar_rocksdb_ingestion.go
 ## Usage
 
 ```bash
-./rocksdb-ingestion-v2 --config config.toml --start-ledger 1 --end-ledger 60000000 --ledger-batch-size 5000 --enable-tx-hash-to-tx-data
+./rocksdb-ingestion-v2 --config config.toml --start-ledger 1 --end-ledger 60000000 --ledger-batch-size 5000 --enable-ledger-seq-to-lcm --enable-tx-hash-to-ledger-seq
 ```
 
 Run with `--help` for all available flags.

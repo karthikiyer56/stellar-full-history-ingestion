@@ -40,7 +40,6 @@ END_TIME=""
 YEAR=""
 LEDGER_BATCH_SIZE=""
 ENABLE_LEDGER_SEQ_TO_LCM=false
-ENABLE_TX_HASH_TO_TX_DATA=false
 ENABLE_TX_HASH_TO_LEDGER_SEQ=false
 
 # =============================================================================
@@ -71,7 +70,6 @@ TIME RANGE (one of the following is required):
 
 STORE FLAGS (at least one required):
     --enable-ledger-seq-to-lcm      Enable ledger_seq_to_lcm store
-    --enable-tx-hash-to-tx-data     Enable tx_hash_to_tx_data store
     --enable-tx-hash-to-ledger-seq  Enable tx_hash_to_ledger_seq store
 
 OTHER OPTIONS:
@@ -86,22 +84,12 @@ EXAMPLES:
         --ledger-batch-size 2000 \\
         --enable-tx-hash-to-ledger-seq
 
-    # Ingest Q1 2022 with both transaction stores:
-    $0 \\
-        --config ./config.toml \\
-        --start-time "2022-01-01T00:00:00+00:00" \\
-        --end-time "2022-03-31T23:59:59+00:00" \\
-        --ledger-batch-size 2000 \\
-        --enable-tx-hash-to-tx-data \\
-        --enable-tx-hash-to-ledger-seq
-
-    # Full ingestion with all stores (when NOT using rocksdb_lcm_store_path):
+    # Full ingestion with both stores:
     $0 \\
         --config ./config.toml \\
         --year 2022 \\
         --ledger-batch-size 2000 \\
         --enable-ledger-seq-to-lcm \\
-        --enable-tx-hash-to-tx-data \\
         --enable-tx-hash-to-ledger-seq
 
 ================================================================================
@@ -135,10 +123,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --enable-ledger-seq-to-lcm)
             ENABLE_LEDGER_SEQ_TO_LCM=true
-            shift
-            ;;
-        --enable-tx-hash-to-tx-data)
-            ENABLE_TX_HASH_TO_TX_DATA=true
             shift
             ;;
         --enable-tx-hash-to-ledger-seq)
@@ -219,12 +203,10 @@ fi
 
 # Check at least one store is enabled
 if [[ "$ENABLE_LEDGER_SEQ_TO_LCM" != "true" && \
-      "$ENABLE_TX_HASH_TO_TX_DATA" != "true" && \
       "$ENABLE_TX_HASH_TO_LEDGER_SEQ" != "true" ]]; then
     echo "ERROR: At least one store must be enabled" >&2
     echo "Use one or more of:" >&2
     echo "  --enable-ledger-seq-to-lcm" >&2
-    echo "  --enable-tx-hash-to-tx-data" >&2
     echo "  --enable-tx-hash-to-ledger-seq" >&2
     exit 1
 fi
@@ -238,7 +220,6 @@ echo "  Batch Size:          $LEDGER_BATCH_SIZE ledgers"
 echo ""
 echo "Enabled Stores:"
 echo "  ledger_seq_to_lcm:     $ENABLE_LEDGER_SEQ_TO_LCM"
-echo "  tx_hash_to_tx_data:    $ENABLE_TX_HASH_TO_TX_DATA"
 echo "  tx_hash_to_ledger_seq: $ENABLE_TX_HASH_TO_LEDGER_SEQ"
 echo ""
 
@@ -358,9 +339,6 @@ CMD=(
 # Add store enable flags
 if [[ "$ENABLE_LEDGER_SEQ_TO_LCM" == "true" ]]; then
     CMD+=(--enable-ledger-seq-to-lcm)
-fi
-if [[ "$ENABLE_TX_HASH_TO_TX_DATA" == "true" ]]; then
-    CMD+=(--enable-tx-hash-to-tx-data)
 fi
 if [[ "$ENABLE_TX_HASH_TO_LEDGER_SEQ" == "true" ]]; then
     CMD+=(--enable-tx-hash-to-ledger-seq)

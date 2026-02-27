@@ -38,7 +38,6 @@ type Config struct {
 	// Per-store configurations
 	// Each store has its own RocksDB tuning parameters and paths
 	LedgerSeqToLcm    LedgerSeqToLcmConfig    `toml:"ledger_seq_to_lcm"`
-	TxHashToTxData    TxHashToTxDataConfig    `toml:"tx_hash_to_tx_data"`
 	TxHashToLedgerSeq TxHashToLedgerSeqConfig `toml:"tx_hash_to_ledger_seq"`
 }
 
@@ -149,9 +148,6 @@ type RocksDBSettings struct {
 	// For ledger_seq_to_lcm (sequential keys, ~900GB/year):
 	//   4096 MB (4GB) → ~225 files/year → ~2250 files for 10 years
 	//
-	// For tx_hash_to_tx_data (random keys, ~1.5TB/year):
-	//   2048 MB (2GB) → ~750 files/year → ~7500 files for 10 years
-	//
 	// For tx_hash_to_ledger_seq (random keys, ~54GB/year raw):
 	//   1024 MB (1GB) → ~54 files/year → ~540 files for 10 years
 	//
@@ -172,8 +168,8 @@ type RocksDBSettings struct {
 	// Rule of thumb: Set to ~10× your TargetFileSizeMB
 	// This means L1 will hold about 10 files before pushing to L2.
 	//
-	// For ledger_seq_to_lcm:  40960 MB (40GB) with 4GB files
-	// For tx_hash_to_tx_data: 20480 MB (20GB) with 2GB files
+	// For ledger_seq_to_lcm:      40960 MB (40GB) with 4GB files
+	// For tx_hash_to_ledger_seq:  10240 MB (10GB) with 1GB files
 	// For tx_hash_to_ledger_seq: 10240 MB (10GB) with 1GB files
 	MaxBytesForLevelBaseMB int `toml:"max_bytes_for_level_base_mb"`
 
@@ -268,34 +264,6 @@ type LedgerSeqToLcmConfig struct {
 	RocksDB RocksDBSettings `toml:"rocksdb"`
 }
 
-// TxHashToTxDataConfig configures the txHash → CompositeTxData store.
-//
-// This store maps: 32-byte tx hash → zstd-compressed TxData protobuf
-//
-// Data characteristics:
-// - Key: 32 bytes (transaction hash)
-// - Value: ~1.5 KB compressed TxData (varies by transaction)
-// - Keys are random (hash distribution)
-// - ~1.5 billion transactions/year
-// - ~1.5 TB/year after compression
-//
-// Recommended settings for yearly ingestion:
-// - TargetFileSizeMB: 2048 (2GB files) → ~750 files/year
-// - MaxBytesForLevelBaseMB: 20480 (20GB)
-// - WriteBufferSizeMB: 512 - balance between RAM and flush frequency
-// - BloomFilterBitsPerKey: 10 (essential for random key lookups)
-type TxHashToTxDataConfig struct {
-	// Enabled controls whether this store is active.
-	// Can be overridden by --enable-tx-hash-to-tx-data command line flag.
-	Enabled bool `toml:"enabled"`
-
-	// OutputPath is the directory where the RocksDB database will be stored.
-	OutputPath string `toml:"output_path"`
-
-	// RocksDB tuning parameters for this store
-	RocksDB RocksDBSettings `toml:"rocksdb"`
-}
-
 // TxHashToLedgerSeqConfig configures the txHash → ledgerSequence store.
 //
 // This store maps: 32-byte tx hash → uint32 ledger sequence
@@ -360,7 +328,6 @@ type RuntimeConfig struct {
 
 	// Store enable flags (override TOML settings if specified)
 	EnableLedgerSeqToLcm    bool
-	EnableTxHashToTxData    bool
 	EnableTxHashToLedgerSeq bool
 
 	// Time range information (for logging purposes)
@@ -393,14 +360,12 @@ type IngestionConfig struct {
 
 	// Store configurations (with enabled flags resolved)
 	LedgerSeqToLcm    LedgerSeqToLcmConfig
-	TxHashToTxData    TxHashToTxDataConfig
 	TxHashToLedgerSeq TxHashToLedgerSeqConfig
 
 	// Derived flags for convenience
 	EnableLedgerSeqToLcm    bool
-	EnableTxHashToTxData    bool
 	EnableTxHashToLedgerSeq bool
-	ProcessTransactions     bool // True if either tx store is enabled
+	ProcessTransactions     bool // True if tx_hash_to_ledger_seq is enabled
 }
 
 // =============================================================================
@@ -435,7 +400,6 @@ func LoadConfig(path string) (*Config, error) {
 
 	// Set defaults for all stores
 	config.LedgerSeqToLcm.RocksDB = DefaultRocksDBSettings()
-	config.TxHashToTxData.RocksDB = DefaultRocksDBSettings()
 	config.TxHashToLedgerSeq.RocksDB = DefaultRocksDBSettings()
 
 	// Customize defaults per store type
@@ -443,11 +407,6 @@ func LoadConfig(path string) (*Config, error) {
 	config.LedgerSeqToLcm.RocksDB.TargetFileSizeMB = 4096
 	config.LedgerSeqToLcm.RocksDB.MaxBytesForLevelBaseMB = 40960
 	config.LedgerSeqToLcm.RocksDB.WriteBufferSizeMB = 1024
-
-	// TxHashToTxData: Random keys, medium values, target 2GB files
-	config.TxHashToTxData.RocksDB.TargetFileSizeMB = 2048
-	config.TxHashToTxData.RocksDB.MaxBytesForLevelBaseMB = 20480
-	config.TxHashToTxData.RocksDB.WriteBufferSizeMB = 512
 
 	// TxHashToLedgerSeq: Random keys, tiny values, target 1GB files
 	config.TxHashToLedgerSeq.RocksDB.TargetFileSizeMB = 1024
@@ -482,7 +441,6 @@ func ValidateAndMerge(tomlConfig *Config, runtime *RuntimeConfig) (*IngestionCon
 		EndTime:             runtime.EndTime,
 		RocksDBLcmStorePath: tomlConfig.Global.RocksDBLcmStorePath,
 		LedgerSeqToLcm:      tomlConfig.LedgerSeqToLcm,
-		TxHashToTxData:      tomlConfig.TxHashToTxData,
 		TxHashToLedgerSeq:   tomlConfig.TxHashToLedgerSeq,
 	}
 
@@ -491,16 +449,14 @@ func ValidateAndMerge(tomlConfig *Config, runtime *RuntimeConfig) (*IngestionCon
 
 	// Resolve enabled flags: command line overrides TOML
 	config.EnableLedgerSeqToLcm = runtime.EnableLedgerSeqToLcm || tomlConfig.LedgerSeqToLcm.Enabled
-	config.EnableTxHashToTxData = runtime.EnableTxHashToTxData || tomlConfig.TxHashToTxData.Enabled
 	config.EnableTxHashToLedgerSeq = runtime.EnableTxHashToLedgerSeq || tomlConfig.TxHashToLedgerSeq.Enabled
 
 	// Update the store configs with resolved enabled flags
 	config.LedgerSeqToLcm.Enabled = config.EnableLedgerSeqToLcm
-	config.TxHashToTxData.Enabled = config.EnableTxHashToTxData
 	config.TxHashToLedgerSeq.Enabled = config.EnableTxHashToLedgerSeq
 
 	// Determine if we need to process transactions
-	config.ProcessTransactions = config.EnableTxHashToTxData || config.EnableTxHashToLedgerSeq
+	config.ProcessTransactions = config.EnableTxHashToLedgerSeq
 
 	// =========================================================================
 	// Validation
@@ -521,8 +477,8 @@ func ValidateAndMerge(tomlConfig *Config, runtime *RuntimeConfig) (*IngestionCon
 	}
 
 	// At least one store must be enabled
-	if !config.EnableLedgerSeqToLcm && !config.EnableTxHashToTxData && !config.EnableTxHashToLedgerSeq {
-		return nil, fmt.Errorf("at least one store must be enabled")
+	if !config.EnableLedgerSeqToLcm && !config.EnableTxHashToLedgerSeq {
+		return nil, fmt.Errorf("at least one of the two stores must be enabled (ledger_seq_to_lcm or tx_hash_to_ledger_seq)")
 	}
 
 	// Cannot enable ledger_seq_to_lcm when reading from RocksDB source
@@ -542,13 +498,6 @@ func ValidateAndMerge(tomlConfig *Config, runtime *RuntimeConfig) (*IngestionCon
 	if config.EnableLedgerSeqToLcm {
 		if err := validateStoreConfig("ledger_seq_to_lcm", config.LedgerSeqToLcm.OutputPath,
 			&config.LedgerSeqToLcm.RocksDB); err != nil {
-			return nil, err
-		}
-	}
-
-	if config.EnableTxHashToTxData {
-		if err := validateStoreConfig("tx_hash_to_tx_data", config.TxHashToTxData.OutputPath,
-			&config.TxHashToTxData.RocksDB); err != nil {
 			return nil, err
 		}
 	}
@@ -672,10 +621,6 @@ func (c *IngestionConfig) GetConfigSummary() string {
 		summary += c.getLedgerSeqToLcmSummary()
 	}
 
-	if c.EnableTxHashToTxData {
-		summary += c.getTxHashToTxDataSummary()
-	}
-
 	if c.EnableTxHashToLedgerSeq {
 		summary += c.getTxHashToLedgerSeqSummary()
 	}
@@ -693,32 +638,6 @@ func (c *IngestionConfig) getLedgerSeqToLcmSummary() string {
 	summary += "  Description:     Maps ledger sequence numbers to compressed LedgerCloseMeta\n"
 	summary += "  Key Size:        4 bytes (uint32)\n"
 	summary += "  Value Size:      ~200 KB (compressed LCM, varies)\n"
-	summary += fmt.Sprintf("  Output Path:     %s\n", s.OutputPath)
-	summary += "\n"
-	summary += "  RocksDB Settings:\n"
-	summary += fmt.Sprintf("    Write Buffer:          %d MB × %d = %d MB total\n",
-		r.WriteBufferSizeMB, r.MaxWriteBufferNumber, r.WriteBufferSizeMB*r.MaxWriteBufferNumber)
-	summary += fmt.Sprintf("    Target File Size:      %d MB\n", r.TargetFileSizeMB)
-	summary += fmt.Sprintf("    L1 Max Size:           %d MB\n", r.MaxBytesForLevelBaseMB)
-	summary += fmt.Sprintf("    L0 Triggers:           %d / %d / %d (compact/slow/stop)\n",
-		r.L0CompactionTrigger, r.L0SlowdownWritesTrigger, r.L0StopWritesTrigger)
-	summary += fmt.Sprintf("    Background Jobs:       %d\n", r.MaxBackgroundJobs)
-	summary += fmt.Sprintf("    Max Open Files:        %d\n", r.MaxOpenFiles)
-	summary += fmt.Sprintf("    Bloom Filter:          %d bits/key\n", r.BloomFilterBitsPerKey)
-	summary += fmt.Sprintf("    WAL Disabled:          %v\n", r.DisableWAL)
-	summary += "\n"
-
-	return summary
-}
-
-func (c *IngestionConfig) getTxHashToTxDataSummary() string {
-	s := c.TxHashToTxData
-	r := s.RocksDB
-
-	summary := "STORE: tx_hash_to_tx_data (Transaction Hash → Compressed TxData)\n"
-	summary += "  Description:     Maps transaction hashes to compressed TxData protobufs\n"
-	summary += "  Key Size:        32 bytes (tx hash)\n"
-	summary += "  Value Size:      ~1.5 KB (compressed TxData, varies)\n"
 	summary += fmt.Sprintf("  Output Path:     %s\n", s.OutputPath)
 	summary += "\n"
 	summary += "  RocksDB Settings:\n"
